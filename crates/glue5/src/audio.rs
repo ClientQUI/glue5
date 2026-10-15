@@ -98,7 +98,7 @@ fn pump(out: AudioOut, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     let mut placed = None;
     let mut scratch = vec![0f32; PULL_FRAMES * CHANNELS];
     while !stop.load(Ordering::Acquire) {
-        let on = qos::efficiency_cores();
+        let on = qos::efficiency_cores() || qos::efficiency_mode();
         if placed != Some(on) {
             qos::set_audio();
             placed = Some(on);

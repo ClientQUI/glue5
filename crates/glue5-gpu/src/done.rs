@@ -170,8 +170,9 @@ impl Done {
 
 fn run(device: wgpu::Device, mem: Mem, pool: Arc<StagingPool>, rx: Receiver<(wgpu::SubmissionIndex, Vec<Work>)>) {
     // The engine paces its frames on what this thread completes.
-    glue5_runtime::qos::set(glue5_runtime::qos::Qos::Interactive);
+    glue5_runtime::qos::bind_host(glue5_runtime::qos::Qos::Interactive);
     while let Ok((submission, works)) = rx.recv() {
+        glue5_runtime::qos::refresh();
         glue5_runtime::diagnostics::gpu_completion_stage(1);
         let result = wait_for_submission(
             || {

@@ -6,11 +6,14 @@
 //! The main, game, render and GPU threads stay user-interactive. With
 //! efficiency placement on, the mixer and asset streaming run at utility
 //! (the mixer at the top of that class) and a thread that only saves runs
-//! at background. The audio device callback stays user-interactive and plays
-//! a buffer the pump already filled. On Android only user-interactive threads
-//! join the performance hint session ([`frame`]).
+//! at background. The experimental efficiency mode instead runs every engine
+//! thread, and the GPU threads, at utility so a power test can prefer
+//! efficiency cores. The audio device callback stays user-interactive and
+//! plays a buffer the pump already filled. On Android only user-interactive
+//! threads join the performance hint session ([`frame`]).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::sched::{self, Class, Role};
@@ -30,11 +33,19 @@ pub enum Qos {
 
 static EFFICIENCY: AtomicBool = AtomicBool::new(true);
 static KILL: OnceLock<bool> = OnceLock::new();
+/// Experimental: every engine thread at utility. Default off.
+static E_MODE: AtomicBool = AtomicBool::new(false);
+static E_MODE_ENV: OnceLock<Option<bool>> = OnceLock::new();
+/// Bumped when a menu flag changes, so a thread can re-apply without a syscall
+/// on the frames in between.
+static PLACEMENT: AtomicU64 = AtomicU64::new(1);
 
 /// `GLUE5_EFFICIENCY_CORES=0` forces placement off. Anything else follows
 /// [`set_efficiency_cores`], which the graphics menu updates.
 pub fn set_efficiency_cores(on: bool) {
-    EFFICIENCY.store(on, Ordering::Relaxed);
+    if EFFICIENCY.swap(on, Ordering::Relaxed) != on {
+        PLACEMENT.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn efficiency_cores() -> bool {
@@ -42,6 +53,25 @@ pub fn efficiency_cores() -> bool {
         return false;
     }
     EFFICIENCY.load(Ordering::Relaxed)
+}
+
+/// `GLUE5_EFFICIENCY_MODE=1` forces the experimental test on, `=0` forces it
+/// off. Unset follows [`set_efficiency_mode`] (the menu, default off).
+pub fn set_efficiency_mode(on: bool) {
+    if E_MODE.swap(on, Ordering::Relaxed) != on {
+        PLACEMENT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn efficiency_mode() -> bool {
+    match *E_MODE_ENV.get_or_init(|| match std::env::var("GLUE5_EFFICIENCY_MODE").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }) {
+        Some(forced) => forced,
+        None => E_MODE.load(Ordering::Relaxed),
+    }
 }
 
 /// The device callback. It only copies a filled buffer, and it is the
@@ -66,7 +96,7 @@ pub fn set_audio_callback() {
 /// late wake. When placement is off they stay interactive, which is the
 /// previous behaviour: a frame is not scheduled ahead of the mix.
 pub fn set_audio() {
-    if efficiency_cores() {
+    if efficiency_mode() || efficiency_cores() {
         // Top of the utility class. Streaming uses a lower relative priority
         // and a higher nice, so a decompress does not sit ahead of the mix.
         // The device callback is nicer still (user-interactive, nice -10).
@@ -78,15 +108,73 @@ pub fn set_audio() {
     }
 }
 
-/// Class for an engine pthread, from its name. Threads already running keep
-/// the class they were given here until the process starts them again.
+#[derive(Clone, Copy)]
+enum Bind {
+    Unset,
+    Engine(Role),
+    Host(Qos),
+}
+
+thread_local! {
+    static BIND: Cell<Bind> = const { Cell::new(Bind::Unset) };
+    static APPLIED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Class for an engine pthread, from its name. [`refresh`] applies a later
+/// change of the experimental mode on this thread.
 pub fn apply_engine_thread(name: Option<&str>) {
     let role = name.map(sched::role).unwrap_or(Role::Worker);
-    if role == Role::Audio {
+    BIND.with(|bind| bind.set(Bind::Engine(role)));
+    APPLIED.with(|applied| applied.set(0));
+    refresh();
+}
+
+/// A host thread whose normal class is `normal` (the GPU command, submit,
+/// encode and completion threads). Experimental mode uses utility instead.
+pub fn bind_host(normal: Qos) {
+    BIND.with(|bind| bind.set(Bind::Host(normal)));
+    APPLIED.with(|applied| applied.set(0));
+    refresh();
+}
+
+/// Re-applies this thread's class when the menu flags have changed.
+/// One atomic load until they do.
+pub fn refresh() {
+    let stamp = placement_stamp();
+    let changed = APPLIED.with(|applied| {
+        if applied.get() == stamp {
+            false
+        } else {
+            applied.set(stamp);
+            true
+        }
+    });
+    if !changed {
+        return;
+    }
+    match BIND.with(|bind| bind.get()) {
+        Bind::Unset => {}
+        Bind::Engine(role) => install_engine(role),
+        Bind::Host(normal) => {
+            if efficiency_mode() {
+                set(Qos::Utility);
+            } else {
+                set(normal);
+            }
+        }
+    }
+}
+
+fn placement_stamp() -> u64 {
+    PLACEMENT.load(Ordering::Relaxed) << 2 | u64::from(efficiency_mode()) << 1 | u64::from(efficiency_cores())
+}
+
+fn install_engine(role: Role) {
+    if role == Role::Audio && !efficiency_mode() {
         set_audio();
         return;
     }
-    match sched::class_for(role, efficiency_cores()) {
+    match sched::class_for(role, efficiency_cores(), efficiency_mode()) {
         Class::Interactive => set(Qos::Interactive),
         Class::Initiated => set(Qos::Initiated),
         Class::Utility => set(Qos::Utility),
@@ -110,13 +198,13 @@ pub fn set(qos: Qos) {
         _ => 0,
     };
     set_rel(qos, rel);
-    if !matches!(qos, Qos::Interactive) {
-        renice(match qos {
-            Qos::Background => 10,
-            Qos::Utility => 5,
-            _ => 0,
-        });
-    }
+    // Interactive is nice 0, so leaving the experimental utility test puts the
+    // thread back. The audio callback sets its own niceness and does not use this.
+    renice(match qos {
+        Qos::Background => 10,
+        Qos::Utility => 5,
+        Qos::Interactive | Qos::Initiated => 0,
+    });
 }
 
 fn set_rel(qos: Qos, relative: i32) {

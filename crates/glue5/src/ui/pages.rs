@@ -293,6 +293,22 @@ fn settings_items(
                 .small()
                 .color(theme::MUTED),
             );
+            let mode = match crate::settings::efficiency_mode_forced() {
+                Some(true) => "Forced on by GLUE5_EFFICIENCY_MODE=1. Experimental. Lowers FPS.",
+                Some(false) => "Forced off by GLUE5_EFFICIENCY_MODE=0",
+                None if settings.efficiency_mode => "Experimental. Lowers FPS.",
+                None => "Off",
+            };
+            setting(ui, "Efficiency mode (E-cores)", Control::Toggle, Some(mode), |ui| {
+                toggle(ui, &mut settings.efficiency_mode)
+            });
+            ui.label(
+                RichText::new(
+                    "Experimental power test. Game, render and GPU threads run at utility QoS so the system prefers efficiency cores, and FPS will drop. The audio callback stays immediate. Other engine threads follow when the game starts again.",
+                )
+                .small()
+                .color(theme::MUTED),
+            );
             let unlimited = if settings.vsync { "Display" } else { "Unlimited" };
             let mut rates = vec![(0, unlimited), (60, "60")];
             if status.refresh_rate >= 119.0 {
@@ -518,7 +534,7 @@ fn distance_options(ui: &mut egui::Ui, settings: &mut Settings, status: &Status)
         .small()
         .color(theme::MUTED),
     );
-    setting(ui, "Defaults", Control::Action, Some("Fog, distances, scale, boost, thermal, cores"), |ui| {
+    setting(ui, "Defaults", Control::Action, Some("Fog, distances, scale, boost, thermal, both core modes"), |ui| {
         if action_button(ui, "Reset").clicked() {
             settings.reset_distance_options(status.window.1);
         }

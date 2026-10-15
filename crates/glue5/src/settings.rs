@@ -71,6 +71,11 @@ pub struct Settings {
     /// callback, and the main, game, render and GPU threads, stay
     /// user-interactive. `GLUE5_EFFICIENCY_CORES=0` forces this off.
     pub efficiency_cores: bool,
+    /// Experimental. Every engine thread, including main, game and render,
+    /// and the GPU threads, run at utility QoS so iOS prefers efficiency
+    /// cores. FPS drops. Default off. `GLUE5_EFFICIENCY_MODE=1` forces it on
+    /// and `=0` forces it off.
+    pub efficiency_mode: bool,
     pub touch: TouchMode,
     pub touch_opacity: f32,
     pub touch_size: f32,
@@ -268,6 +273,15 @@ pub fn efficiency_cores_killed() -> bool {
     std::env::var("GLUE5_EFFICIENCY_CORES").ok().as_deref() == Some("0")
 }
 
+/// `Some(true)` when `GLUE5_EFFICIENCY_MODE=1`, `Some(false)` when `=0`.
+pub fn efficiency_mode_forced() -> Option<bool> {
+    match std::env::var("GLUE5_EFFICIENCY_MODE").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
 fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     glue5_runtime::qos::lower(glue5_runtime::qos::Qos::Utility, || durable_write_at(path, bytes))
 }
@@ -332,6 +346,7 @@ impl Default for Settings {
             shadow_distance: default_shadow_distance(),
             render_boost: 1.0,
             efficiency_cores: true,
+            efficiency_mode: false,
             touch: TouchMode::Auto,
             touch_opacity: 0.6,
             touch_size: 1.0,
@@ -436,6 +451,7 @@ impl Settings {
         self.render_boost = fresh.render_boost;
         self.thermal_protection = fresh.thermal_protection;
         self.efficiency_cores = fresh.efficiency_cores;
+        self.efficiency_mode = fresh.efficiency_mode;
         self.adaptive_graphics = fresh.adaptive_graphics;
         let lines = if MOBILE { 720.0 } else { 1080.0 };
         self.render_scale = Some(round_scale(lines / window_height.max(1) as f32));
@@ -446,6 +462,14 @@ impl Settings {
     /// Efficiency-core placement, after the env kill switch.
     pub fn efficiency_cores_on(&self) -> bool {
         if efficiency_cores_killed() { false } else { self.efficiency_cores }
+    }
+
+    /// Experimental all-threads utility test, after `GLUE5_EFFICIENCY_MODE`.
+    pub fn efficiency_mode_on(&self) -> bool {
+        match efficiency_mode_forced() {
+            Some(forced) => forced,
+            None => self.efficiency_mode,
+        }
     }
 
     /// Policy for the renderer. Built-in distances still shorten while the
@@ -604,6 +628,7 @@ mod tests {
         assert_eq!(migrated.world_preset, WorldPreset::Eco);
         assert!(migrated.fog);
         assert!(migrated.efficiency_cores);
+        assert!(!migrated.efficiency_mode);
         assert_eq!(migrated.render_boost, 1.0);
         assert_eq!(migrated.distance_policy().render_boost, 1.0);
         assert_eq!(migrated.input_size((2868, 1320)), (1042, 480));
@@ -667,6 +692,7 @@ mod tests {
         assert_eq!(s.texture_detail, TextureDetail::Original);
         assert_eq!(s.resource_budget, ResourceBudget::Auto);
         assert!(s.render_lines.is_none());
+        assert!(!s.efficiency_mode);
         s.performance_profile(0);
         let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
         assert_eq!(restored.render_lines, Some(480));

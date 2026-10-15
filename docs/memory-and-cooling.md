@@ -37,7 +37,9 @@ requests can still grow it to avoid failed streaming reads.
   thread at background QoS, which prefer efficiency cores. The audio
   callback and the main, game, render and GPU threads stay user-interactive.
   Frame-critical work is not forced onto efficiency cores, and the Neural
-  Engine is not used.
+  Engine is not used. The experimental Video toggle "Efficiency mode
+  (E-cores)" (off unless chosen, or `GLUE5_EFFICIENCY_MODE=1`) does put the
+  game, render and GPU threads at utility QoS for a power test, and FPS drops.
 - Video settings now offer 20 FPS as a lower, live frame cap. The renderer
   paces before submit/completion, reducing engine frame progress too.
 

@@ -107,6 +107,7 @@ pub fn run() -> Result<()> {
     }
     let mut settings = Settings::load(&user_dir);
     glue5_runtime::qos::set_efficiency_cores(settings.efficiency_cores_on());
+    glue5_runtime::qos::set_efficiency_mode(settings.efficiency_mode_on());
     // Before the GPU opens; turned on later, it shows from the next launch.
     let metal_hud = settings.metal_hud;
     if metal_hud {
@@ -554,6 +555,7 @@ impl App {
         });
         glue5_runtime::diagnostics::set_verbose_logs(self.settings.verbose_logs);
         glue5_runtime::qos::set_efficiency_cores(self.settings.efficiency_cores_on());
+        glue5_runtime::qos::set_efficiency_mode(self.settings.efficiency_mode_on());
         glue5_gpu::set_distance_policy(self.settings.distance_policy());
         self.adapt_graphics();
         self.resize_game();

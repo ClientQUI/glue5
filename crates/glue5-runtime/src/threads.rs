@@ -64,7 +64,7 @@ pub(crate) fn spawn_main() -> Result<JoinHandle<i32>> {
 }
 
 fn run_main() -> i32 {
-    crate::qos::set(crate::qos::Qos::Interactive);
+    crate::qos::apply_engine_thread(Some("engine main"));
     crate::diagnostics::note(format_args!("engine main: starting"));
     let env = new_env();
     let result = (|| -> Result<u32, Trap> {

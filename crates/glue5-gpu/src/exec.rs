@@ -311,6 +311,7 @@ impl Gpu {
         self.ring.set_state(glue5_runtime::gpu::State::Running);
         log::info!("gpu: running");
         loop {
+            glue5_runtime::qos::refresh();
             let head = reader.head();
             if reader.is_empty(head) {
                 self.idle();

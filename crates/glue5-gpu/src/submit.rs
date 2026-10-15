@@ -118,8 +118,9 @@ impl Submitter {
             std::thread::Builder::new()
                 .name(format!("gpu encode {i}"))
                 .spawn(move || {
-                    glue5_runtime::qos::set(glue5_runtime::qos::Qos::Interactive);
+                    glue5_runtime::qos::bind_host(glue5_runtime::qos::Qos::Interactive);
                     loop {
+                        glue5_runtime::qos::refresh();
                         let job = rx.lock().unwrap().recv();
                         let Ok((encoders, back)) = job else { return };
                         let t = Instant::now();
@@ -136,7 +137,7 @@ impl Submitter {
         std::thread::Builder::new()
             .name("gpu submit".into())
             .spawn(move || {
-                glue5_runtime::qos::set(glue5_runtime::qos::Qos::Interactive);
+                glue5_runtime::qos::bind_host(glue5_runtime::qos::Qos::Interactive);
                 run(device, queue, done, free, output, rx, thread_stats, thread_encoding, finished)
             })
             .expect("spawning the GPU submit thread");
@@ -177,6 +178,7 @@ fn run(
     let mut graves_frames = 0;
     let mut last_shown: Option<Instant> = None;
     while let Ok((batch, encoded)) = rx.recv() {
+        glue5_runtime::qos::refresh();
         glue5_runtime::diagnostics::gpu_submit_stage(1);
         let Ok(mut buffers) = encoded.recv() else { return };
         // Sleeping to hit the frame cap is not CPU work. Android's performance

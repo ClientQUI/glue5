@@ -169,7 +169,7 @@ pub fn backend(settings: Settings, screen: Option<Screen>) -> GpuBackend {
             .name("gpu".into())
             .spawn(move || match init(ring, settings, screen) {
                 Ok(gpu) => {
-                    glue5_runtime::qos::set(glue5_runtime::qos::Qos::Interactive);
+                    glue5_runtime::qos::bind_host(glue5_runtime::qos::Qos::Interactive);
                     gpu.run()
                 }
                 Err(e) => {

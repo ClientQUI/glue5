@@ -95,9 +95,13 @@ fn words(name: &str) -> Vec<String> {
     out
 }
 
-/// Class for `role` when efficiency-core placement is `efficiency`.
-/// Unknown workers stay user-initiated either way.
-pub fn class_for(role: Role, efficiency: bool) -> Class {
+/// Class for `role`. `e_mode` is the experimental all-threads test: every
+/// engine role, including the frame, runs at utility. Unknown workers stay
+/// user-initiated when that test is off.
+pub fn class_for(role: Role, efficiency: bool, e_mode: bool) -> Class {
+    if e_mode {
+        return Class::Utility;
+    }
     match role {
         Role::Frame => Class::Interactive,
         Role::Audio => {
@@ -233,14 +237,18 @@ mod tests {
         assert_eq!(role("street"), Role::Worker);
         assert_eq!(role("AsyncBink"), Role::Worker);
 
-        assert_eq!(class_for(Role::Frame, true), Class::Interactive);
-        assert_eq!(class_for(Role::Audio, true), Class::Utility);
-        assert_eq!(class_for(Role::Stream, true), Class::Utility);
-        assert_eq!(class_for(Role::Save, true), Class::Background);
-        assert_eq!(class_for(Role::Worker, true), Class::Initiated);
-        assert_eq!(class_for(Role::Audio, false), Class::Interactive);
-        assert_eq!(class_for(Role::Stream, false), Class::Initiated);
-        assert_ne!(class_for(Role::Audio, true), Class::Background);
+        assert_eq!(class_for(Role::Frame, true, false), Class::Interactive);
+        assert_eq!(class_for(Role::Audio, true, false), Class::Utility);
+        assert_eq!(class_for(Role::Stream, true, false), Class::Utility);
+        assert_eq!(class_for(Role::Save, true, false), Class::Background);
+        assert_eq!(class_for(Role::Worker, true, false), Class::Initiated);
+        assert_eq!(class_for(Role::Audio, false, false), Class::Interactive);
+        assert_eq!(class_for(Role::Stream, false, false), Class::Initiated);
+        assert_ne!(class_for(Role::Audio, true, false), Class::Background);
+        assert_eq!(class_for(Role::Frame, false, true), Class::Utility);
+        assert_eq!(class_for(Role::Worker, false, true), Class::Utility);
+        assert_eq!(class_for(Role::Save, true, true), Class::Utility);
+        assert_eq!(class_for(Role::Audio, false, true), Class::Utility);
     }
 
     #[test]

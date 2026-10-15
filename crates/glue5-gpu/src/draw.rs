@@ -404,7 +404,9 @@ impl Gpu {
             self.pool.urgent(move || {
                 qos::set(Qos::Utility);
                 job();
-                qos::set(Qos::Initiated);
+                if !qos::efficiency_mode() {
+                    qos::set(Qos::Initiated);
+                }
             });
         }
         cell

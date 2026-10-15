@@ -41,7 +41,6 @@ pub(crate) const ENGINE_ARGS: &[&str] = &[
     "-nocatalog",
 ];
 
-
 /// The local gamer's id (as Rockstar's ids): made up once per user
 /// directory, kept in it.
 fn gamer_id() -> u64 {

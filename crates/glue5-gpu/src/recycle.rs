@@ -59,6 +59,10 @@ pub struct Recycler {
 }
 
 impl Recycler {
+    pub fn cached_bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// A buffer of `bytes` and `usage` destroyed in an epoch the GPU has finished.
     pub fn buffer(&mut self, bytes: u64, usage: BufferUsages) -> Option<wgpu::Buffer> {
         match self.take(&Key::Buffer(bytes, usage))? {

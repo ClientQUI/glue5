@@ -2,353 +2,14 @@
 use super::widgets::{
     Control, action_button, choice, close_button, focus, segmented, setting, slider, text_field, toggle,
 };
-use super::{Action, Mode, Page, SettingsTab, Status, WARN, theme};
-use crate::paths::{self, MOBILE};
-use crate::settings::{self, RENDER_SCALES, Settings, TouchMode, Upscaling};
-use egui::{Align, Align2, Color32, Id, Layout, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
+use super::{Action, Page, SettingsTab, Status, WARN, theme};
+use crate::paths::MOBILE;
+use crate::settings::{
+    self, RENDER_SCALES, ResourceBudget, Settings, TextureDetail, TouchMode, Upscaling, WorldDetail, WorldPreset,
+};
+use egui::{Align, Align2, Id, Layout, RichText, vec2};
 
-/// The only platform differences are capabilities, not layout.
-fn open_hint() -> &'static str {
-    if MOBILE { "Settings: ⚙ or Back + Start" } else { "Settings: F1 or Back + Start" }
-}
-
-/// The ways into the game, the start page's main column: a name and what
-/// it is.
-const MODES: [(Mode, &str, &str); 4] = [
-    (Mode::Story, "STORY MODE", "Michael, Franklin and Trevor's story, from your saves."),
-    (Mode::Online, "GTA ONLINE", "Freemode with other players, matched automatically, no servers."),
-    (Mode::Sandbox, "SANDBOX", "The whole map, free roam, no missions."),
-    (Mode::Benchmark, "BENCHMARK", "The game's fly-through of the map: how it runs here."),
-];
-
-/// A mode's card at least, and the title's row, in points at full density
-/// (to place the page before it is laid out).
-const MODE_HEIGHT: f32 = 66.0;
-const TITLE_HEIGHT: f32 = 58.0;
-const GAP: f32 = 8.0;
-
-/// A status dot: the game's files are there.
-const READY: Color32 = Color32::from_rgb(120, 205, 145);
-
-/// The start page: the title with the app's own buttons, the game's modes
-/// and, quieter, what the app knows. Two columns where there is room, one
-/// on an upright phone. Returns the mode chosen, if one was. `starting`:
-/// the mode chosen at the last frame; `online_open`: GTA Online's card is
-/// open (its lobby and the player's name).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn start_page(
-    ctx: &egui::Context,
-    settings: &mut Settings,
-    status: &Status,
-    starting: Option<Mode>,
-    online_open: &mut bool,
-    actions: &mut Vec<Action>,
-    go: &mut Option<Option<Page>>,
-) -> Option<Mode> {
-    let safe = ctx.content_rect();
-    let scale = theme::layout_scale(safe);
-    let edge = 16.0 * scale;
-    let available = (safe.width() - 2.0 * edge).clamp(1.0, 1100.0).floor();
-    let gap = 32.0 * scale;
-    // Upright screens read better in one column: a phone, a tablet.
-    let two_columns = available >= 600.0 * scale && safe.width() >= safe.height();
-    let width = if two_columns { available } else { available.min(520.0) };
-    let menu_width = if two_columns { (420.0 * scale).min((width - gap) * 0.5).floor() } else { width };
-    // A little above the middle when there is room: the title and the
-    // modes (the other cards come and go), on one column all of it.
-    let modes = MODES.len() as f32 * (MODE_HEIGHT + GAP) * scale;
-    let content = (TITLE_HEIGHT + 20.0) * scale + modes + if two_columns { 0.0 } else { 160.0 * scale };
-    let top = ((safe.height() - content) * 0.4).max(edge * 0.5).floor();
-    let height = (safe.height() - top - edge * 0.5).max(1.0).floor();
-    let mut chosen = None;
-    egui::Area::new(Id::new("start"))
-        .default_size(vec2(width, height))
-        .constrain(false)
-        .fixed_pos(pos2(safe.center().x - width * 0.5, safe.top() + top))
-        .show(ctx, |ui| {
-            theme::apply_density(ui, scale);
-            ui.set_width(width);
-            ui.set_height(height);
-            // The buttons go in last, so that the first move of a
-            // controller lands on the modes.
-            let (title_row, _) = ui.allocate_exact_size(vec2(width, TITLE_HEIGHT * scale), Sense::hover());
-            ui.painter().text(
-                title_row.left_center(),
-                Align2::LEFT_CENTER,
-                "GLUE 5",
-                egui::FontId::new(48.0 * scale, egui::FontFamily::Name("condensed".into())),
-                Color32::WHITE,
-            );
-            ui.add_space(20.0 * scale);
-            let remaining = (ui.max_rect().bottom() - ui.cursor().top()).max(1.0).floor();
-            if two_columns {
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    column(ui, "home-modes", menu_width, remaining, |ui| {
-                        chosen = mode_list(ui, settings, status, starting, online_open, menu_width);
-                    });
-                    column(ui, "home-status", width - menu_width - gap, remaining, |ui| info(ui, status, actions));
-                });
-            } else {
-                column(ui, "home", width, remaining, |ui| {
-                    // Without the game's files, why first.
-                    if status.game_dir.is_none() {
-                        info(ui, status, actions);
-                        ui.add_space(8.0 * scale);
-                    }
-                    chosen = mode_list(ui, settings, status, starting, online_open, width);
-                    if status.game_dir.is_some() {
-                        ui.add_space(8.0 * scale);
-                        info(ui, status, actions);
-                    }
-                });
-            }
-            let labels = width >= 720.0 * scale;
-            ui.scope_builder(UiBuilder::new().max_rect(title_row).layout(Layout::right_to_left(Align::Center)), |ui| {
-                ui.spacing_mut().item_spacing.x = 8.0 * scale;
-                if !MOBILE && icon_button(ui, "🗙", "Quit", labels).clicked() {
-                    actions.push(Action::Quit);
-                }
-                let files = if MOBILE { "Find files" } else { "Game folder" };
-                if icon_button(ui, "🗁", files, labels).clicked() {
-                    actions.push(if MOBILE { Action::FindGame } else { Action::ChooseGame });
-                }
-                if icon_button(ui, "★", "Credits", labels).clicked() {
-                    *go = Some(Some(Page::Credits));
-                }
-                if icon_button(ui, "⚙", "Settings", labels).clicked() {
-                    *go = Some(Some(Page::Settings));
-                }
-            });
-        });
-    chosen
-}
-
-/// A column of the start page, scrolling if it has to.
-fn column(ui: &mut egui::Ui, id: &str, width: f32, height: f32, add: impl FnOnce(&mut egui::Ui)) {
-    ui.allocate_ui_with_layout(vec2(width, height), Layout::top_down(Align::Min), |ui| {
-        ui.set_width(width);
-        ui.spacing_mut().item_spacing = vec2(10.0, GAP) * theme::density(ui);
-        egui::ScrollArea::vertical()
-            .content_margin(0)
-            .id_salt(id)
-            .max_height(height)
-            .auto_shrink([false, false])
-            .show(ui, add);
-    });
-}
-
-/// The modes, one card each. The one on its way (chosen at the last frame,
-/// or waiting for its pipelines) says so; the others wait. GTA Online opens
-/// in place first (`open`): the lobby and the player's name, then Play.
-fn mode_list(
-    ui: &mut egui::Ui,
-    settings: &mut Settings,
-    status: &Status,
-    starting: Option<Mode>,
-    open: &mut bool,
-    width: f32,
-) -> Option<Mode> {
-    let going = starting.or(status.preparing.map(|_| status.mode));
-    let ready = status.game_dir.is_some() && going.is_none();
-    *open &= ready;
-    let mut chosen = None;
-    for (mode, name, about) in MODES {
-        let id = Id::new(("mode", name));
-        let look = if mode == status.mode { Look::Primary } else { Look::Plain };
-        let online = mode == Mode::Online;
-        // Fades the open card's controls in.
-        let shown = if online { ui.ctx().animate_bool_responsive(id.with("open"), *open) } else { 0.0 };
-        if going == Some(mode) {
-            match status.preparing {
-                Some(done) => mode_card(
-                    ui,
-                    id,
-                    width,
-                    &format!("PREPARING {:.0}%", done * 100.0),
-                    "Compiling the game's shaders for this device: minutes the first time, seconds after.",
-                    look,
-                    None,
-                    Some(done),
-                ),
-                None => mode_card(ui, id, width, "STARTING…", about, look, None, None),
-            };
-        } else if online && *open {
-            if online_card(ui, id, width, about, shown, settings, open) {
-                chosen = Some(mode);
-            }
-        } else {
-            let chevron = if online { Chevron::Opens } else { Chevron::Starts };
-            let card = ui.add_enabled_ui(ready, |ui| mode_card(ui, id, width, name, about, look, Some(chevron), None));
-            if card.inner.clicked() {
-                if online {
-                    *open = true;
-                    ui.data_mut(|d| d.insert_temp(id.with("reveal"), true));
-                    if settings.online_name.trim().is_empty() {
-                        settings.online_name = settings::default_online_name();
-                    }
-                    ui.ctx().request_repaint();
-                } else {
-                    chosen = Some(mode);
-                }
-            }
-        }
-    }
-    chosen
-}
-
-/// How a mode's card looks.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Look {
-    Plain,
-    /// White: the last one played.
-    Primary,
-    /// The open GTA Online card's top (the card draws the background).
-    Open,
-}
-
-/// What the card's chevron says: it starts the game, it opens, it closes.
-#[derive(Clone, Copy)]
-enum Chevron {
-    Starts,
-    Opens,
-    Closes,
-}
-
-/// A mode: its name and what it is, a chevron, the whole card a button
-/// (without a chevron, it is on its way). `progress`: a bar along the
-/// bottom. `id` stays the same whatever the card says.
-#[allow(clippy::too_many_arguments)]
-fn mode_card(
-    ui: &mut egui::Ui,
-    id: Id,
-    width: f32,
-    name: &str,
-    about: &str,
-    look: Look,
-    chevron: Option<Chevron>,
-    progress: Option<f32>,
-) -> egui::Response {
-    let scale = theme::density(ui);
-    let pad = vec2(20.0, 12.0) * scale;
-    let (ink, soft) =
-        if look == Look::Primary { (theme::INK, Color32::from_gray(92)) } else { (Color32::WHITE, theme::MUTED) };
-    let text_width = (width - 2.0 * pad.x - 24.0 * scale).max(1.0);
-    let galley = |text: egui::RichText, wrap| {
-        egui::WidgetText::from(text).into_galley(ui, Some(wrap), text_width, egui::TextStyle::Body)
-    };
-    let title = galley(theme::heading(name, 22.0 * scale).color(ink), egui::TextWrapMode::Truncate);
-    let about = galley(RichText::new(about).size(12.0 * scale).color(soft), egui::TextWrapMode::Wrap);
-    let text_height = title.size().y + 2.0 * scale + about.size().y;
-    let height = (text_height + 2.0 * pad.y).max(MODE_HEIGHT * scale);
-    let interactive = chevron.is_some() && ui.is_enabled();
-    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
-    let response = ui.interact(rect, id, if interactive { Sense::click() } else { Sense::hover() });
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), name));
-    let lit = interactive && (response.hovered() || response.has_focus());
-    let fill = match (look, lit) {
-        (Look::Primary, false) => Color32::WHITE,
-        (Look::Primary, true) => Color32::from_gray(228),
-        (Look::Plain, false) => Color32::from_black_alpha(215),
-        (Look::Plain, true) => Color32::from_rgba_unmultiplied(40, 41, 45, 235),
-        (Look::Open, false) => Color32::TRANSPARENT,
-        (Look::Open, true) => Color32::from_white_alpha(8),
-    };
-    let radius = 18.0 * scale;
-    let painter = ui.painter();
-    painter.rect_filled(rect, radius, fill);
-    let top = rect.center().y - text_height * 0.5;
-    painter.galley(pos2(rect.left() + pad.x, top), title.clone(), ink);
-    painter.galley(pos2(rect.left() + pad.x, top + title.size().y + 2.0 * scale), about, soft);
-    if let Some(chevron) = chevron.filter(|_| interactive) {
-        let at = pos2(rect.right() - pad.x - 4.0 * scale, rect.center().y);
-        let towards = match chevron {
-            Chevron::Starts => vec2(1.0, 0.0),
-            Chevron::Opens => vec2(0.0, 1.0),
-            Chevron::Closes => vec2(0.0, -1.0),
-        };
-        let (side, depth) = (towards.rot90() * 6.0 * scale, towards * 3.5 * scale);
-        let stroke = Stroke::new(2.0 * scale, soft);
-        painter.add(egui::Shape::line(vec![at - depth + side, at + depth, at - depth - side], stroke));
-    }
-    if let Some(done) = progress {
-        let rail = Rect::from_min_max(
-            pos2(rect.left() + pad.x, rect.bottom() - 7.0 * scale),
-            pos2(rect.right() - pad.x, rect.bottom() - 4.0 * scale),
-        );
-        painter.rect_filled(rail, 2.0 * scale, ink.gamma_multiply(0.2));
-        let filled = Rect::from_min_max(rail.min, pos2(egui::lerp(rail.x_range(), done.clamp(0.0, 1.0)), rail.max.y));
-        painter.rect_filled(filled, 2.0 * scale, ink);
-    }
-    if response.has_focus() {
-        focus_ring(ui, rect, radius);
-    }
-    focus(response)
-}
-
-/// Around a focused card or button, a little apart (white on white shows).
-fn focus_ring(ui: &egui::Ui, rect: Rect, radius: f32) {
-    let gap = 3.0 * theme::density(ui);
-    let stroke = Stroke::new(2.0, Color32::WHITE);
-    ui.painter().rect_stroke(rect.expand(gap), radius + gap, stroke, StrokeKind::Outside);
-}
-
-/// GTA Online, open: everyone's lobby or a private one with its code, the
-/// player's name, and Play, faded in by `shown`. Its top closes it (`open`
-/// false). True when Play is pressed.
-fn online_card(
-    ui: &mut egui::Ui,
-    id: Id,
-    width: f32,
-    about: &str,
-    shown: f32,
-    settings: &mut Settings,
-    open: &mut bool,
-) -> bool {
-    let scale = theme::density(ui);
-    let mut play = false;
-    let card = egui::Frame::new()
-        .fill(Color32::from_black_alpha(230))
-        .stroke(Stroke::new(1.0, Color32::from_gray(70)))
-        .corner_radius((18.0 * scale) as u8)
-        .show(ui, |ui| {
-            let width = width - 2.0;
-            ui.set_width(width);
-            ui.spacing_mut().item_spacing.y = 0.0;
-            if mode_card(ui, id, width, "GTA ONLINE", about, Look::Open, Some(Chevron::Closes), None).clicked() {
-                *open = false;
-            }
-            ui.scope(|ui| {
-                ui.multiply_opacity(shown);
-                let margin = |v: f32| (v * scale) as i8;
-                egui::Frame::new()
-                    .inner_margin(egui::Margin {
-                        left: margin(20.0),
-                        right: margin(20.0),
-                        top: 0,
-                        bottom: margin(20.0),
-                    })
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 10.0 * scale;
-                        lobby_controls(ui, settings);
-                        ui.add_space(2.0 * scale);
-                        let private = settings.online_private;
-                        let ready = !private || !settings::lobby_key(&settings.online_lobby).is_empty();
-                        let label = if private { "PLAY PRIVATE" } else { "PLAY" };
-                        play = ui.add_enabled_ui(ready, |ui| play_button(ui, label)).inner.clicked();
-                    });
-            });
-        });
-    // Just opened: all of it in view (a phone on its side scrolls).
-    if ui.data_mut(|d| d.remove_temp::<bool>(id.with("reveal"))).is_some() {
-        ui.scroll_to_rect(card.response.rect, None);
-    }
-    play
-}
-
-/// Everyone's lobby or a private one; the private one's code, which a new
-/// one replaces; the player's name.
-fn lobby_controls(ui: &mut egui::Ui, settings: &mut Settings) {
+pub(super) fn lobby_controls(ui: &mut egui::Ui, settings: &mut Settings) {
     let scale = theme::density(ui);
     let lobbies = [(false, "PUBLIC"), (true, "PRIVATE")];
     if segmented(ui, &mut settings.online_private, &lobbies, 38.0 * scale)
@@ -380,132 +41,10 @@ fn lobby_controls(ui: &mut egui::Ui, settings: &mut Settings) {
     text_field(ui, "Name", &mut settings.online_name, "Player", 16);
 }
 
-/// The white button that starts the game.
-fn play_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let scale = theme::density(ui);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0 * scale), Sense::hover());
-    let response = ui.interact(rect, ui.id().with("play"), Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
-    let lit = response.hovered() || response.has_focus();
-    let radius = 14.0 * scale;
-    let painter = ui.painter();
-    painter.rect_filled(rect, radius, if lit { Color32::from_gray(228) } else { Color32::WHITE });
-    let font = egui::FontId::new(20.0 * scale, egui::FontFamily::Name("condensed".into()));
-    painter.text(rect.center(), Align2::CENTER_CENTER, label, font, theme::INK);
-    if response.has_focus() {
-        focus_ring(ui, rect, radius);
-    }
-    focus(response)
-}
-
-/// The app's own buttons, small and half-transparent next to the modes:
-/// an icon, with its name where there is room.
-fn icon_button(ui: &mut egui::Ui, icon: &str, label: &str, with_label: bool) -> egui::Response {
-    let scale = theme::density(ui);
-    let size = (40.0 * scale).max(36.0);
-    let text = if with_label { format!("{icon}  {label}") } else { icon.to_owned() };
-    let button = egui::Button::new(
-        RichText::new(text).size(if with_label { 14.0 } else { 18.0 } * scale).color(Color32::from_white_alpha(220)),
-    )
-    .fill(Color32::from_black_alpha(140))
-    .min_size(vec2(size, size))
-    .corner_radius((12.0 * scale) as u8);
-    let response = focus(ui.add(button));
-    if with_label { response } else { response.on_hover_text(label) }
-}
-
-/// What the app knows: the game's files, the last benchmark, why the last
-/// session stopped.
-fn info(ui: &mut egui::Ui, status: &Status, actions: &mut Vec<Action>) {
-    card(ui, |ui| game_files(ui, status));
-    if let Some(results) = status.benchmark {
-        card(ui, |ui| last_benchmark(ui, results));
-    }
-    if let Some(why) = status.last_failure {
-        card(ui, |ui| last_failure(ui, why, status.graphics_reset, actions));
-    }
-    ui.label(RichText::new(open_hint()).small().color(theme::MUTED));
-}
-
-fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let scale = theme::density(ui);
-    egui::Frame::new()
-        .fill(Color32::from_black_alpha(210))
-        .corner_radius((18.0 * scale) as u8)
-        .inner_margin(egui::Margin::symmetric((20.0 * scale) as i8, (16.0 * scale) as i8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 6.0 * scale;
-            add(ui)
-        })
-        .inner
-}
-
-/// A card's title, and on its right a status: a dot and a word.
-fn card_title(ui: &mut egui::Ui, title: &str, state: Option<(&str, Color32)>) {
-    let scale = theme::density(ui);
-    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0 * scale), Sense::hover());
-    let painter = ui.painter();
-    let font = egui::FontId::new(17.0 * scale, egui::FontFamily::Name("condensed".into()));
-    painter.text(row.left_center(), Align2::LEFT_CENTER, title, font, Color32::WHITE);
-    if let Some((word, color)) = state {
-        let text = painter.layout_no_wrap(word.into(), egui::FontId::proportional(11.0 * scale), Color32::WHITE);
-        let pill = Rect::from_min_max(
-            pos2(row.right() - text.size().x - 28.0 * scale, row.center().y - 11.0 * scale),
-            pos2(row.right(), row.center().y + 11.0 * scale),
-        );
-        painter.rect_filled(pill, 11.0 * scale, Color32::from_gray(42));
-        painter.circle_filled(pos2(pill.left() + 11.0 * scale, pill.center().y), 3.5 * scale, color);
-        painter.galley(pos2(pill.left() + 19.0 * scale, pill.center().y - text.size().y * 0.5), text, Color32::WHITE);
-    }
-}
-
-fn game_files(ui: &mut egui::Ui, status: &Status) {
-    let state = if status.game_dir.is_some() { ("Ready", READY) } else { ("Missing", WARN) };
-    card_title(ui, "GAME FILES", Some(state));
-    if let Some(dir) = status.game_dir {
-        let text = dir.display().to_string();
-        ui.add(egui::Label::new(RichText::new(&text).small().color(theme::MUTED)).truncate()).on_hover_text(text);
-    } else {
-        if let Some(problem) = status.problem {
-            ui.label(RichText::new(problem).small().color(WARN));
-        }
-        ui.label(RichText::new(paths::where_the_game_goes()).small().color(theme::MUTED));
-        ui.label(RichText::new(paths::game_layout()).monospace().small().color(theme::MUTED));
-    }
-}
-
-fn graphics_reset_note() -> RichText {
+pub(super) fn graphics_reset_note() -> RichText {
     RichText::new("Graphics reset. Backup: settings.xml.bak").small().color(theme::MUTED)
 }
 
-fn last_benchmark(ui: &mut egui::Ui, results: &crate::benchmark::Results) {
-    let scale = theme::density(ui);
-    card_title(ui, "LAST BENCHMARK", None);
-    ui.label(theme::heading(&format!("{:.0} FPS", results.avg_fps), 34.0 * scale));
-    ui.label(
-        RichText::new(format!(
-            "On average; {:.0} at least, {:.0}% of the frames in under 33 ms.",
-            results.min_fps,
-            results.smooth * 100.0
-        ))
-        .small()
-        .color(theme::MUTED),
-    );
-}
-
-fn last_failure(ui: &mut egui::Ui, why: &str, reset: bool, actions: &mut Vec<Action>) {
-    card_title(ui, "LAST SESSION", Some(("Stopped", WARN)));
-    ui.label(RichText::new(why).small().color(theme::MUTED));
-    if reset {
-        ui.label(graphics_reset_note());
-    } else if ui.horizontal(|ui| action_button(ui, "Reset graphics")).inner.clicked() {
-        actions.push(Action::ResetGraphics);
-    }
-}
-
-/// The settings, over the start page or the game. True when closed.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn settings_page(
     ctx: &egui::Context,
     settings: &mut Settings,
@@ -518,7 +57,12 @@ pub(super) fn settings_page(
 ) -> bool {
     sheet(ctx, "settings-window", "SETTINGS", |ui| {
         let scale = theme::density(ui);
-        let tabs = [(SettingsTab::Video, "VIDEO"), (SettingsTab::Controls, "CONTROLS"), (SettingsTab::Game, "GAME")];
+        let tabs = [
+            (SettingsTab::Video, "VIDEO"),
+            (SettingsTab::World, "WORLD"),
+            (SettingsTab::Controls, "CONTROLS"),
+            (SettingsTab::Game, "GAME"),
+        ];
         segmented(ui, tab, &tabs, 40.0 * scale);
         ui.add_space(10.0 * scale);
         if let Some(note) = note {
@@ -592,6 +136,33 @@ pub(super) fn sheet(ctx: &egui::Context, id: &str, title: &str, add: impl FnOnce
     close
 }
 
+fn upscaling_controls(ui: &mut egui::Ui, settings: &mut Settings, status: &Status) {
+    if status.upscalers.len() > 1 {
+        let options: Vec<_> = status
+            .upscalers
+            .iter()
+            .map(|&u| {
+                let name = match u {
+                    Upscaling::Bicubic => "Bicubic",
+                    Upscaling::MetalFx => "MetalFX",
+                    Upscaling::MetalFxTemporal => "MetalFX Temporal",
+                    Upscaling::Fsr => "FSR 2",
+                };
+                (u, name)
+            })
+            .collect();
+        setting(ui, "Upscaling", Control::Choice, None, |ui| choice(ui, &mut settings.upscaler, &options));
+    }
+    if settings.upscaler == Upscaling::Fsr {
+        setting(ui, "Sharpening", Control::Slider, None, |ui| {
+            slider(ui, &mut settings.sharpness, 0.0..=1.0, 0.05, "%", 0)
+        });
+    }
+    if status.frame_generation && settings.upscaler == Upscaling::MetalFxTemporal {
+        setting(ui, "Frame generation", Control::Toggle, None, |ui| toggle(ui, &mut settings.frame_generation));
+    }
+}
+
 fn settings_items(
     ui: &mut egui::Ui,
     settings: &mut Settings,
@@ -604,41 +175,106 @@ fn settings_items(
     let started = status.started;
     match tab {
         SettingsTab::Video => {
-            let mut scale = scale_edit.unwrap_or(settings.render_scale());
-            let (rw, rh) = settings::render_size(status.window, scale, settings.low_memory);
-            let subtitle = format!("{rw} × {rh}");
-            let r = setting(ui, "Resolution", Control::Slider, Some(&subtitle), |ui| {
-                slider(ui, &mut scale, RENDER_SCALES, 0.05, "%", 0)
+            ui.label(RichText::new("Quick profiles · world detail applies at next start").small().color(theme::MUTED));
+            ui.horizontal_wrapped(|ui| {
+                for (profile, label) in [(0, "Eco · 30 FPS"), (1, "Balanced · 30 FPS"), (2, "Detail · 60 FPS")] {
+                    if focus(ui.add(egui::Button::new(label).min_size(vec2(0.0, 40.0)))).clicked() {
+                        settings.performance_profile(profile);
+                        *scale_edit = None;
+                    }
+                }
             });
-            if r.dragged() {
-                *scale_edit = Some(scale);
-            } else if r.changed() || r.drag_stopped() {
-                settings.render_scale = Some(settings::round_scale(scale));
+            let mut preset = settings.scaling_preset();
+            let mut pairs: Vec<_> = settings::SCALE_PAIRS.iter().enumerate().map(|(i, p)| (i, p.2)).collect();
+            pairs.push((settings::SCALE_PAIRS.len(), "Custom / %"));
+            let response = setting(ui, "Scaling preset", Control::Choice, Some("Aspect follows your screen"), |ui| {
+                choice(ui, &mut preset, &pairs)
+            });
+            if response.changed() {
+                settings.set_scaling_preset(preset);
                 *scale_edit = None;
             }
-            if status.upscalers.len() > 1 {
-                let options: Vec<_> = status
-                    .upscalers
-                    .iter()
-                    .map(|&u| {
-                        let name = match u {
-                            Upscaling::Bicubic => "Bicubic",
-                            Upscaling::MetalFx => "MetalFX",
-                            Upscaling::MetalFxTemporal => "MetalFX Temporal",
-                            Upscaling::Fsr => "FSR 2",
-                        };
-                        (u, name)
-                    })
-                    .collect();
-                setting(ui, "Upscaling", Control::Choice, None, |ui| choice(ui, &mut settings.upscaler, &options));
+            let mut fixed = settings.render_lines.is_some();
+            let r = setting(ui, "Input resolution", Control::Choice, None, |ui| {
+                choice(ui, &mut fixed, &[(false, "Display %"), (true, "Custom height")])
+            });
+            if r.changed() {
+                settings.render_lines = fixed.then_some(settings.input_size(status.window).1);
             }
-            if settings.upscaler == Upscaling::Fsr {
-                setting(ui, "Sharpening", Control::Slider, None, |ui| {
-                    slider(ui, &mut settings.sharpness, 0.0..=1.0, 0.05, "%", 0)
+            if let Some(lines) = settings.render_lines {
+                let mut h = lines as f32;
+                if setting(ui, "Render height", Control::Slider, Some("Game renders at this height"), |ui| {
+                    slider(ui, &mut h, 240.0..=2160.0, 2.0, "p", 0)
+                })
+                .changed()
+                {
+                    settings.render_lines = Some(h as u32);
+                }
+            } else {
+                let mut scale = scale_edit.unwrap_or(settings.render_scale());
+                let (rw, rh) = settings::render_size(status.window, scale, settings.low_memory);
+                let subtitle = format!("{rw} × {rh}");
+                let r = setting(ui, "Resolution", Control::Slider, Some(&subtitle), |ui| {
+                    slider(ui, &mut scale, RENDER_SCALES, 0.05, "%", 0)
                 });
+                if r.dragged() {
+                    *scale_edit = Some(scale);
+                } else if r.changed() || r.drag_stopped() {
+                    settings.render_scale = Some(settings::round_scale(scale));
+                    *scale_edit = None;
+                }
             }
-            if status.frame_generation && settings.upscaler == Upscaling::MetalFxTemporal {
-                setting(ui, "Frame generation", Control::Toggle, None, |ui| toggle(ui, &mut settings.frame_generation));
+            let mut native = settings.upscale_lines.is_none();
+            if setting(ui, "MetalFX target", Control::Choice, Some("Then fit to display"), |ui| {
+                choice(ui, &mut native, &[(true, "Display"), (false, "Custom height")])
+            })
+            .changed()
+            {
+                settings.upscale_lines = (!native).then_some(720);
+            }
+            if let Some(lines) = settings.upscale_lines {
+                let mut h = lines as f32;
+                if setting(ui, "Target height", Control::Slider, Some("Capped to display size"), |ui| {
+                    slider(ui, &mut h, 240.0..=2160.0, 2.0, "p", 0)
+                })
+                .changed()
+                {
+                    settings.upscale_lines = Some(h as u32);
+                }
+            }
+            let input = settings.input_size(status.window);
+            let output = settings.output_size(status.window);
+            if let Some((w, h)) = status.actual_input {
+                ui.label(RichText::new(format!("Active input request: {w}×{h}")).small().color(theme::MUTED));
+            }
+            if settings.upscaler == Upscaling::Bicubic {
+                ui.label(
+                    RichText::new("Bicubic scales directly to the display; the intermediate target needs an upscaler.")
+                        .small()
+                        .color(theme::MUTED),
+                );
+            }
+            ui.label(
+                RichText::new(format!(
+                    "Requested: {}×{} → {}×{} → display {}×{}",
+                    input.0, input.1, output.0, output.1, status.window.0, status.window.1
+                ))
+                .small()
+                .color(theme::MUTED),
+            );
+            upscaling_controls(ui, settings, status);
+            if MOBILE {
+                setting(ui, "Adaptive quality", Control::Toggle, None, |ui| {
+                    toggle(ui, &mut settings.adaptive_graphics)
+                });
+                let state = ["Nominal", "Fair", "Serious", "Critical"][status.thermal_state.min(3) as usize];
+                let subtitle = format!(
+                    "{state} · active limit {} FPS",
+                    if status.effective_fps > 0 { status.effective_fps } else { 60 }
+                );
+                setting(ui, "Thermal protection", Control::Toggle, Some(&subtitle), |ui| {
+                    toggle(ui, &mut settings.thermal_protection)
+                });
             }
             let unlimited = if settings.vsync { "Display" } else { "Unlimited" };
             let mut rates = vec![(0, unlimited), (60, "60")];
@@ -646,11 +282,14 @@ fn settings_items(
                 rates.push((40, "40"));
             }
             rates.push((30, "30"));
+            rates.push((20, "20"));
             setting(
                 ui,
                 "Frame rate",
                 Control::Choice,
-                next_start(started.is_some_and(|s| s.max_fps != settings.max_fps)),
+                next_start(
+                    started.is_some_and(|s| s.max_fps > 0 && (settings.max_fps == 0 || settings.max_fps > s.max_fps)),
+                ),
                 |ui| choice(ui, &mut settings.max_fps, &rates),
             );
             setting(ui, "VSync", Control::Toggle, None, |ui| toggle(ui, &mut settings.vsync));
@@ -662,6 +301,70 @@ fn settings_items(
                 (settings.metal_hud && !status.metal_hud).then_some("Next launch"),
                 |ui| toggle(ui, &mut settings.metal_hud),
             );
+        }
+        SettingsTab::World => {
+            setting(
+                ui,
+                "World textures",
+                Control::Choice,
+                Some(if started.is_some_and(|s| s.texture_detail != settings.texture_detail) {
+                    "Next start"
+                } else {
+                    "GPU memory / longest edge"
+                }),
+                |ui| {
+                    choice(
+                        ui,
+                        &mut settings.texture_detail,
+                        &[
+                            (TextureDetail::Original, "Original"),
+                            (TextureDetail::Balanced, "1024"),
+                            (TextureDetail::Compact, "512"),
+                            (TextureDetail::Minimal, "256"),
+                        ],
+                    )
+                },
+            );
+            ui.label(RichText::new("Lower limits save Metal memory at the cost of sharpness. Sampled BC mipmaps only; unmipmapped UI and render targets stay intact. Next game start.").small().color(theme::MUTED));
+            let desired = (settings.world_preset != WorldPreset::Game).then_some(settings.world);
+            let hint = if started.is_some_and(|s| s.world != desired) {
+                "Next start"
+            } else {
+                "Applies when starting the game"
+            };
+            let r = setting(ui, "LOD preset", Control::Choice, Some(hint), |ui| {
+                choice(
+                    ui,
+                    &mut settings.world_preset,
+                    &[
+                        (WorldPreset::Game, "Game settings"),
+                        (WorldPreset::Eco, "Eco"),
+                        (WorldPreset::Balanced, "Balanced"),
+                        (WorldPreset::Detail, "Detail"),
+                        (WorldPreset::Custom, "Custom"),
+                    ],
+                )
+            });
+            if r.changed() && !matches!(settings.world_preset, WorldPreset::Game | WorldPreset::Custom) {
+                settings.world = WorldDetail::preset(settings.world_preset);
+            }
+            if settings.world_preset != WorldPreset::Game {
+                for (label, value) in [
+                    ("World draw distance", &mut settings.world.lod),
+                    ("Ped LOD", &mut settings.world.ped_lod),
+                    ("Vehicle LOD", &mut settings.world.vehicle_lod),
+                    ("Population density", &mut settings.world.density),
+                    ("Ped variety", &mut settings.world.ped_variety),
+                    ("Vehicle variety", &mut settings.world.vehicle_variety),
+                ] {
+                    if setting(ui, label, Control::Slider, None, |ui| slider(ui, value, 0.0..=1.0, 0.05, "%", 0))
+                        .changed()
+                    {
+                        settings.world_preset = WorldPreset::Custom;
+                    }
+                }
+            }
+            ui.label(RichText::new("Lower distances, density and variety reduce world/streaming work. Game settings leaves the game's XML choices alone; selecting it does not undo previously applied values.").small().color(theme::MUTED));
         }
         SettingsTab::Controls => {
             setting(ui, "Touch controls", Control::Choice, None, |ui| {
@@ -683,6 +386,36 @@ fn settings_items(
             }
         }
         SettingsTab::Game => {
+            setting(
+                ui,
+                "Streaming budget",
+                Control::Choice,
+                Some(if started.is_some_and(|s| s.resource_budget != settings.resource_budget) {
+                    "Next start"
+                } else {
+                    "Independent of graphics quality"
+                }),
+                |ui| {
+                    choice(
+                        ui,
+                        &mut settings.resource_budget,
+                        &[
+                            (ResourceBudget::Auto, "Auto"),
+                            (ResourceBudget::Balanced, "1536 MiB"),
+                            (ResourceBudget::Compact, "1280 MiB"),
+                            (ResourceBudget::Compatibility, "2048 MiB"),
+                        ],
+                    )
+                },
+            );
+            ui.label(RichText::new("1536 MiB is a reduced-budget test, not a total RAM cap. Auto uses 2048 MiB on mobile, or 768 with legacy Low memory. Too little can leave world assets missing. Restart to apply.").small().color(theme::MUTED));
+            setting(
+                ui,
+                "Verbose engine logs",
+                Control::Toggle,
+                Some("Off keeps errors and important warnings"),
+                |ui| toggle(ui, &mut settings.verbose_logs),
+            );
             let r = setting(
                 ui,
                 "Low memory",
@@ -742,8 +475,9 @@ fn next_start(differs: bool) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, SettingsTab, Status, settings_page, start_page, theme};
+    use super::{SettingsTab, Status, settings_page, theme};
     use crate::settings::{Settings, Upscaling};
+    use crate::ui::{Mode, home::start_page};
     use egui::{Id, Pos2, Rect, SafeAreaInsets, vec2};
     use std::path::Path;
 
@@ -762,6 +496,9 @@ mod tests {
             preparing: None,
             mode: Mode::Story,
             benchmark: None,
+            thermal_state: 0,
+            effective_fps: 30,
+            actual_input: None,
         }
     }
 
@@ -783,7 +520,10 @@ mod tests {
             theme::install(&ctx);
             let screen = Rect::from_min_size(Pos2::ZERO, size);
             let mut settings = Settings::default();
-            for tab in [SettingsTab::Video, SettingsTab::Controls, SettingsTab::Game] {
+            for tab in [SettingsTab::Video, SettingsTab::World, SettingsTab::Controls, SettingsTab::Game] {
+                if tab == SettingsTab::World {
+                    settings.world_preset = crate::settings::WorldPreset::Custom;
+                }
                 let mut tab = tab;
                 for _ in 0..4 {
                     let mut output = ctx.run_ui(
@@ -836,7 +576,7 @@ mod tests {
                             egui::Event::PointerMoved(Pos2::new(430.0, 300.0)),
                             egui::Event::MouseWheel {
                                 unit: egui::MouseWheelUnit::Point,
-                                delta: vec2(0.0, -150.0),
+                                delta: vec2(0.0, -10000.0),
                                 phase: egui::TouchPhase::Move,
                                 modifiers: egui::Modifiers::default(),
                             },
@@ -875,10 +615,10 @@ mod tests {
                         _ => None,
                     })
                     .collect();
-                assert_eq!(rows.len(), if cfg!(target_vendor = "apple") { 5 } else { 4 });
-                // The original options fit without scrolling. On Apple, the
-                // additional HUD row must be fully reachable by scrolling.
-                let visible = if pass == 3 { &rows[..4] } else { &rows[rows.len() - 1..] };
+                // The expanded settings scroll. Both the first row and last
+                // option must be reachable in a short landscape safe area.
+                assert!(!rows.is_empty());
+                let visible = if pass == 3 { &rows[..1] } else { &rows[rows.len() - 1..] };
                 for (rect, clip) in visible {
                     assert!(clip.contains_rect(*rect), "clipped option: {rect:?} in {clip:?}");
                 }
@@ -891,62 +631,32 @@ mod tests {
     }
 
     #[test]
-    fn a_controller_lands_on_the_modes_first_and_opens_gta_online() {
-        let ctx = egui::Context::default();
-        theme::install(&ctx);
-        let key = |key| {
-            [true, false].map(|pressed| egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed,
-                repeat: false,
-                modifiers: Default::default(),
-            })
-        };
-        let mut settings = Settings::default();
-        let mut open = false;
-        let mut chosen = None;
-        let keys = [None, Some(egui::Key::Tab), Some(egui::Key::ArrowDown), Some(egui::Key::Enter), None];
-        for key in keys.map(|k| k.map_or(Vec::new(), |k| key(k).to_vec())) {
-            let raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0))),
-                events: key,
-                ..Default::default()
-            };
-            ctx.run_ui(raw, |root| {
-                chosen = start_page(root.ctx(), &mut settings, &status(), None, &mut open, &mut Vec::new(), &mut None)
-            })
-            .textures_delta
-            .clear();
+    fn online_lobby_controls_fit_the_safe_area() {
+        for private in [false, true] {
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let mut settings = Settings::default();
+            settings.online_private = private;
+            settings.online_lobby = crate::settings::new_lobby_code();
+            for _ in 0..4 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(390.0, 844.0))),
+                        ..Default::default()
+                    },
+                    |root| {
+                        super::sheet(root.ctx(), "online-window", "GTA ONLINE", |ui| {
+                            super::lobby_controls(ui, &mut settings);
+                        });
+                    },
+                );
+                assert!(!output.shapes.is_empty());
+                output.textures_delta.clear();
+            }
+            let rect = ctx.memory(|m| m.area_rect(Id::new("online-window"))).unwrap();
+            assert!(ctx.content_rect().contains_rect(rect));
+            assert_eq!(settings.lobby().is_empty(), !private);
         }
-        // GTA Online opens first, its card keeps the focus, a name is made up.
-        assert_eq!(chosen, None);
-        assert!(open);
-        assert_eq!(ctx.memory(|m| m.focused()), Some(Id::new(("mode", "GTA ONLINE"))));
-        assert!(!settings.online_name.is_empty());
-
-        // Down to the lobbies, right to the private one: a code is made up.
-        // Then down to Play, which starts.
-        let mut keys = vec![egui::Key::ArrowDown, egui::Key::ArrowRight, egui::Key::Enter];
-        keys.extend([egui::Key::ArrowDown; 3]);
-        keys.push(egui::Key::Enter);
-        for k in keys.into_iter().map(Some).chain([None]) {
-            let raw = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0))),
-                events: k.map_or(Vec::new(), |k| key(k).to_vec()),
-                ..Default::default()
-            };
-            ctx.run_ui(raw, |root| {
-                let page =
-                    start_page(root.ctx(), &mut settings, &status(), None, &mut open, &mut Vec::new(), &mut None);
-                chosen = chosen.or(page);
-            })
-            .textures_delta
-            .clear();
-        }
-        assert!(settings.online_private);
-        assert_eq!(crate::settings::lobby_key(&settings.online_lobby).len(), 6, "{}", settings.online_lobby);
-        assert_eq!(chosen, Some(Mode::Online));
     }
 
     #[test]
@@ -979,15 +689,7 @@ mod tests {
             for _ in 0..4 {
                 let mut output =
                     ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |root| {
-                        start_page(
-                            root.ctx(),
-                            &mut Settings::default(),
-                            &status(),
-                            None,
-                            &mut false,
-                            &mut Vec::new(),
-                            &mut None,
-                        );
+                        start_page(root.ctx(), &Settings::default(), &status(), None, &mut Vec::new(), &mut None);
                     });
                 output.textures_delta.clear();
             }

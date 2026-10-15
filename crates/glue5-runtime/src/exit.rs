@@ -63,7 +63,9 @@ pub fn is_panic_recoverable() -> bool {
 pub fn fail(why: impl Into<String>) {
     let why = why.into();
     log::error!("the game has stopped: {why}");
-    let _ = FAILURE.set(why);
+    if FAILURE.set(why.clone()).is_ok() {
+        crate::diagnostics::fault(format_args!("runtime failure: {why}"));
+    }
 }
 
 /// The engine's "restart pending" flag (a byte, at this address in this

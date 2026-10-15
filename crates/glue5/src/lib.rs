@@ -28,14 +28,21 @@ use sdl3::messagebox::{MessageBoxFlag, show_simple_message_box};
 /// Runs the application; returns the process exit code.
 pub fn main() -> i32 {
     #[cfg(not(target_os = "android"))]
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(if paths::MOBILE {
+        "warn"
+    } else {
+        "info"
+    }))
+    .init();
     #[cfg(target_os = "android")]
     {
         // RUST_LOG as on desktop (the launch intent's extras, see Glue5Activity).
         let spec = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
         let filter = android_logger::FilterBuilder::new().parse(&spec).build();
         let level = filter.filter();
-        android_logger::init_once(android_logger::Config::default().with_tag("glue5").with_max_level(level).with_filter(filter));
+        android_logger::init_once(
+            android_logger::Config::default().with_tag("glue5").with_max_level(level).with_filter(filter),
+        );
     }
     // A host thread serving the engine (the renderer's, ...) that panics
     // leaves it waiting forever, as an engine thread's trap does.
@@ -47,6 +54,10 @@ pub fn main() -> i32 {
         }
         let thread = std::thread::current();
         let what = info.payload_as_str().unwrap_or("panic");
+        glue5_runtime::diagnostics::fault(format_args!(
+            "panic: thread={} info={info}",
+            thread.name().unwrap_or("unnamed"),
+        ));
         glue5_runtime::exit::fail(format!("its {} thread stopped ({what})", thread.name().unwrap_or("unnamed")));
     }));
     match app::run() {

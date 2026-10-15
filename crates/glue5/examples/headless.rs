@@ -192,6 +192,7 @@ fn main() -> Result<()> {
             height: args.size.1,
             start_mode: if args.sandbox { 2 } else { 1 },
             low_memory: low,
+            resource_mb: 0,
             max_fps: args.fps,
             benchmark: args.benchmark,
             online: args.online.map(|name| glue5_runtime::Online { name, lobby: args.lobby }),

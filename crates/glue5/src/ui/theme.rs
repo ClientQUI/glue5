@@ -3,6 +3,8 @@ use egui::*;
 
 pub(super) const INK: Color32 = Color32::from_rgb(14, 15, 17);
 pub(super) const MUTED: Color32 = Color32::from_rgb(157, 160, 166);
+pub(super) const SUNSET: Color32 = Color32::from_rgb(239, 198, 143);
+pub(super) const PAPER: Color32 = Color32::from_rgb(247, 242, 233);
 
 pub(super) fn heading(text: &str, size: f32) -> RichText {
     RichText::new(text).font(FontId::new(size, FontFamily::Name("condensed".into())))
@@ -105,9 +107,9 @@ pub(super) fn backdrop(ctx: &Context, texture: Option<&TextureHandle>) {
             let w = aspect / image_aspect;
             Rect::from_min_max(pos2((1.0 - w) * 0.65, 0.0), pos2((1.0 - w) * 0.65 + w, 1.0))
         };
-        p.image(texture.id(), r, uv, Color32::from_gray(185));
+        p.image(texture.id(), r, uv, Color32::from_gray(235));
     }
-    for alphas in [[235, 35, 35, 235], [0, 0, 255, 255]] {
+    for alphas in [[242, 45, 45, 242], [0, 0, 248, 248]] {
         let mut mesh = Mesh::default();
         for (pos, a) in [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()].into_iter().zip(alphas) {
             mesh.colored_vertex(pos, Color32::from_rgba_unmultiplied(14, 15, 17, a));

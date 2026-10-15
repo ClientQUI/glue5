@@ -1,5 +1,6 @@
 //! Thread priorities. On Apple platforms they are quality-of-service classes,
-//! which also decide between performance and efficiency cores: the threads a
+//! which also influence placement on performance and efficiency cores (the
+//! system chooses the cores, not this app): the threads a
 //! frame waits on are interactive, the engine's others just below. On
 //! Android the interactive threads form a performance hint session told how
 //! long frames take ([`frame`]), from which the system sets the CPU clocks.
@@ -72,7 +73,8 @@ mod hint {
     // SAFETY: the session is only used under the mutex.
     unsafe impl Send for Session {}
 
-    static SESSION: Mutex<Session> = Mutex::new(Session { threads: Vec::new(), session: std::ptr::null_mut(), target: 0 });
+    static SESSION: Mutex<Session> =
+        Mutex::new(Session { threads: Vec::new(), session: std::ptr::null_mut(), target: 0 });
 
     fn api() -> Option<&'static Api> {
         static API: OnceLock<Option<Api>> = OnceLock::new();

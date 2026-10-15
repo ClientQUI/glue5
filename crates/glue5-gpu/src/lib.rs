@@ -12,6 +12,7 @@
 //! and window over when it does.
 
 mod bc;
+mod byte_cache;
 mod done;
 mod draw;
 mod exec;
@@ -33,9 +34,9 @@ mod shader;
 mod slabs;
 mod submit;
 mod uniforms;
+mod uploads;
 #[cfg(test)]
 mod upscale_tests;
-mod uploads;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +48,30 @@ use glue5_runtime::gpu::{GpuBackend, GpuRing, State};
 
 pub use overlay::Overlay;
 pub use present::{Presentation, Upscaler, Window};
+
+/// Apple's reported thermal state: 0 nominal, 1 fair, 2 serious, 3 critical.
+/// Platforms without this API return nominal. Sample infrequently in the app.
+pub fn thermal_state() -> u8 {
+    #[cfg(target_vendor = "apple")]
+    return objc2_foundation::NSProcessInfo::processInfo().thermalState().0.clamp(0, 3) as u8;
+    #[cfg(not(target_vendor = "apple"))]
+    0
+}
+
+/// Metal's allocation total is different from the process footprint. Sample
+/// only with the periodic statistics, not on every draw or streaming request.
+fn driver_allocated_bytes(device: &wgpu::Device) -> Option<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use objc2_metal::MTLDevice;
+        unsafe { device.as_hal::<wgpu::hal::api::Metal>() }.map(|d| d.raw_device().currentAllocatedSize() as u64)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = device;
+        None
+    }
+}
 
 /// How the renderer runs.
 #[derive(Clone, Debug)]
@@ -61,6 +86,9 @@ pub struct Settings {
     /// Every n-th presented frame to a PNG in `shot_dir` (0: never).
     pub shot_every: u32,
     pub shot_dir: Option<PathBuf>,
+    /// Optional longest edge for sampled BC world textures (0: unchanged).
+    /// Unmipmapped UI, render targets and writable textures stay intact; applies at start.
+    pub max_texture_dimension: u32,
 }
 
 impl Settings {
@@ -70,7 +98,14 @@ impl Settings {
     }
 
     pub fn new(shader_dir: PathBuf) -> Settings {
-        Settings { shader_dir, cache_dir: None, sync_pipelines: false, shot_every: 0, shot_dir: None }
+        Settings {
+            shader_dir,
+            cache_dir: None,
+            sync_pipelines: false,
+            shot_every: 0,
+            shot_dir: None,
+            max_texture_dimension: 0,
+        }
     }
 }
 
@@ -367,8 +402,17 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
     let Device { adapter, device, queue, features: _, profile } = gpu;
     device.on_uncaptured_error(error_handler(Some(ring)));
     let caps = compiler.caps;
+    glue5_runtime::diagnostics::note(format_args!(
+        "gpu memory policy: native_bc={} world_texture_max_dimension={} (0=original); mobile byte-bounded staging and decode backpressure enabled",
+        caps.features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
+        settings.max_texture_dimension,
+    ));
     let saved_compiled = compiler.compiled.load(Ordering::Relaxed);
-    let threads = glue5_runtime::cores().saturating_sub(2).clamp(2, 6);
+    // On iOS, compiling several Metal pipelines at once creates large CPU
+    // and temporary shader-memory spikes while the game is streaming. Two
+    // workers are enough to keep compilation moving without competing with
+    // the game and renderer; desktop keeps the faster wider pool.
+    let threads = if cfg!(target_os = "ios") { 2 } else { glue5_runtime::cores().saturating_sub(2).clamp(2, 6) };
     let staging = Arc::new(done::StagingPool::default());
     let limits = device.limits();
     let window = output.is_some();
@@ -438,6 +482,7 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         recycler,
         decoder: None,
         decodes: Vec::new(),
+        decode_peak_bytes: 0,
         occlusion: Default::default(),
         counter_src: None,
         counter_slot: 0,

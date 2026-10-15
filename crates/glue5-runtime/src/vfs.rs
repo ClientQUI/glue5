@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -112,6 +113,11 @@ pub struct Vfs {
     user: PathBuf,
     scratch: PathBuf,
     fds: Mutex<Vec<Option<Arc<Open>>>>,
+    /// A game install is read-only, so a missing game file is much more
+    /// useful than an ordinary failed save/config write. Keep the first few
+    /// and periodic later misses for a post-freeze diagnosis without turning
+    /// normal optional-file probes into a huge log.
+    game_open_errors: AtomicU64,
 }
 
 pub struct Host {
@@ -132,6 +138,12 @@ impl Vfs {
             game_index.len(),
             user.display()
         );
+        crate::diagnostics::note(format_args!(
+            "vfs: indexed {} game files from {}; user data={}",
+            game_index.len(),
+            game_data.display(),
+            user.display(),
+        ));
         let std_fd = |node| {
             Some(Arc::new(Open { node, path: String::new(), flags: 0, dir: Mutex::default(), pos: Mutex::default() }))
         };
@@ -141,6 +153,7 @@ impl Vfs {
             user,
             scratch,
             fds: Mutex::new(vec![std_fd(Node::Stdin), std_fd(Node::Stdout), std_fd(Node::Stderr)]),
+            game_open_errors: AtomicU64::new(0),
         })
     }
 
@@ -192,7 +205,10 @@ impl Vfs {
             }
             Ok(_) if flags & oflag::DIRECTORY != 0 => return Err(errno::NOTDIR),
             Ok(_) if flags & oflag::CREAT != 0 && flags & oflag::EXCL != 0 => return Err(errno::EXIST),
-            Err(_) if flags & oflag::CREAT == 0 => return Err(errno::NOENT),
+            Err(error) if flags & oflag::CREAT == 0 => {
+                self.note_game_open_error(path, &host.path, &error);
+                return Err(errno::NOENT);
+            }
             _ => {
                 if let Some(parent) = host.path.parent()
                     && !host.read_only
@@ -207,7 +223,10 @@ impl Vfs {
                     .truncate(flags & oflag::TRUNC != 0)
                     .create(flags & oflag::CREAT != 0)
                     .open(&host.path)
-                    .map_err(io_errno)?;
+                    .map_err(|error| {
+                        self.note_game_open_error(path, &host.path, &error);
+                        io_errno(error)
+                    })?;
                 Node::File(file)
             }
         };
@@ -230,6 +249,22 @@ impl Vfs {
         }
         fds[fd] = Some(open);
         Ok(fd as i32)
+    }
+
+    fn note_game_open_error(&self, engine_path: &str, host_path: &Path, error: &io::Error) {
+        if engine_path != "/game" && !engine_path.starts_with("/game/") {
+            return;
+        }
+        let seen = self.game_open_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        if seen <= 32 || seen % 128 == 0 {
+            crate::diagnostics::note(format_args!(
+                "vfs: cannot open game file #{seen}: engine={} host={} kind={:?}: {}",
+                engine_path,
+                host_path.display(),
+                error.kind(),
+                error,
+            ));
+        }
     }
 
     pub fn close(&self, fd: i32) -> Result<(), Errno> {

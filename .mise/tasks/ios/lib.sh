@@ -1,7 +1,7 @@
 # Shared by the iOS tasks (sourced; not a task itself: not executable).
 set -euo pipefail
 
-bundle_id=local.glue5
+bundle_id=com.lennertwilhelm.gta5offline
 
 die() {
     echo "$*" >&2

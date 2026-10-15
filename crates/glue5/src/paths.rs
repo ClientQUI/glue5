@@ -19,6 +19,17 @@ pub fn user_dir() -> Result<PathBuf> {
     sdl3::filesystem::get_pref_path("", "glue5").map_err(|e| anyhow::anyhow!("no user directory: {e}"))
 }
 
+/// A place the user can retrieve after a freeze. On iOS this is deliberately
+/// in Documents rather than the private preference directory: with file
+/// sharing enabled, Files/Finder exposes it without Xcode or a crash report.
+pub fn diagnostics_dir(user_dir: &Path) -> PathBuf {
+    #[cfg(target_os = "ios")]
+    if let Ok(documents) = sdl3::filesystem::get_user_folder(sdl3::filesystem::Folder::DOCUMENTS) {
+        return documents.join("Glue5 Diagnostics");
+    }
+    user_dir.join("Glue5 Diagnostics")
+}
+
 /// Where the game is looked for when nothing says otherwise.
 pub fn default_game_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();

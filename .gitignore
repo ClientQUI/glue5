@@ -1,4 +1,5 @@
 /target
+**/target/
 /game
 /third_party/wgpu
 /third_party/wgpu.tmp

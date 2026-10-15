@@ -10,16 +10,19 @@
 /// the second frame names (`target/glue5-tools/gen/<hash>/game_N.c`).
 pub(crate) unsafe extern "C" fn record(code: u32, line: u32) {
     let frames = frames();
-    log::error!("wasm trap {code} (generated C line {line}), native frames: {}", frames.join(" "));
+    let frames = frames.join(" ");
+    crate::diagnostics::fault(format_args!("wasm trap {code} (generated C line {line}), native frames: {frames}"));
+    log::error!("wasm trap {code} (generated C line {line}), native frames: {frames}");
 }
 
 #[cfg(unix)]
-fn frames() -> Vec<String> {
+pub(crate) fn frames() -> Vec<String> {
     use std::ffi::{CStr, c_int, c_void};
 
     const MAX: usize = 64;
     unsafe extern "C" {
-        fn _Unwind_Backtrace(trace: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int, arg: *mut c_void) -> c_int;
+        fn _Unwind_Backtrace(trace: unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int, arg: *mut c_void)
+        -> c_int;
         fn _Unwind_GetIP(context: *mut c_void) -> usize;
     }
     unsafe extern "C" fn each(context: *mut c_void, arg: *mut c_void) -> c_int {
@@ -45,7 +48,7 @@ fn frames() -> Vec<String> {
 }
 
 #[cfg(windows)]
-fn frames() -> Vec<String> {
+pub(crate) fn frames() -> Vec<String> {
     use std::ffi::c_void;
 
     use windows_sys::Win32::Foundation::HMODULE;
@@ -76,6 +79,6 @@ fn frames() -> Vec<String> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn frames() -> Vec<String> {
+pub(crate) fn frames() -> Vec<String> {
     vec!["(not recorded on this platform)".into()]
 }

@@ -116,6 +116,7 @@ Rendering is wgpu on Vulkan: the GPU driver provides it.
 | Record pipelines on automated runs (benchmark, map tours, graphics settings) into the seed | `mise run shaders:collect [default low min mid high max]` |
 | iOS: build, sign, install, launch on the connected device | `mise run ios [device]` |
 | iOS: only check that the app builds | `mise run ios:build` |
+| iOS: build and export a signed IPA | `mise run ios:ipa` (`target/ios/export/Glue 5.ipa`) |
 | iOS: launch the installed app again, with its console | `mise run ios:run [device]` |
 | iOS: copy the game into the app's Documents/game | `mise run ios:game [device]` |
 | Android: build, install, launch on the connected device with its log | `mise run android [device]` |
@@ -165,14 +166,16 @@ intent's extras).
 | Variable | Effect |
 |---|---|
 | `GLUE5_GAME_DIR` | The game directory, for the build and at run time (`./game` under cargo). |
+| `GLUE5_IOS_CPU` | Optional CPU target for the generated game C on personal iOS builds, e.g. `apple-a17`; keep `apple-a11` for compatibility with all supported iOS devices. |
 | `RUST_LOG` | Log filter (default `info`): renderer statistics every 10 s (frame times, CPU time per renderer stage, memory); `glue5::audio=debug` adds the sound device's. |
-| `GLUE5_ENGINE_LOG=stdout` | The engine's log on the terminal too (it is always in `<user dir>/game.log`). |
+| `GLUE5_ENGINE_LOG=stdout` | The engine's log on the terminal too. On iOS it is also saved as `Glue5 Diagnostics/engine.log` in the app's Documents folder. |
 | `GLUE5_ENGINE_ARGS` | More engine switches, e.g. `-FrameQueueLimit=2`. |
+| `GLUE5_DISABLE_SCENARIO_WORKAROUND=1` | Diagnostic only: disables the workaround for the engine's full scenario-ped overlap list, to A/B-test a mission-specific crash. |
 | `GLUE5_GPU_PROFILE=1` | GPU time per pass in the statistics. |
 | `GLUE5_PLAY=1` | Start the game without the start page (as `--play`; on a phone too). |
 | `GLUE5_NO_BC=1`, `GLUE5_NO_FLOAT32_FILTER=1` | Mobile GPU fallbacks on a desktop GPU: BC textures decoded on the CPU (and re-encoded as ETC2 where the GPU has it), 32-bit float textures unfiltered. |
 | `GLUE5_NO_ETC2=1` | Decoded BC textures stay RGBA8 instead of ETC2. |
-| `GAMERESOURCEMB`, `KEEPTHREADS` | The engine's module settings (`gameResourceMB`, `keepThreads`), read like the browser build reads them under Node. |
+| `GAMERESOURCEMB`, `GLUE5_RESOURCE_MB`, `KEEPTHREADS` | Engine module settings. The World page independently chooses 1280/1536/2048 MiB streaming budgets; mobile Auto uses 768 MiB with low-memory graphics, otherwise 2048 MiB. `GAMERESOURCEMB` / `GLUE5_RESOURCE_MB` override the budget for experiments. |
 | `GLUE5_ALLOW_UNKNOWN_BUILD=1` | Build against a `game.wasm` other than the supported one. |
 | `GLUE5_TEAM` | Apple development team id, to sign the iOS app. |
 
@@ -299,8 +302,15 @@ and a hook can call the original through `glue5_game::orig`.
 ## Notes
 
 - Game data must be the copies prepared for the browser build (re-keyed archives).
-- The user directory (saves, `glue5.json`, the engine log `game.log`, the
-  renderer's caches in `cache/`) is SDL's per-user application directory:
+- **After an iOS freeze or crash:** force-quit and reopen the app only after
+  copying `Glue5 Diagnostics/diagnostics.log` and `engine.log` from
+  `Files > On My iPhone > Glue 5`. They append across launches (and rotate at
+  8 MiB/32 MiB), so the last heartbeat remains available even when iOS kills
+  the process for memory pressure. Native fatal signals, WASM traps, Rust
+  panics, engine fatal errors, resource-heap pressure, GPU statistics and
+  missing game-file opens are recorded there.
+- The user directory (saves, `glue5.json` and the renderer's caches in
+  `cache/`) is SDL's per-user application directory:
   `~/Library/Application Support/glue5` on macOS, `~/.local/share/glue5` on
   Linux, `%APPDATA%\glue5` on Windows.
 

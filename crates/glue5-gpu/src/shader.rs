@@ -556,9 +556,9 @@ impl Program {
         p.unfiltered = unfiltered | depth;
         if depth != 0 {
             let module =
-                with_depth_reads(&self.text.get(), depth).ok_or_else(|| anyhow::anyhow!("not rewritable")).and_then(|text| {
-                    create_module(device, &format!("{} [depth reads]", self.label), &text).map(|m| (text, m))
-                });
+                with_depth_reads(&self.text.get(), depth).ok_or_else(|| anyhow::anyhow!("not rewritable")).and_then(
+                    |text| create_module(device, &format!("{} [depth reads]", self.label), &text).map(|m| (text, m)),
+                );
             match module {
                 Ok((text, module)) => {
                     p.bindings = stage_bindings(&text, self.stage);
@@ -592,7 +592,9 @@ impl Program {
     /// The program's module (made again if released while idle).
     pub fn module(&self, device: &wgpu::Device) -> Option<wgpu::ShaderModule> {
         self.modules.get_or_make("", || {
-            create_module(device, &self.label, &self.text.get()).map_err(|e| log::warn!("gpu: {}: {e:#}", self.label)).ok()
+            create_module(device, &self.label, &self.text.get())
+                .map_err(|e| log::warn!("gpu: {}: {e:#}", self.label))
+                .ok()
         })
     }
 
@@ -1361,6 +1363,7 @@ fn main(@location(1u) v1 : vec4<f32>, @location(5u) v5 : vec4<f32>) -> @location
         let library = Library::open(&glue5_runtime::layout::shader_dir(Path::new(&game))).unwrap();
         let gpu = crate::Device::open(&crate::instance(), None).unwrap();
         let vs = library.named(&gpu.device, "im::VS_Blit", Stage::Vertex).unwrap();
+        assert!(Arc::ptr_eq(&vs.text.0, &vs.copy().text.0), "binding-only copies share their compressed WGSL source");
         let original = library.named(&gpu.device, "im::PS_BlitDepthToAlpha", Stage::Pixel).unwrap();
         let ps = original.for_hud_mask(&gpu.device).unwrap();
         assert!(!original.hud_mask);

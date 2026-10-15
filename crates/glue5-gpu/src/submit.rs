@@ -177,7 +177,14 @@ fn run(
     let mut graves_frames = 0;
     let mut last_shown: Option<Instant> = None;
     while let Ok((batch, encoded)) = rx.recv() {
+        glue5_runtime::diagnostics::gpu_submit_stage(1);
         let Ok(mut buffers) = encoded.recv() else { return };
+        if batch.frame {
+            if let Some(out) = output.as_mut() {
+                glue5_runtime::diagnostics::gpu_submit_stage(6);
+                out.pace();
+            }
+        }
         // The window's frames: with frame generation, one made between the
         // previous and this one first.
         let mut frames = Vec::new();
@@ -191,7 +198,8 @@ fn run(
             };
             for image in between.iter().map(Some).chain([scaled.as_ref()]) {
                 let t = Instant::now();
-                let acquired = out.acquire(&device);
+                glue5_runtime::diagnostics::gpu_submit_stage(2);
+                let acquired = out.acquire_for_generation(&device, between.is_some());
                 stats.drawable_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if let Some(acquired) = acquired {
                     buffers.extend(out.compose(&device, &queue, &acquired, Some(p), image));
@@ -200,6 +208,7 @@ fn run(
             }
         }
         let t = Instant::now();
+        glue5_runtime::diagnostics::gpu_submit_stage(3);
         let submission = queue.submit(buffers);
         // Batches the GPU has finished (objects destroyed in them can be reused).
         let (finished, epoch) = (finished.clone(), batch.epoch);
@@ -218,14 +227,18 @@ fn run(
         let generated = frames.len() > 1;
         if let (false, Some(out)) = (frames.is_empty(), output.as_mut()) {
             let t = Instant::now();
+            glue5_runtime::diagnostics::gpu_submit_stage(4);
             for frame in frames {
                 out.show(&device, &queue, frame, generated);
             }
+            glue5_runtime::diagnostics::frame_presented();
             stats.present_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             // The frame threads' clocks follow how frames keep up (Android).
             let now = Instant::now();
             if let Some(last) = last_shown.replace(now) {
-                glue5_runtime::qos::frame(now - last, out.frame_budget());
+                let interval = now - last;
+                out.note_frame_interval(interval);
+                glue5_runtime::qos::frame(interval, out.frame_budget());
             }
         }
         // Destroying takes wgpu's device-wide resource lock for writing: it
@@ -236,6 +249,7 @@ fn run(
         graves.extend(batch.graves);
         graves_frames += (batch.frame && !graves.is_empty()) as u32;
         if !graves.is_empty() && (encoding.load(Ordering::Acquire) == 0 || graves_frames >= 2) {
+            glue5_runtime::diagnostics::gpu_submit_stage(5);
             let t = Instant::now();
             for grave in graves.drain(..) {
                 match grave {
@@ -249,6 +263,7 @@ fn run(
         if batch.frame {
             in_flight.push_back(submission);
             if in_flight.len() > FRAMES_IN_FLIGHT {
+                glue5_runtime::diagnostics::gpu_submit_stage(6);
                 let oldest = in_flight.pop_front().unwrap();
                 let t = Instant::now();
                 let _ = device.poll(wgpu::PollType::Wait {
@@ -258,5 +273,6 @@ fn run(
                 stats.gpu_wait_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         }
+        glue5_runtime::diagnostics::gpu_submit_stage(0);
     }
 }

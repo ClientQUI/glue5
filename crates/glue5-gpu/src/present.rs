@@ -10,10 +10,12 @@
 //! before actually appeared. A display faster than the game (120 Hz
 //! ProMotion, a 144 Hz monitor) would otherwise show each frame at the first
 //! refresh after it is ready, for 1, 2 or 3 refreshes as it comes: judder,
-//! though the frames themselves are on time. On Apple platforms the window's
-//! images are taken from its Metal layer and shown by hand, as wgpu does but
-//! with `presentDrawable:afterMinimumDuration:`, and the times they reached
-//! the screen go into the statistics.
+//! though the frames themselves are on time. macOS images are taken from its
+//! Metal layer and shown by hand, as wgpu does but with
+//! `presentDrawable:afterMinimumDuration:`. iOS deliberately uses wgpu's
+//! surface present path: a CAMetalLayer drawable may otherwise wait forever
+//! after an iOS scene transition, which stalls the submit queue and therefore
+//! the game engine too.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -92,6 +94,16 @@ fn bicubic(src: texture_2d<f32>, uv: vec2f) -> vec3f {
 /// Behind the application's UI while no game frame is shown.
 const BACKGROUND: wgpu::Color = wgpu::Color { r: 0.05, g: 0.055, b: 0.07, a: 1.0 };
 
+fn upscale_size(input: (u32, u32), display: (u32, u32), height: u32) -> (u32, u32) {
+    if height == 0 {
+        return display;
+    }
+    // Never downscale through MetalFX, nor allocate more than the drawable.
+    let h = height.max(input.1).min(display.1).max(1);
+    let w = (display.0 as u64 * h as u64 / display.1.max(1) as u64) as u32;
+    ((w / 2 * 2).max(input.0).min(display.0), (h / 2 * 2).max(input.1).min(display.1))
+}
+
 /// How the back buffer is scaled up to the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Upscaler {
@@ -126,6 +138,8 @@ struct Shared {
     vsync: AtomicBool,
     metal_hud: AtomicBool,
     upscaler: AtomicU8,
+    upscale_height: AtomicU32,
+    frame_interval_cs: AtomicU32,
     /// Upscalers this GPU has (bit per [`Upscaler`]), once the window's
     /// output knows.
     upscalers: AtomicU8,
@@ -149,6 +163,8 @@ impl Presentation {
             vsync: AtomicBool::new(vsync),
             metal_hud: AtomicBool::new(false),
             upscaler: AtomicU8::new(upscaler as u8),
+            upscale_height: AtomicU32::new(0),
+            frame_interval_cs: AtomicU32::new(0),
             upscalers: AtomicU8::new(1 << Upscaler::Bicubic as u8),
             frame_generation: AtomicBool::new(false),
             has_frame_generation: AtomicBool::new(false),
@@ -193,6 +209,11 @@ impl Presentation {
 
     pub fn set_upscaler(&self, upscaler: Upscaler) {
         self.0.upscaler.store(upscaler as u8, Ordering::Relaxed);
+    }
+
+    /// 0: MetalFX scales to the display; otherwise to this intermediate height.
+    pub fn set_upscale_height(&self, height: u32) {
+        self.0.upscale_height.store(height, Ordering::Relaxed);
     }
 
     fn upscaler(&self) -> Upscaler {
@@ -246,6 +267,22 @@ impl Presentation {
     /// (wgpu's surface), the engine's own limiter does it alone.
     pub fn set_frame_rate(&self, fps: u32) {
         self.0.frame_rate.store(fps, Ordering::Relaxed);
+    }
+
+    /// Records a smoothed frame interval for the application. A short
+    /// moving average prevents one shader compile or drawable hiccup from
+    /// immediately changing the resolution.
+    pub(crate) fn note_frame_interval(&self, interval: Duration) {
+        let current = (interval.as_secs_f64() * 100_000.0).clamp(0.0, u32::MAX as f64) as u32;
+        let previous = self.0.frame_interval_cs.load(Ordering::Relaxed);
+        let smoothed = if previous == 0 { current } else { previous.saturating_mul(3) / 4 + current / 4 };
+        self.0.frame_interval_cs.store(smoothed, Ordering::Relaxed);
+    }
+
+    /// The smoothed interval between presented frames, in milliseconds.
+    pub fn frame_interval_ms(&self) -> Option<f32> {
+        let value = self.0.frame_interval_cs.load(Ordering::Relaxed);
+        (value > 0).then_some(value as f32 / 100.0)
     }
 
     /// How long each frame stays on screen at least.
@@ -362,7 +399,7 @@ pub struct Frame {
 
 /// What a frame's texture is.
 enum Image {
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(any(not(target_vendor = "apple"), target_os = "ios"))]
     Surface(wgpu::SurfaceTexture),
     #[cfg(target_vendor = "apple")]
     Drawable(Retained<ProtocolObject<dyn CAMetalDrawable>>),
@@ -452,6 +489,7 @@ impl Display {
         device: &wgpu::Device,
         wanted: (u32, u32, bool),
         metal_hud: bool,
+        generated: bool,
     ) -> Option<Frame> {
         if wanted.0 == 0 || wanted.1 == 0 {
             return None;
@@ -463,10 +501,20 @@ impl Display {
             }
             self.configure(&caps, device, wanted);
         }
-        self.next_image(device, metal_hud)
+        #[cfg(target_vendor = "apple")]
+        if !cfg!(target_os = "ios") || generated {
+            return self.next_metal_image(device, metal_hud);
+        }
+        #[cfg(any(not(target_vendor = "apple"), target_os = "ios"))]
+        {
+            let _ = generated;
+            self.next_image(device, metal_hud)
+        }
+        #[cfg(all(target_vendor = "apple", not(target_os = "ios")))]
+        None
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(any(not(target_vendor = "apple"), target_os = "ios"))]
     fn next_image(&mut self, _: &wgpu::Device, _: bool) -> Option<Frame> {
         let format = self.format?;
         let surface = match self.surface.get_current_texture() {
@@ -487,7 +535,7 @@ impl Display {
     /// The layer's next drawable (waiting for one, as wgpu does), as a
     /// texture to draw into.
     #[cfg(target_vendor = "apple")]
-    fn next_image(&mut self, device: &wgpu::Device, metal_hud: bool) -> Option<Frame> {
+    fn next_metal_image(&mut self, device: &wgpu::Device, metal_hud: bool) -> Option<Frame> {
         use objc2_metal::{MTLTexture, MTLTextureType};
         let (surface_format, format) = (self.surface_format?, self.format?);
         let layer = unsafe { self.surface.as_hal::<Metal>() }.map(|s| s.render_layer().lock().clone())?;
@@ -701,6 +749,7 @@ pub struct Output {
     /// When the last game frame came, and the time between them (smoothed).
     last_frame: Option<Instant>,
     frame_interval: Duration,
+    last_frame_start: Option<Instant>,
     #[cfg(target_vendor = "apple")]
     metalfx: crate::metalfx::MetalFx,
 }
@@ -748,6 +797,27 @@ struct Offscreen {
 }
 
 impl Output {
+    /// Limit real engine submissions, not the generated intermediate images.
+    /// Waiting before queue submission also keeps engine fences paced on iOS.
+    pub(crate) fn pace(&mut self) {
+        let fps = self.presentation.0.frame_rate.load(Ordering::Relaxed);
+        if fps == 0 {
+            self.last_frame_start = None;
+            return;
+        }
+        let budget = Duration::from_secs_f64(1.0 / fps as f64);
+        if let Some(last) = self.last_frame_start {
+            if let Some(left) = budget.checked_sub(last.elapsed()) {
+                std::thread::sleep(left);
+            }
+        }
+        self.last_frame_start = Some(Instant::now());
+    }
+
+    pub(crate) fn note_frame_interval(&self, interval: Duration) {
+        self.presentation.note_frame_interval(interval);
+    }
+
     pub fn new(adapter: wgpu::Adapter, device: &wgpu::Device, window: Window) -> Output {
         let display = Display {
             surface: window.surface,
@@ -803,6 +873,7 @@ impl Output {
             fsr: Default::default(),
             last_frame: None,
             frame_interval: Duration::ZERO,
+            last_frame_start: None,
             #[cfg(target_vendor = "apple")]
             metalfx,
         }
@@ -821,6 +892,10 @@ impl Output {
     /// The next frame to draw into (none while the window has no area or
     /// its surface is being replaced).
     pub fn acquire(&mut self, device: &wgpu::Device) -> Option<Frame> {
+        self.acquire_for_generation(device, false)
+    }
+
+    pub(crate) fn acquire_for_generation(&mut self, device: &wgpu::Device, generated: bool) -> Option<Frame> {
         let (w, h) = self.presentation.size();
         let Some(display) = &mut self.display else {
             return self.offscreen.as_mut().and_then(|o| o.acquire(device, (w, h)));
@@ -835,6 +910,7 @@ impl Output {
             device,
             (w, h, self.presentation.vsync()),
             self.presentation.0.metal_hud.load(Ordering::Relaxed),
+            generated,
         )
     }
 
@@ -857,11 +933,22 @@ impl Output {
     /// each of the game's).
     #[cfg(target_vendor = "apple")]
     pub fn show(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: Frame, generated: bool) {
+        #[cfg(target_os = "ios")]
+        let frame = match frame.image {
+            Image::Surface(surface) => {
+                drop(frame.texture);
+                queue.present(surface);
+                return;
+            }
+            _ => frame,
+        };
         use block2::RcBlock;
         use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLDrawable};
         let drawable = match &frame.image {
             Image::Drawable(d) => d,
             Image::Offscreen => return self.show_offscreen(device, queue, &frame),
+            #[cfg(target_os = "ios")]
+            Image::Surface(_) => unreachable!("surface frames presented above"),
         };
         let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&**drawable);
         let on_screen = RcBlock::new(|d: std::ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| {
@@ -951,7 +1038,8 @@ impl Output {
             self.frame_interval = if self.frame_interval.is_zero() { dt } else { (self.frame_interval * 7 + dt) / 8 };
         }
         let rect = fit((src.width, src.height), self.presentation.size());
-        let mut size = (rect.2, rect.3);
+        let height = self.presentation.0.upscale_height.load(Ordering::Relaxed);
+        let mut size = upscale_size((src.width, src.height), (rect.2, rect.3), height);
         if self.presentation.upscaler().is_temporal() {
             // At most what they are made for; the present pass scales the rest.
             size = temporal_size((src.width, src.height), size);
@@ -1210,6 +1298,16 @@ pub fn write_png(path: &Path, data: &[u8], width: u32, height: u32, bpr: u32, fo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn intermediate_targets_and_frame_intervals() {
+        assert_eq!(super::upscale_size((854, 480), (1920, 1080), 720), (1280, 720));
+        assert_eq!(super::upscale_size((854, 480), (1920, 1080), 0), (1920, 1080));
+        assert_eq!(super::upscale_size((1280, 720), (1920, 1080), 360), (1280, 720));
+        let p = super::Presentation::new((1920, 1080), true, super::Upscaler::MetalFxTemporal);
+        p.note_frame_interval(std::time::Duration::from_millis(40));
+        assert_eq!(p.frame_interval_ms(), Some(40.0));
+    }
+
     #[test]
     fn temporal_sizes() {
         assert_eq!(super::temporal_size((1280, 720), (2560, 1440)), (2560, 1440));

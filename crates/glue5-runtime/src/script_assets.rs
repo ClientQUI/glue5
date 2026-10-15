@@ -78,39 +78,15 @@ pub(crate) unsafe extern "C" fn bank_loading_status(env: *mut Env, slot: u64, ba
     if status == FAILED && REQUEST.with(Cell::get) { LOADED } else { status }
 }
 
-/// The texture dictionary store's map from name hashes to slots, in this
-/// build: the bucket count, the buckets (the first entry's index each), the
-/// entries ({ u32 hash, u32 slot, u32 next }).
-const TXD_BUCKET_COUNT: u64 = 11097520;
-const TXD_BUCKETS: u64 = 11097512;
-const TXD_ENTRIES: u64 = 11097504;
-const NONE: u32 = u32::MAX;
-
-/// Whether the texture dictionary store has a slot for this name hash.
-fn txd_slot_exists(m: Mem, hash: u32) -> bool {
-    let buckets = m.u32(TXD_BUCKET_COUNT);
-    if buckets == 0 {
-        return false;
-    }
-    let entries = m.u64(TXD_ENTRIES);
-    let mut i = m.u32(m.u64(TXD_BUCKETS) + u64::from(hash % buckets) * 4);
-    while i != NONE {
-        let entry = entries + u64::from(i) * 12;
-        if m.u32(entry) == hash {
-            return m.u32(entry + 4) != NONE;
-        }
-        i = m.u32(entry + 8);
-    }
-    false
-}
-
 /// Hook for `graphics_commands::HasStreamedTxdLoaded(char const*)`.
 pub(crate) unsafe extern "C" fn txd_loaded(env: *mut Env, name: u64) -> u32 {
     if unsafe { orig::script_txd_loaded(env, name) } != 0 {
         return 1;
     }
     let hash = unsafe { orig::hash_string(env, 0, name) };
-    !txd_slot_exists(unsafe { Mem::of(env) }, hash) as u32
+    let mem = unsafe { Mem::of(env) };
+    (crate::txd_store::txd_registration(mem, crate::rt().memory.size(), hash) == crate::txd_store::Registration::Absent)
+        as u32
 }
 
 /// This module's hooks.

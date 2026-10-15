@@ -54,6 +54,28 @@ pub struct Proxy {
 }
 
 impl Tex {
+    /// Proxy views can also be retained by cached bind groups. Dropping the
+    /// wrapper alone is not enough: retire their allocations through the same
+    /// after-submit path as the engine texture, including nested proxies.
+    pub fn retire(
+        mut self,
+        epoch: u64,
+        recycler: &mut crate::recycle::Recycler,
+        graves: &mut Vec<crate::submit::Grave>,
+    ) {
+        for proxy in self.proxies.iter_mut().filter_map(Option::take) {
+            proxy.tex.retire(epoch, recycler, graves);
+        }
+        match self.recycle.take() {
+            Some(key) => recycler.keep_texture(epoch, key, self.tex, self.bytes),
+            None => graves.push(crate::submit::Grave::Texture(self.tex)),
+        }
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        self.bytes + self.proxies.iter().flatten().map(|p| p.tex.resident_bytes()).sum::<u64>()
+    }
+
     pub fn is_3d(&self) -> bool {
         self.dim == TextureDimension::D3
     }
@@ -235,5 +257,131 @@ impl Objects {
     pub fn two_mut(&mut self, a: u32, b: u32) -> Option<(&mut Obj, &mut Obj)> {
         let [x, y] = self.map.get_disjoint_mut([&a, &b]);
         Some((x?, y?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texture(device: &wgpu::Device) -> Tex {
+        Tex {
+            tex: device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("proxy retirement test"),
+                size: wgpu::Extent3d { width: 512, height: 512, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }),
+            format: TextureFormat::Rgba8Unorm,
+            upload: Upload::Direct,
+            dim: TextureDimension::D2,
+            width: 512,
+            height: 512,
+            layers: 1,
+            mips: 1,
+            dropped: 0,
+            samples: 1,
+            bytes: 1 << 20,
+            recycle: None,
+            views: Vec::new(),
+            used: Cell::default(),
+            uploaded: Cell::default(),
+            in_bind_group: Cell::default(),
+            proxies: Default::default(),
+            mip_chain: None,
+            present: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Metal or Vulkan device"]
+    fn retirement_releases_proxy_allocations_even_with_cached_bindings() {
+        let gpu = crate::Device::open(&crate::instance(), None).unwrap();
+        let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut root = texture(&gpu.device);
+        let mut proxy = texture(&gpu.device);
+        let nested = texture(&gpu.device);
+        let resources = [root.tex.clone(), proxy.tex.clone(), nested.tex.clone()];
+        proxy.proxies[0] = Some(Box::new(Proxy { tex: nested, dirty: false, passes: Vec::new() }));
+        root.proxies[0] = Some(Box::new(Proxy { tex: proxy, dirty: false, passes: Vec::new() }));
+        assert_eq!(root.resident_bytes(), 3 << 20);
+        let views: Vec<_> = resources.iter().map(|t| t.create_view(&Default::default())).collect();
+        let layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &(0..3)
+                .map(|binding| wgpu::BindGroupLayoutEntry {
+                    binding,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    count: None,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                })
+                .collect::<Vec<_>>(),
+        });
+        let cached = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &layout,
+            entries: &views
+                .iter()
+                .enumerate()
+                .map(|(i, v)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: wgpu::BindingResource::TextureView(v),
+                })
+                .collect::<Vec<_>>(),
+        });
+        let target = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 3 << 20,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        for (i, texture) in resources.iter().enumerate() {
+            encoder.copy_texture_to_buffer(
+                texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &target,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: (i as u64) << 20,
+                        bytes_per_row: Some(2048),
+                        rows_per_image: Some(512),
+                    },
+                },
+                texture.size(),
+            );
+        }
+        let mut graves = Vec::new();
+        root.retire(1, &mut crate::recycle::Recycler::default(), &mut graves);
+        assert_eq!(graves.len(), 3, "all allocations reach the after-submit graveyard");
+        let index = gpu.queue.submit([encoder.finish()]);
+        let wait = || wgpu::PollType::Wait {
+            submission_index: Some(index.clone()),
+            timeout: Some(std::time::Duration::from_secs(10)),
+        };
+        gpu.device.poll(wait()).unwrap();
+        let before = crate::driver_allocated_bytes(&gpu.device);
+        for grave in graves {
+            match grave {
+                crate::submit::Grave::Texture(t) => t.destroy(),
+                crate::submit::Grave::Buffer(_) => unreachable!(),
+            }
+        }
+        gpu.device.poll(wait()).unwrap();
+        let after = crate::driver_allocated_bytes(&gpu.device);
+        if let (Some(before), Some(after)) = (before, after) {
+            assert!(after < before, "Metal allocations must fall despite cached views: {before} -> {after}");
+        }
+        std::hint::black_box((&cached, &views, &resources));
+        assert!(pollster::block_on(scope.pop()).is_none());
     }
 }

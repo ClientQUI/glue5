@@ -23,6 +23,21 @@ pub struct Settings {
     /// back buffer follows the window). Chosen for the screen at the first
     /// start ([`Settings::for_screen`]).
     pub render_scale: Option<f32>,
+    /// Fixed input height, aspect follows the display. None keeps legacy % scaling.
+    pub render_lines: Option<u32>,
+    /// MetalFX output height before the final display blit. None: native display.
+    pub upscale_lines: Option<u32>,
+    pub scaling_custom: bool,
+    pub world_preset: WorldPreset,
+    pub world: WorldDetail,
+    pub texture_detail: TextureDetail,
+    pub resource_budget: ResourceBudget,
+    pub thermal_protection: bool,
+    pub verbose_logs: bool,
+    /// On phones, adjust the back buffer gradually when frame pacing falls
+    /// behind or has headroom. This changes render cost without touching the
+    /// game's texture/streaming quality settings.
+    pub adaptive_graphics: bool,
     pub vsync: bool,
     /// At most this many frames per second; 0: no limit of the engine's
     /// (the display's refresh rate with VSync).
@@ -104,7 +119,117 @@ pub enum TouchMode {
 const LOW_MEMORY_RAM_MB: i32 = 7000;
 
 /// The render scale's range, in steps of 5%.
-pub const RENDER_SCALES: std::ops::RangeInclusive<f32> = 0.25..=1.0;
+pub const RENDER_SCALES: std::ops::RangeInclusive<f32> = 0.2..=1.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorldPreset {
+    #[default]
+    Game,
+    Eco,
+    Balanced,
+    Detail,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextureDetail {
+    #[default]
+    Original,
+    Balanced,
+    Compact,
+    Minimal,
+}
+
+impl TextureDetail {
+    pub fn max_dimension(self) -> u32 {
+        match self {
+            Self::Original => 0,
+            Self::Balanced => 1024,
+            Self::Compact => 512,
+            Self::Minimal => 256,
+        }
+    }
+}
+
+/// Keep this independent of resolution, texture tails and the bundled legacy
+/// low-memory graphics preset. Reduced budgets require a game restart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceBudget {
+    #[default]
+    Auto,
+    Balanced,
+    Compact,
+    Compatibility,
+}
+
+impl ResourceBudget {
+    pub fn mb(self) -> u32 {
+        match self {
+            Self::Auto => 0,
+            Self::Balanced => 1536,
+            Self::Compact => 1280,
+            Self::Compatibility => 2048,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorldDetail {
+    pub lod: f32,
+    pub ped_lod: f32,
+    pub vehicle_lod: f32,
+    pub density: f32,
+    pub ped_variety: f32,
+    pub vehicle_variety: f32,
+}
+
+impl Default for WorldDetail {
+    fn default() -> Self {
+        Self::preset(WorldPreset::Balanced)
+    }
+}
+
+impl WorldDetail {
+    pub fn preset(p: WorldPreset) -> Self {
+        let (lod, bias, density, variety) = match p {
+            WorldPreset::Eco => (0.0, 0.0, 0.0, 0.15),
+            WorldPreset::Detail => (0.5, 0.35, 0.5, 0.7),
+            _ => (0.2, 0.1, 0.2, 0.35),
+        };
+        Self { lod, ped_lod: bias, vehicle_lod: bias, density, ped_variety: variety, vehicle_variety: variety }
+    }
+
+    pub fn xml_values(self) -> Vec<(&'static str, String)> {
+        [
+            ("LodScale", self.lod),
+            ("PedLodBias", self.ped_lod),
+            ("VehicleLodBias", self.vehicle_lod),
+            ("CityDensity", self.density),
+            ("PedVarietyMultiplier", self.ped_variety),
+            ("VehicleVarietyMultiplier", self.vehicle_variety),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name, format!("{:.6}", finite_unit(value))))
+        .collect()
+    }
+}
+
+fn finite_unit(value: f32) -> f32 {
+    if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 }
+}
+
+/// Heights, not fixed 16:9 widths: phone aspect ratios are preserved.
+pub const SCALE_PAIRS: &[(u32, Option<u32>, &str)] = &[
+    (360, Some(720), "360p → 720p"),
+    (480, Some(720), "480p → 720p"),
+    (540, Some(900), "540p → 900p"),
+    (540, Some(1080), "540p → 1080p"),
+    (720, Some(1080), "720p → 1080p"),
+    (720, Some(1440), "720p → 1440p"),
+    (720, None, "720p → Display"),
+    (1080, None, "1080p → Display"),
+];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -113,9 +238,19 @@ impl Default for Settings {
             low_memory: MOBILE && sdl3::cpuinfo::system_ram() < LOW_MEMORY_RAM_MB,
             low_preset_written: false,
             render_scale: None,
+            render_lines: None,
+            upscale_lines: None,
+            scaling_custom: false,
+            world_preset: WorldPreset::Game,
+            world: WorldDetail::default(),
+            texture_detail: TextureDetail::Original,
+            resource_budget: ResourceBudget::Auto,
+            thermal_protection: MOBILE,
+            verbose_logs: false,
+            adaptive_graphics: MOBILE,
             vsync: true,
-            // Phones hold a steady 60 for longer than they hold 120 (heat).
-            max_fps: if MOBILE { 60 } else { 0 },
+            // Conservative engine-frame budget; generated frames are extra.
+            max_fps: if MOBILE { 30 } else { 0 },
             upscaler: Upscaling::MetalFx,
             sharpness: 0.5,
             frame_generation: false,
@@ -213,6 +348,64 @@ impl Settings {
     pub fn render_scale(&self) -> f32 {
         self.render_scale.unwrap_or(1.0)
     }
+
+    pub fn input_size(&self, pixels: (u32, u32)) -> (u32, u32) {
+        let scale =
+            self.render_lines.map_or(self.render_scale(), |h| h.clamp(240, 2160) as f32 / pixels.1.max(1) as f32);
+        let output = self.output_size(pixels);
+        render_size(pixels, scale.min(output.1 as f32 / pixels.1.max(1) as f32), self.low_memory)
+    }
+
+    pub fn output_size(&self, pixels: (u32, u32)) -> (u32, u32) {
+        if self.upscale_lines.is_none() || self.upscaler == Upscaling::Bicubic {
+            return pixels;
+        }
+        let scale =
+            self.upscale_lines.map_or(1.0, |h| h.clamp(240, 2160).min(pixels.1.max(1)) as f32 / pixels.1.max(1) as f32);
+        render_size(pixels, scale, self.low_memory)
+    }
+
+    pub fn scaling_preset(&self) -> usize {
+        if self.scaling_custom || self.upscaler == Upscaling::Bicubic {
+            return SCALE_PAIRS.len();
+        }
+        SCALE_PAIRS
+            .iter()
+            .position(|(h, out, _)| self.render_lines == Some(*h) && self.upscale_lines == *out)
+            .unwrap_or(SCALE_PAIRS.len())
+    }
+
+    pub fn set_scaling_preset(&mut self, index: usize) {
+        if let Some(&(input, output, _)) = SCALE_PAIRS.get(index) {
+            self.scaling_custom = false;
+            self.render_lines = Some(input);
+            self.upscale_lines = output;
+            // Resolution presets must not turn Temporal/FG back into Spatial.
+            if self.upscaler == Upscaling::Bicubic {
+                self.upscaler = Upscaling::MetalFx;
+            }
+        } else {
+            self.scaling_custom = true;
+        }
+    }
+
+    pub fn performance_profile(&mut self, profile: u8) {
+        self.max_fps = if profile == 2 { 60 } else { 30 };
+        self.thermal_protection = true;
+        self.verbose_logs = false;
+        self.metal_hud = false;
+        self.set_scaling_preset(match profile {
+            0 => 1,
+            2 => 4,
+            _ => 2,
+        });
+        self.world_preset = match profile {
+            0 => WorldPreset::Eco,
+            2 => WorldPreset::Detail,
+            _ => WorldPreset::Balanced,
+        };
+        self.world = WorldDetail::preset(self.world_preset);
+    }
 }
 
 /// A render scale in the range, to its 5% step.
@@ -268,7 +461,31 @@ mod tests {
         assert_eq!(Settings::load(&dir).upscaler, Upscaling::MetalFx);
         std::fs::write(dir.join("glue5.json"), r#"{"upscaler": "metalfx-temporal"}"#).unwrap();
         assert_eq!(Settings::load(&dir).upscaler, Upscaling::MetalFxTemporal);
+        std::fs::write(dir.join("glue5.json"), r#"{"metalfx":true,"resource_budget":"Compact","texture_detail":"Minimal","render_lines":480,"upscale_lines":720,"world_preset":"Eco","max_fps":30}"#).unwrap();
+        let migrated = Settings::load(&dir);
+        assert_eq!(migrated.upscaler, Upscaling::MetalFx);
+        assert_eq!(migrated.resource_budget.mb(), 1280);
+        assert_eq!(migrated.texture_detail.max_dimension(), 256);
+        assert_eq!(migrated.world_preset, WorldPreset::Eco);
+        assert_eq!(migrated.input_size((2868, 1320)), (1042, 480));
+        assert_eq!(migrated.output_size((2868, 1320)), (1564, 720));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn profiles_preserve_temporal_frame_generation_and_memory_preferences() {
+        let mut s = Settings::default();
+        s.upscaler = Upscaling::MetalFxTemporal;
+        s.frame_generation = true;
+        s.resource_budget = ResourceBudget::Compact;
+        s.texture_detail = TextureDetail::Minimal;
+        for profile in 0..3 {
+            s.performance_profile(profile);
+            assert_eq!(s.upscaler, Upscaling::MetalFxTemporal);
+            assert!(s.frame_generation);
+            assert_eq!(s.resource_budget.mb(), 1280);
+            assert_eq!(s.texture_detail.max_dimension(), 256);
+        }
     }
 
     #[test]
@@ -281,5 +498,63 @@ mod tests {
         let mut s = Settings::default();
         s.for_screen(1170);
         assert_eq!(s.render_scale, Some(if MOBILE { 0.6 } else { 0.9 }));
+    }
+
+    #[test]
+    fn independent_input_output_heights_and_display_caps() {
+        let mut s = Settings { low_memory: false, ..Settings::default() };
+        s.set_scaling_preset(1);
+        assert_eq!(s.input_size((1920, 1080)), (854, 480));
+        assert_eq!(s.output_size((1920, 1080)), (1280, 720));
+        s.set_scaling_preset(SCALE_PAIRS.len());
+        assert_eq!(s.scaling_preset(), SCALE_PAIRS.len());
+        assert_eq!(s.input_size((1920, 1080)), (854, 480));
+        assert_eq!(s.input_size((2868, 1320)), (1042, 480));
+        assert_eq!(s.output_size((2868, 1320)), (1564, 720));
+        s.render_lines = Some(900);
+        s.upscale_lines = Some(480);
+        assert_eq!(s.input_size((1920, 1080)).1, 480);
+        s.upscale_lines = Some(2160);
+        assert_eq!(s.output_size((1920, 1080)), (1920, 1080));
+    }
+
+    #[test]
+    fn old_settings_keep_their_resolution_and_world_choices() {
+        let mut s: Settings = serde_json::from_str(r#"{"render_scale":0.55,"max_fps":60}"#).unwrap();
+        s.for_screen(1320);
+        assert_eq!(s.render_scale(), 0.55);
+        assert_eq!(s.max_fps, 60);
+        assert_eq!(s.world_preset, WorldPreset::Game);
+        assert_eq!(s.texture_detail, TextureDetail::Original);
+        assert_eq!(s.resource_budget, ResourceBudget::Auto);
+        assert!(s.render_lines.is_none());
+        s.performance_profile(0);
+        let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        assert_eq!(restored.render_lines, Some(480));
+        assert_eq!(restored.upscale_lines, Some(720));
+        assert_eq!(restored.world_preset, WorldPreset::Eco);
+    }
+
+    #[test]
+    fn texture_limits_persist_independently_of_performance_profiles() {
+        let mut s = Settings::default();
+        s.texture_detail = TextureDetail::Compact;
+        s.resource_budget = ResourceBudget::Balanced;
+        s.performance_profile(0);
+        let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        assert_eq!(restored.texture_detail.max_dimension(), 512);
+        assert_eq!(restored.resource_budget.mb(), 1536);
+        assert_eq!(TextureDetail::Original.max_dimension(), 0);
+        assert_eq!(TextureDetail::Balanced.max_dimension(), 1024);
+        assert_eq!(TextureDetail::Minimal.max_dimension(), 256);
+    }
+
+    #[test]
+    fn custom_world_values_are_bounded_and_only_touch_world_fields() {
+        let w = WorldDetail { lod: 3.0, density: f32::NAN, ..WorldDetail::default() };
+        let values = w.xml_values();
+        assert_eq!(values[0], ("LodScale", "1.000000".into()));
+        assert_eq!(values[3], ("CityDensity", "0.000000".into()));
+        assert!(values.iter().all(|(name, _)| !name.contains("Texture") && !name.contains("MSAA")));
     }
 }

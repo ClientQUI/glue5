@@ -26,18 +26,23 @@ impl Pool {
             std::thread::Builder::new()
                 .name(format!("{name} {i}"))
                 .spawn(move || {
-                    glue5_runtime::qos::set(glue5_runtime::qos::Qos::Initiated);
                     loop {
-                        let job = {
+                        let (job, qos) = {
                             let (lock, cv) = &*q;
                             let mut queues = lock.lock().unwrap();
                             loop {
-                                if let Some(job) = queues.urgent.pop_front().or_else(|| queues.background.pop_front()) {
-                                    break job;
+                                if let Some(job) = queues.urgent.pop_front() {
+                                    break (job, glue5_runtime::qos::Qos::Initiated);
+                                }
+                                if let Some(job) = queues.background.pop_front() {
+                                    break (job, glue5_runtime::qos::Qos::Utility);
                                 }
                                 queues = cv.wait(queues).unwrap();
                             }
                         };
+                        // Idle module destruction is not latency-critical.
+                        // Restore the higher class before the next urgent job.
+                        glue5_runtime::qos::set(qos);
                         job();
                     }
                 })

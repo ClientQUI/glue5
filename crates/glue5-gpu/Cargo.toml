@@ -33,7 +33,7 @@ wgpu = { workspace = true, features = ["std", "parking_lot", "metal", "vulkan", 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDictionary", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDictionary", "NSString", "NSProcessInfo"] }
 objc2-metal = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "MTLCommandBuffer", "MTLCommandQueue", "MTLDevice", "MTLDrawable", "MTLPixelFormat", "MTLResource", "MTLTexture"] }
 objc2-metal-fx = { version = "0.3", default-features = false, features = ["std", "MTLFXSpatialScaler", "MTLFXTemporalScaler", "MTLFXFrameInterpolator"] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "objc2-metal", "CALayer", "CAMetalLayer"] }

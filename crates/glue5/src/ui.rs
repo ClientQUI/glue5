@@ -22,11 +22,13 @@ use sdl3::video::Window;
 use crate::settings::Settings;
 
 mod credits;
+mod home;
 mod pages;
 mod theme;
 mod widgets;
 use credits::credits_page;
-use pages::{settings_page, start_page};
+use home::start_page;
+use pages::settings_page;
 
 use crate::touch::Touch;
 
@@ -82,6 +84,9 @@ pub struct Started {
     pub max_fps: u32,
     pub low_memory: bool,
     pub render_scale: f32,
+    pub world: Option<crate::settings::WorldDetail>,
+    pub texture_detail: crate::settings::TextureDetail,
+    pub resource_budget: crate::settings::ResourceBudget,
 }
 
 /// What the pages show about the application.
@@ -113,6 +118,9 @@ pub struct Status<'a> {
     pub mode: Mode,
     /// The last benchmark's results.
     pub benchmark: Option<&'a crate::benchmark::Results>,
+    pub thermal_state: u8,
+    pub effective_fps: u32,
+    pub actual_input: Option<(u32, u32)>,
 }
 
 /// The settings button over the game: from the safe area's top right
@@ -127,6 +135,7 @@ const WARN: Color32 = Color32::from_rgb(240, 180, 100);
 enum SettingsTab {
     #[default]
     Video,
+    World,
     Controls,
     Game,
 }
@@ -446,8 +455,28 @@ impl Ui {
         }
         match self.page {
             Some(Page::Start) => {
-                let open = &mut self.online_open;
-                self.starting = start_page(&ctx, settings, status, starting, open, &mut actions, &mut go);
+                self.starting = start_page(&ctx, settings, status, starting, &mut actions, &mut go);
+                if self.starting == Some(Mode::Online) {
+                    self.starting = None;
+                    self.online_open = true;
+                    if settings.online_name.trim().is_empty() {
+                        settings.online_name = crate::settings::default_online_name();
+                    }
+                }
+                if self.online_open {
+                    let mut play = false;
+                    let close = pages::sheet(&ctx, "online-window", "GTA ONLINE", |ui| {
+                        pages::lobby_controls(ui, settings);
+                        play = widgets::action_button(ui, "PLAY GTA ONLINE").clicked();
+                    });
+                    if close || go.is_some() {
+                        self.online_open = false;
+                    }
+                    if play {
+                        self.starting = Some(Mode::Online);
+                        self.online_open = false;
+                    }
+                }
             }
             Some(Page::Settings) => {
                 let note = self.note.as_deref();

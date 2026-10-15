@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#MISE description="Build and export a signed iOS IPA"
+#MISE depends=["setup"]
+set -euo pipefail
+
+[ -n "${GLUE5_TEAM:-}" ] || { echo "set GLUE5_TEAM in .mise/config.local.toml" >&2; exit 1; }
+
+IPHONEOS_DEPLOYMENT_TARGET=16.4 cargo rustc --release -p glue5 --lib \
+    --crate-type staticlib --target aarch64-apple-ios
+xcodegen generate --quiet --spec platform/ios/project.yml
+
+mkdir -p target/ios
+ipa_build_dir=$(mktemp -d "$PWD/target/ios/ipa.XXXXXX")
+cp platform/ios/export-options.plist "$ipa_build_dir/export-options.plist"
+/usr/libexec/PlistBuddy -c "Add :teamID string $GLUE5_TEAM" "$ipa_build_dir/export-options.plist"
+xcodebuild -project platform/ios/Glue5.xcodeproj -scheme Glue5 \
+    -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+    -derivedDataPath "$ipa_build_dir/derived" \
+    -archivePath "$ipa_build_dir/Glue5.xcarchive" \
+    -allowProvisioningUpdates -allowProvisioningDeviceRegistration archive
+xcodebuild -exportArchive -archivePath "$ipa_build_dir/Glue5.xcarchive" \
+    -exportPath "$ipa_build_dir/export" \
+    -exportOptionsPlist "$ipa_build_dir/export-options.plist" \
+    -allowProvisioningUpdates
+
+echo "IPA: $ipa_build_dir/export/Glue 5.ipa"

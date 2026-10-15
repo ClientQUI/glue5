@@ -37,6 +37,8 @@ png = "0.18"
 [dev-dependencies]
 # The headless example's command line.
 clap = { version = "4", features = ["derive", "env"] }
+egui-wgpu.workspace = true
+pollster = "0.4"
 
 # SDL, built from its sources and linked in; on Android a shared library of
 # its own next to ours (libSDL3.so), as SDL's Java side expects: it registers

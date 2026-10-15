@@ -575,7 +575,11 @@ impl Gpu {
                                 if offset != 0 && offset.is_multiple_of(align) && offset < buf.bytes {
                                     let size = (count != 0 && count != u32::MAX)
                                         .then(|| (count as u64 * stride).min(buf.bytes - offset));
-                                    Res::Buffer(buf.gpu.clone().unwrap(), buf.base + offset, size.or(buf.slot.map(|_| buf.bytes - offset)))
+                                    Res::Buffer(
+                                        buf.gpu.clone().unwrap(),
+                                        buf.base + offset,
+                                        size.or(buf.slot.map(|_| buf.bytes - offset)),
+                                    )
                                 } else {
                                     if offset != 0 {
                                         crate::log_once(&format!("bufoff{}", prog.label), || {
@@ -1161,7 +1165,8 @@ impl Gpu {
         if !sc.wants_camera() {
             return;
         }
-        let scene_pass = self.pass_info.as_ref().is_some_and(|p| p.depth.is_some() && sc.size == Some((p.width, p.height)));
+        let scene_pass =
+            self.pass_info.as_ref().is_some_and(|p| p.depth.is_some() && sc.size == Some((p.width, p.height)));
         if !scene_pass {
             return;
         }
@@ -1242,10 +1247,8 @@ fn pack_constants(
     }
     let jitter_key = jitter.map(|j| j.map(f32::to_bits));
     let cache = packs.entry((prog.id, st as u8)).or_default();
-    if let Some((_, _, _, alloc)) = cache
-        .entries
-        .iter()
-        .find(|(frame, ids, j, _)| *frame == uniforms.frame && *ids == current && *j == jitter_key)
+    if let Some((_, _, _, alloc)) =
+        cache.entries.iter().find(|(frame, ids, j, _)| *frame == uniforms.frame && *ids == current && *j == jitter_key)
     {
         return *alloc;
     }

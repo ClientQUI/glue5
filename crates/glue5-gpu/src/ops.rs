@@ -359,7 +359,7 @@ impl Gpu {
                 mips: t.mips,
                 dropped: 0,
                 samples: 1,
-                bytes: 0,
+                bytes: crate::exec::texture_bytes(format, size, t.mips, wgpu::TextureDimension::D2),
                 recycle: None,
                 views: Vec::new(),
                 used: Default::default(),
@@ -880,7 +880,8 @@ impl Gpu {
         let epoch = self.epoch;
         let done = |flag: u64| Work::Store { at: flag, value: 0 };
         if is_buffer {
-            let Some((g, bytes, base)) = self.objs.buf(src).and_then(|b| b.gpu.clone().map(|g| (g, b.bytes, b.base))) else {
+            let Some((g, bytes, base)) = self.objs.buf(src).and_then(|b| b.gpu.clone().map(|g| (g, b.bytes, b.base)))
+            else {
                 if flag != 0 {
                     self.works.push(done(flag));
                 }

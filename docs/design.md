@@ -536,8 +536,8 @@ prompts, aim assist and menu behaviour:
   graphics preset to `settings.xml` once; later changes use the game's menu.
 
   The resource heap is capped at its starting size (`gameResourceMB`,
-  768 MiB in low memory), on phones also without low memory (the game's
-  own size). The PC build grows it by 256 MiB whenever the streaming engine
+  768 MiB in low memory), on phones also without low memory (Auto: 2048 MiB,
+  independently selectable as 1280/1536/2048 MiB). The PC build grows it by 256 MiB whenever the streaming engine
   asks how much memory is left, and the streaming engine keeps it full: in
   the game's benchmark it went from 1.3 to 2.6 GiB, and 8 GB phones with
   low memory off were killed before its end. This can retain resources from areas the

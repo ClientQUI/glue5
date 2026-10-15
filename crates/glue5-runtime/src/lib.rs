@@ -10,10 +10,11 @@ mod audio_update;
 mod cloud;
 mod device_reset;
 mod dht;
+pub mod diagnostics;
 pub mod exit;
 pub mod game_settings;
-mod gamer_tags;
 mod gamelog;
+mod gamer_tags;
 pub mod gpu;
 mod imports;
 pub mod input;
@@ -24,18 +25,20 @@ mod p2p;
 pub mod qos;
 mod readback;
 mod scenario;
+mod script_assets;
 mod shader_settings;
 mod shadow_reveal;
-mod script_assets;
 mod skin;
 mod stats;
 mod threads;
 mod time;
 pub mod tour;
 mod trap_site;
+mod txd_store;
 mod upscale;
 pub mod vfs;
 mod vnet;
+mod wait_diagnostics;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -92,6 +95,9 @@ pub struct Config {
     /// Smaller engine pools (with [`game_settings::apply_low_preset`], the
     /// browser build's `?low=1`).
     pub low_memory: bool,
+    /// Explicit streaming/resource heap budget in MiB (0: legacy defaults).
+    /// Not a hard allocation limit or a process-memory cap.
+    pub resource_mb: u32,
     /// Frames per second at most: 0 lets the engine run as fast as the
     /// renderer presents (the display's refresh with vsync); 60 or 30 use
     /// the engine's own limiter.
@@ -157,8 +163,9 @@ impl Config {
         // No quality switches: they would override the game's own settings
         // (its menu) at every start.
         // More engine switches, for experiments.
-        let extra: Vec<String> =
-            std::env::var("GLUE5_ENGINE_ARGS").map(|e| e.split_whitespace().map(String::from).collect()).unwrap_or_default();
+        let extra: Vec<String> = std::env::var("GLUE5_ENGINE_ARGS")
+            .map(|e| e.split_whitespace().map(String::from).collect())
+            .unwrap_or_default();
         // A second frame queued: with one, the engine's render thread waits
         // for the GPU to finish the previous frame before it starts the
         // next. The game's benchmark ran 11-32 % faster with two on Windows
@@ -187,6 +194,11 @@ pub(crate) struct Runtime {
     pub input_block: AtomicU64,
     pub audio_ring: AtomicU64,
     pub gpu_ring: AtomicU64,
+    /// Last call to the browser-facing monotonic clock. It is a cheap
+    /// liveness marker for the translated engine: a stale value while the
+    /// app heartbeat continues points to an engine-side deadlock instead of
+    /// an iOS/UI freeze.
+    pub wasm_clock_ms: AtomicU64,
     /// Taken when the engine starts its GPU worker.
     pub gpu_backend: Mutex<Option<gpu::GpuBackend>>,
     pub threads: threads::Registry,
@@ -232,11 +244,32 @@ fn nonzero(v: u64) -> Option<u64> {
 /// Starts the game, rendering with `gpu` (e.g. [`gpu::null`]). Only one game
 /// can run per process.
 pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
+    if let Err(e) = diagnostics::start(&config.user_dir) {
+        log::warn!("diagnostics: cannot start: {e}");
+    }
+    diagnostics::note(format_args!(
+        "runtime start: build={} game={} data={} size={}x{} low_memory={} max_fps={} benchmark={}",
+        GAME_BUILD,
+        config.game_dir.display(),
+        layout::data_dir(&config.game_dir).display(),
+        config.width,
+        config.height,
+        config.low_memory,
+        config.max_fps,
+        config.benchmark,
+    ));
     let data = layout::data_dir(&config.game_dir);
     std::fs::create_dir_all(&config.user_dir)?;
     let log = gamelog::start(&config.user_dir).context("creating the engine log")?;
     log::info!("engine log: {} (GLUE5_ENGINE_LOG=stdout also prints it)", log.display());
     glue5_game::set_trap_hook(trap_site::record);
+    if wait_diagnostics::enabled() {
+        glue5_game::futex::observe(wait_diagnostics::record);
+    }
+    diagnostics::note(format_args!(
+        "wait diagnostics: detailed tracing={} (GLUE5_WAIT_DIAGNOSTICS=1 enables it)",
+        wait_diagnostics::enabled()
+    ));
     time::fine_timers();
     let vfs = Vfs::new(data.clone(), config.user_dir.clone()).with_context(|| format!("opening {}", data.display()))?;
     let memory = WasmMemory::reserve()?;
@@ -248,6 +281,7 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
         input_block: AtomicU64::new(0),
         audio_ring: AtomicU64::new(0),
         gpu_ring: AtomicU64::new(0),
+        wasm_clock_ms: AtomicU64::new(0),
         gpu_backend: Mutex::new(Some(gpu)),
         threads: threads::Registry::default(),
     };

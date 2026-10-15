@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use glue5_gpu::{Presentation, Screen, Upscaler};
@@ -37,6 +37,38 @@ const GEAR_ALONE: f32 = 0.35;
 /// (gone once the game is started again).
 const FAILURE_FILE: &str = "last-failure.txt";
 
+#[cfg(test)]
+mod performance_tests {
+    #[test]
+    fn thermal_caps_never_raise_a_user_limit() {
+        use super::{hot_fps_cap, limited_fps};
+        assert_eq!(hot_fps_cap(0), None);
+        assert_eq!(limited_fps(60, hot_fps_cap(1)), 40);
+        assert_eq!(limited_fps(60, hot_fps_cap(2)), 30);
+        assert_eq!(limited_fps(30, hot_fps_cap(3)), 20);
+        assert_eq!(limited_fps(20, hot_fps_cap(1)), 20);
+        assert_eq!(limited_fps(0, hot_fps_cap(2)), 30);
+        assert_eq!(limited_fps(0, None), 0);
+    }
+}
+
+fn hot_fps_cap(state: u8) -> Option<u32> {
+    match state {
+        1 => Some(40),
+        2 => Some(30),
+        3.. => Some(20),
+        _ => None,
+    }
+}
+
+fn limited_fps(requested: u32, cap: Option<u32>) -> u32 {
+    match cap {
+        Some(cap) if requested == 0 => cap,
+        Some(cap) => requested.min(cap),
+        None => requested,
+    }
+}
+
 pub fn run() -> Result<()> {
     // SDL's event wait on Android pumps events, which queues the poll
     // sentinel, which wakes the wait: it spins for its whole timeout (a big
@@ -56,6 +88,23 @@ pub fn run() -> Result<()> {
     // system's resize loop, had frames drawn for one size shown at another.
     sdl3::hint::set("SDL_VIDEO_METAL_AUTO_RESIZE_DRAWABLE", "0");
     let user_dir = paths::user_dir()?;
+    let diagnostics_dir = paths::diagnostics_dir(&user_dir);
+    match glue5_runtime::diagnostics::start(&diagnostics_dir) {
+        Ok(path) => {
+            log::info!("diagnostics: {}", path.display());
+            glue5_runtime::diagnostics::note(format_args!(
+                "app start: os={} mobile={} diagnostics={}",
+                std::env::consts::OS,
+                MOBILE,
+                path.display(),
+            ));
+            #[cfg(target_os = "ios")]
+            glue5_runtime::diagnostics::note(format_args!(
+                "render: iOS uses wgpu surface presentation; normal resource heap budget is 2048MiB",
+            ));
+        }
+        Err(e) => log::warn!("diagnostics: cannot start in {}: {e}", diagnostics_dir.display()),
+    }
     let mut settings = Settings::load(&user_dir);
     // Before the GPU opens; turned on later, it shows from the next launch.
     let metal_hud = settings.metal_hud;
@@ -103,17 +152,18 @@ pub fn run() -> Result<()> {
     let watched = presentation.clone();
     let lifecycle = Arc::new(Lifecycle::default());
     let life = lifecycle.clone();
-    let _watch = sdl.event().map_err(|e| anyhow!("SDL events: {e}"))?.add_event_watch(move |event: Event| match event {
-        Event::Window { win_event: WindowEvent::PixelSizeChanged(w, h), .. } => {
-            watched.set_size(w.max(0) as u32, h.max(0) as u32)
-        }
-        Event::AppWillEnterBackground { .. } => life.background.store(true, Ordering::Relaxed),
-        Event::AppDidEnterForeground { .. } => {
-            life.background.store(false, Ordering::Relaxed);
-            life.came_back.store(true, Ordering::Relaxed);
-        }
-        _ => {}
-    });
+    let _watch =
+        sdl.event().map_err(|e| anyhow!("SDL events: {e}"))?.add_event_watch(move |event: Event| match event {
+            Event::Window { win_event: WindowEvent::PixelSizeChanged(w, h), .. } => {
+                watched.set_size(w.max(0) as u32, h.max(0) as u32)
+            }
+            Event::AppWillEnterBackground { .. } => life.background.store(true, Ordering::Relaxed),
+            Event::AppDidEnterForeground { .. } => {
+                life.background.store(false, Ordering::Relaxed);
+                life.came_back.store(true, Ordering::Relaxed);
+            }
+            _ => {}
+        });
 
     // Text input runs only while the game's text box is open (see `update`).
     let text_input = video.text_input();
@@ -157,6 +207,15 @@ pub fn run() -> Result<()> {
         mode,
         benchmark: last_benchmark,
         game: None,
+        adaptive_slow_since: None,
+        adaptive_fast_since: None,
+        adaptive_last_change: None,
+        active_render_scale: None,
+        thermal_state: 0,
+        thermal_last_poll: Instant::now(),
+        thermal_cool_since: None,
+        thermal_cap: None,
+        last_ui_frame: Instant::now(),
     };
     app.last_failure = std::fs::read_to_string(app.user_dir.join(FAILURE_FILE)).ok();
     app.find_game(args.game_dir.as_deref());
@@ -254,6 +313,17 @@ struct App {
     /// The last benchmark's results.
     benchmark: Option<benchmark::Results>,
     game: Option<Running>,
+    /// Hysteresis timers for adaptive mobile rendering. The timers make the
+    /// quality react to sustained pressure, not one transient frame.
+    adaptive_slow_since: Option<Instant>,
+    adaptive_fast_since: Option<Instant>,
+    adaptive_last_change: Option<Instant>,
+    active_render_scale: Option<f32>,
+    thermal_state: u8,
+    thermal_last_poll: Instant,
+    thermal_cool_since: Option<Instant>,
+    thermal_cap: Option<u32>,
+    last_ui_frame: Instant,
 }
 
 /// The game, once started.
@@ -289,6 +359,12 @@ impl App {
                 self.stopped(why);
                 return Ok(());
             }
+            // This is intentionally on the UI/event thread. If it freezes,
+            // the last durable heartbeat says when it stopped; if only an
+            // engine thread stops, heartbeats continue but report its rings.
+            if self.game.is_some() {
+                glue5_runtime::diagnostics::heartbeat();
+            }
             if let Some(game) = &mut self.game
                 && game.input.is_none()
             {
@@ -300,7 +376,7 @@ impl App {
             let page = self.ui.page();
             // Before the game the loop sleeps until there is input or the UI
             // animates; with it, it keeps the touch controls and pads current.
-            let wait = if self.game.is_some() { Duration::from_millis(8) } else { self.ui.idle_for() };
+            let wait = if self.game.is_some() { Duration::from_millis(16) } else { self.ui.idle_for() };
             let first = wait_event(&mut self.events, wait);
             let events: Vec<Event> = first.into_iter().chain(self.events.poll_iter()).collect();
             for event in events {
@@ -416,15 +492,26 @@ impl App {
         // What applies at once (the engine's own frame limiter at its next start).
         self.presentation.set_vsync(self.settings.vsync);
         self.presentation.set_metal_hud(self.settings.metal_hud);
-        self.presentation.set_frame_rate(self.settings.max_fps);
+        self.update_thermal();
+        self.presentation.set_frame_rate(self.effective_fps());
         self.presentation.set_upscaler(upscaler(&self.settings));
         self.presentation.set_sharpness(self.settings.sharpness);
         self.presentation.set_frame_generation(self.settings.frame_generation);
+        self.presentation.set_upscale_height(if self.settings.upscale_lines.is_some() {
+            self.settings.output_size(self.window.size_in_pixels()).1
+        } else {
+            0
+        });
+        glue5_runtime::diagnostics::set_verbose_logs(self.settings.verbose_logs);
+        self.adapt_graphics();
         self.resize_game();
 
         // The UI: over the game at every turn, before it when something changed.
         let mut actions = Vec::new();
-        if in_game || (!self.lifecycle.background.load(Ordering::Relaxed) && self.ui.wants_frame()) {
+        let ui_budget = Duration::from_secs_f64(1.0 / self.effective_fps().clamp(30, 60) as f64);
+        let ui_due = self.ui.wants_frame() || self.last_ui_frame.elapsed() >= ui_budget;
+        if !self.lifecycle.background.load(Ordering::Relaxed) && ((in_game && ui_due) || self.ui.wants_frame()) {
+            self.last_ui_frame = Instant::now();
             let status = Status {
                 game_dir: self.game_dir.as_deref(),
                 problem: self.problem.as_deref(),
@@ -439,6 +526,9 @@ impl App {
                 preparing: self.play_requested.then(|| self.screen.as_ref().and_then(Screen::progress)).flatten(),
                 mode: self.mode,
                 benchmark: self.benchmark.as_ref(),
+                thermal_state: self.thermal_state,
+                effective_fps: self.effective_fps(),
+                actual_input: self.game.as_ref().map(|g| g.back_buffer),
             };
             // The settings button: on touch screens always, so that it stays
             // with a controller in use or the touch controls off.
@@ -510,12 +600,11 @@ impl App {
         Ok(false)
     }
 
-    /// The game's back buffer follows the window and the render scale: asked
-    /// of the engine when it differs. The engine waits for a size to hold for 20
-    /// of its frames before rebuilding its render targets, and a window
-    /// being resized by the system does not reach this loop until the end:
-    /// one rebuild per resize. Phone windows never change size; only the
-    /// scale moves their back buffer.
+    /// The game's back buffer follows the window (desktop), and on phones it
+    /// can also follow adaptive quality. The engine waits for a size to hold
+    /// for 20 of its frames before rebuilding its render targets, and a
+    /// window being resized by the system does not reach this loop until the
+    /// end: one rebuild per resize.
     fn resize_game(&mut self) {
         let Some(game) = &mut self.game else { return };
         let Some(input) = &game.input else { return };
@@ -523,11 +612,120 @@ impl App {
         if w == 0 || h == 0 {
             return;
         }
-        let size = settings::render_size((w, h), self.settings.render_scale(), game.started.low_memory);
+        let wanted = self.settings.input_size((w, h));
+        let scale = self.active_render_scale.unwrap_or(wanted.1 as f32 / h as f32);
+        let size = settings::render_size((w, h), scale, game.started.low_memory);
         if size != game.back_buffer {
             log::info!("back buffer {}x{}", size.0, size.1);
             input.resize(size.0, size.1);
             game.back_buffer = size;
+            if MOBILE {
+                game.started.render_scale = scale;
+            }
+        }
+    }
+
+    /// Adjusts only the engine back buffer, leaving the game's texture and
+    /// world streaming settings alone. It needs sustained evidence before a
+    /// change and a cooldown afterwards, so the picture does not oscillate.
+    fn adapt_graphics(&mut self) {
+        let pixels = self.window.size_in_pixels();
+        let wanted = self.settings.input_size(pixels).1 as f32 / pixels.1.max(1) as f32;
+        let hot = MOBILE && self.settings.thermal_protection && self.thermal_cap.is_some();
+        let ceiling = wanted
+            * if hot {
+                if self.thermal_state >= 3 {
+                    0.6
+                } else if self.thermal_state == 1 {
+                    0.9
+                } else {
+                    0.75
+                }
+            } else {
+                1.0
+            };
+        if !MOBILE || !self.settings.adaptive_graphics || self.game.is_none() {
+            self.adaptive_slow_since = None;
+            self.adaptive_fast_since = None;
+            self.active_render_scale = Some(ceiling);
+            return;
+        }
+        self.active_render_scale = Some(self.active_render_scale.unwrap_or(ceiling).min(ceiling));
+        let Some(interval_ms) = self.presentation.frame_interval_ms() else { return };
+        let fps = self.effective_fps();
+        let target_ms = 1000.0 / if fps > 0 { fps } else { 60 } as f32;
+        let now = Instant::now();
+        let overloaded = interval_ms > target_ms * 1.18;
+        let headroom = !hot && self.thermal_state < 2 && interval_ms <= target_ms * 1.04;
+        if overloaded {
+            self.adaptive_slow_since.get_or_insert(now);
+            self.adaptive_fast_since = None;
+        } else if headroom {
+            self.adaptive_fast_since.get_or_insert(now);
+            self.adaptive_slow_since = None;
+        } else {
+            self.adaptive_slow_since = None;
+            self.adaptive_fast_since = None;
+        }
+        let cooldown = self.adaptive_last_change.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2));
+        let lower =
+            cooldown && self.adaptive_slow_since.is_some_and(|t| now.duration_since(t) >= Duration::from_millis(1200));
+        let raise =
+            cooldown && self.adaptive_fast_since.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(8));
+        let delta = if lower {
+            -0.05
+        } else if raise {
+            0.05
+        } else {
+            return;
+        };
+        let old = self.active_render_scale.unwrap_or(ceiling);
+        let floor = 240.0 / pixels.1.max(1) as f32;
+        let new = (old + delta).max(floor.min(ceiling)).min(ceiling);
+        self.adaptive_slow_since = None;
+        self.adaptive_fast_since = None;
+        if new == old {
+            return;
+        }
+        self.active_render_scale = Some(new);
+        if let Some(game) = &mut self.game {
+            game.started.render_scale = new;
+        }
+        self.adaptive_last_change = Some(now);
+        log::info!("adaptive graphics: frame interval {interval_ms:.1} ms, render scale {old:.2} -> {new:.2}");
+        glue5_runtime::diagnostics::note(format_args!(
+            "adaptive graphics: frame_interval={interval_ms:.1}ms render_scale={old:.2}->{new:.2}",
+        ));
+    }
+
+    fn effective_fps(&self) -> u32 {
+        let engine_cap = self.game.as_ref().and_then(|g| (g.started.max_fps > 0).then_some(g.started.max_fps));
+        let requested = limited_fps(self.settings.max_fps, engine_cap);
+        limited_fps(requested, self.thermal_cap.filter(|_| self.settings.thermal_protection))
+    }
+
+    fn update_thermal(&mut self) {
+        if !MOBILE || self.thermal_last_poll.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.thermal_last_poll = Instant::now();
+        let state = glue5_gpu::thermal_state();
+        if state != self.thermal_state {
+            glue5_runtime::diagnostics::note(format_args!("thermal state: {} -> {state}", self.thermal_state));
+            self.thermal_state = state;
+        }
+        if !self.settings.thermal_protection {
+            self.thermal_cap = None;
+            self.thermal_cool_since = None;
+        } else if let Some(cap) = hot_fps_cap(state) {
+            self.thermal_cap = Some(self.thermal_cap.map_or(cap, |old| old.min(cap)));
+            self.thermal_cool_since = None;
+        } else if self.thermal_cap.is_some() {
+            let since = self.thermal_cool_since.get_or_insert(Instant::now());
+            if since.elapsed() >= Duration::from_secs(30) {
+                self.thermal_cap = None;
+                self.thermal_cool_since = None;
+            }
         }
     }
 
@@ -538,12 +736,21 @@ impl App {
         let Some(game_dir) = self.game_dir.clone() else { return Ok(()) };
         let mut gpu_settings = glue5_gpu::Settings::for_game(&game_dir);
         gpu_settings.cache_dir = Some(self.user_dir.join("cache"));
+        gpu_settings.max_texture_dimension = self.settings.texture_detail.max_dimension();
         let Some(screen) = self.screen.as_mut() else { return Ok(()) };
         self.play_requested = !screen.prepare(&gpu_settings);
         if self.play_requested {
             return Ok(());
         }
         let Some(screen) = self.screen.take() else { return Ok(()) };
+        // `play` is called once per UI frame while pipeline preparation is
+        // running. Open the visible mirror only once that preparation has
+        // completed, otherwise each attempt replaces its file descriptor.
+        let visible_diagnostics = game_dir.join("Glue5 Diagnostics");
+        match glue5_runtime::diagnostics::mirror_to(&visible_diagnostics) {
+            Ok(path) => glue5_runtime::diagnostics::note(format_args!("diagnostics mirror: {}", path.display())),
+            Err(e) => log::warn!("diagnostics: cannot mirror to {}: {e}", visible_diagnostics.display()),
+        }
         // Graphics quality is the game's own (its menu); the low-memory
         // profile only lowers it once, after which the menu has the last word.
         if self.settings.low_memory && !self.settings.low_preset_written {
@@ -558,12 +765,26 @@ impl App {
         if self.mode == Mode::Online && self.settings.online_name.trim().is_empty() {
             self.settings.online_name = settings::default_online_name();
         }
+        if self.settings.world_preset != settings::WorldPreset::Game {
+            glue5_runtime::game_settings::apply(&self.user_dir, &self.settings.world.xml_values())?;
+        }
+        glue5_runtime::diagnostics::set_verbose_logs(self.settings.verbose_logs);
         self.settings.save(&self.user_dir);
         // A new attempt: the last one's failure is history.
         let _ = std::fs::remove_file(self.user_dir.join(FAILURE_FILE));
         log::info!("game: {}, user data: {}", game_dir.display(), self.user_dir.display());
         let s = &self.settings;
-        let back_buffer = settings::render_size(self.window.size_in_pixels(), s.render_scale(), s.low_memory);
+        let back_buffer = s.input_size(self.window.size_in_pixels());
+        glue5_runtime::diagnostics::note(format_args!(
+            "game launch requested: game={} resolution={}x{} render_scale={:.2} low_memory={} max_fps={} mode={:?}",
+            game_dir.display(),
+            back_buffer.0,
+            back_buffer.1,
+            s.render_scale(),
+            s.low_memory,
+            s.max_fps,
+            self.mode,
+        ));
         let game = glue5_runtime::start(
             glue5_runtime::Config {
                 game_dir: game_dir.clone(),
@@ -574,6 +795,7 @@ impl App {
                 start_mode: if self.mode == Mode::Sandbox { 2 } else { 1 },
                 benchmark: self.mode == Mode::Benchmark,
                 low_memory: s.low_memory,
+                resource_mb: s.resource_budget.mb(),
                 max_fps: s.max_fps,
                 online: (self.mode == Mode::Online)
                     .then(|| glue5_runtime::Online { name: s.online_name.trim().into(), lobby: s.lobby() }),
@@ -588,10 +810,18 @@ impl App {
                 None
             }
         };
-        let started =
-            Started { game_dir, max_fps: s.max_fps, low_memory: s.low_memory, render_scale: s.render_scale() };
+        let started = Started {
+            game_dir,
+            max_fps: s.max_fps,
+            low_memory: s.low_memory,
+            render_scale: s.render_scale(),
+            world: (s.world_preset != settings::WorldPreset::Game).then_some(s.world),
+            texture_detail: s.texture_detail,
+            resource_budget: s.resource_budget,
+        };
         self.game = Some(Running { game, input: None, started, back_buffer, _audio: audio });
         self.ui.game_started();
+        glue5_runtime::diagnostics::note(format_args!("game launch complete: waiting for engine input block"));
         Ok(())
     }
 
@@ -621,6 +851,7 @@ impl App {
     /// start page, which offers the way out of a graphics setting the engine
     /// cannot run with; on desktop it opens again on that page.
     fn stopped(&mut self, why: &str) {
+        glue5_runtime::diagnostics::fault(format_args!("app stopped: {why}"));
         if let Err(e) = std::fs::write(self.user_dir.join(FAILURE_FILE), why) {
             log::warn!("cannot record the failure: {e}");
         }

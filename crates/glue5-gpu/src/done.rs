@@ -6,9 +6,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use glue5_runtime::gpu::{OCCLUSION_VISIBLE_COUNT, store_query};
 use glue5_runtime::memory::Mem;
+
+use crate::byte_cache::ByteCache;
 
 pub enum Work {
     /// A fence: store `value` at `at` and wake waiters.
@@ -83,17 +86,29 @@ pub struct Staging {
 }
 
 /// MAP_READ buffers, reused.
-#[derive(Default)]
 pub struct StagingPool {
-    free: Mutex<Vec<wgpu::Buffer>>,
+    free: Mutex<ByteCache<wgpu::Buffer>>,
+}
+
+impl Default for StagingPool {
+    fn default() -> Self {
+        let mobile = cfg!(any(target_os = "ios", target_os = "android"));
+        Self {
+            free: Mutex::new(ByteCache::new(
+                if mobile { 16 << 20 } else { 32 << 20 },
+                if mobile { 8 << 20 } else { 16 << 20 },
+                16,
+            )),
+        }
+    }
 }
 
 impl StagingPool {
     pub fn get(&self, device: &wgpu::Device, size: u64) -> wgpu::Buffer {
         let size = size.max(256).next_power_of_two();
         let mut free = self.free.lock().unwrap();
-        if let Some(i) = free.iter().position(|b| b.size() == size) {
-            return free.swap_remove(i);
+        if let Some(buffer) = free.take(size, true) {
+            return buffer;
         }
         drop(free);
         device.create_buffer(&wgpu::BufferDescriptor {
@@ -105,10 +120,14 @@ impl StagingPool {
     }
 
     fn put(&self, buffer: wgpu::Buffer) {
-        let mut free = self.free.lock().unwrap();
-        if free.len() < 16 {
-            free.push(buffer);
+        let kept = self.free.lock().unwrap().insert(buffer.size(), buffer);
+        if let Err(buffer) = kept {
+            buffer.destroy();
         }
+    }
+
+    pub fn cached_bytes(&self) -> u64 {
+        self.free.lock().unwrap().bytes()
     }
 }
 
@@ -117,14 +136,12 @@ impl Staging {
     pub fn map(buffer: wgpu::Buffer) -> Staging {
         let mapped = Arc::new(AtomicU8::new(0));
         let m = mapped.clone();
-        buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |r| {
-                if let Err(e) = &r {
-                    log::warn!("gpu: mapping a readback: {e}");
-                }
-                m.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release)
-            });
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            if let Err(e) = &r {
+                log::warn!("gpu: mapping a readback: {e}");
+            }
+            m.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release)
+        });
         Staging { buffer, mapped }
     }
 }
@@ -155,20 +172,116 @@ fn run(device: wgpu::Device, mem: Mem, pool: Arc<StagingPool>, rx: Receiver<(wgp
     // The engine paces its frames on what this thread completes.
     glue5_runtime::qos::set(glue5_runtime::qos::Qos::Interactive);
     while let Ok((submission, works)) = rx.recv() {
-        if let Err(e) = device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }) {
-            log::error!("gpu: waiting for a submission: {e}");
+        glue5_runtime::diagnostics::gpu_completion_stage(1);
+        let result = wait_for_submission(
+            || {
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(submission.clone()),
+                        timeout: Some(Duration::from_secs(1)),
+                    })
+                    .map(|_| ())
+            },
+            |elapsed| {
+                glue5_runtime::diagnostics::fault(format_args!(
+                    "gpu completion stalled: submission={submission:?} elapsed={}ms pending_work={}; retaining readbacks and fences",
+                    elapsed.as_millis(),
+                    works.len()
+                ))
+            },
+        );
+        if let Err(e) = result {
+            glue5_runtime::exit::fail(format!("GPU submission wait failed: {e}"));
+            // Never signal completion for work that did not finish.
+            return;
         }
+        glue5_runtime::diagnostics::gpu_completion_stage(2);
         for work in works {
             finish(&device, mem, &pool, work);
         }
+        glue5_runtime::diagnostics::gpu_completion_stage(0);
+    }
+}
+
+/// A timeout is not completion: keep the submission and its work alive and
+/// retry. Only a successful poll permits writing engine completion flags.
+fn wait_for_submission(
+    mut poll: impl FnMut() -> Result<(), wgpu::PollError>,
+    mut stalled: impl FnMut(Duration),
+) -> Result<(), wgpu::PollError> {
+    let started = Instant::now();
+    let mut reported = Duration::ZERO;
+    loop {
+        match poll() {
+            Ok(()) => return Ok(()),
+            Err(wgpu::PollError::Timeout) => {
+                let elapsed = started.elapsed();
+                if elapsed.saturating_sub(reported) >= Duration::from_secs(5) {
+                    reported = elapsed;
+                    stalled(elapsed);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_does_not_complete_submission() {
+        let mut calls = 0;
+        wait_for_submission(
+            || {
+                calls += 1;
+                if calls < 3 { Err(wgpu::PollError::Timeout) } else { Ok(()) }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn invalid_submission_does_not_retry_or_succeed() {
+        let mut calls = 0;
+        let result = wait_for_submission(
+            || {
+                calls += 1;
+                Err(wgpu::PollError::WrongSubmissionIndex(2, 1))
+            },
+            |_| {},
+        );
+        assert!(matches!(result, Err(wgpu::PollError::WrongSubmissionIndex(2, 1))));
+        assert_eq!(calls, 1);
     }
 }
 
 /// The mapped contents of a staging buffer, or `None` if mapping failed.
 fn mapped(device: &wgpu::Device, s: &Staging) -> Option<wgpu::BufferView> {
     if s.mapped.load(Ordering::Acquire) == 0 {
-        // Callbacks of the submission waited for have run; a straggler gets one more poll.
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        // The relevant submission already completed. Pump callbacks without
+        // waiting for unrelated, newer submissions.
+        let started = Instant::now();
+        let mut reported = Duration::ZERO;
+        while s.mapped.load(Ordering::Acquire) == 0 {
+            if let Err(e) = device.poll(wgpu::PollType::Poll) {
+                glue5_runtime::diagnostics::fault(format_args!("gpu mapping poll failed: {e}"));
+            }
+            if started.elapsed().saturating_sub(reported) >= Duration::from_secs(5) {
+                reported = started.elapsed();
+                glue5_runtime::diagnostics::fault(format_args!(
+                    "gpu mapping callback stalled: elapsed={}ms buffer_bytes={}",
+                    reported.as_millis(),
+                    s.buffer.size()
+                ));
+            }
+            if s.mapped.load(Ordering::Acquire) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
     if s.mapped.load(Ordering::Acquire) == 1 { s.buffer.slice(..).get_mapped_range().ok() } else { None }
 }

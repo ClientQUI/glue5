@@ -2,7 +2,7 @@
 //! threads run) and accessed by host code through [`Mem`].
 
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
 use glue5_game::{Env, MEMORY_INITIAL_PAGES, MEMORY_MAX_PAGES, Memory, PAGE_SIZE, orig};
@@ -11,6 +11,10 @@ pub struct WasmMemory {
     pub desc: *mut Memory,
     base: *mut u8,
     max_pages: u64,
+    /// Mirrors `Memory::size` for host threads. The translated game accesses
+    /// the descriptor directly, but diagnostics and host helpers must not
+    /// race that non-atomic field while an engine thread grows it.
+    size_bytes: AtomicU64,
 }
 
 unsafe impl Send for WasmMemory {}
@@ -31,7 +35,12 @@ impl WasmMemory {
                 }
                 log::info!("wasm memory: {} MiB reserved at {base:p}", bytes >> 20);
                 let desc = unsafe { Memory::new(base, MEMORY_INITIAL_PAGES, max_pages) };
-                return Ok(WasmMemory { desc, base, max_pages });
+                return Ok(WasmMemory {
+                    desc,
+                    base,
+                    max_pages,
+                    size_bytes: AtomicU64::new(MEMORY_INITIAL_PAGES * PAGE_SIZE),
+                });
             }
             if max_pages / 2 < MEMORY_INITIAL_PAGES {
                 bail!("cannot reserve {} MiB for the wasm memory", (MEMORY_INITIAL_PAGES * PAGE_SIZE) >> 20);
@@ -49,7 +58,7 @@ impl WasmMemory {
     }
 
     pub fn size(&self) -> u64 {
-        unsafe { (*self.desc).size }
+        self.size_bytes.load(Ordering::Acquire)
     }
 
     /// `emscripten_resize_heap`: memory is already reserved, growing only
@@ -70,6 +79,7 @@ impl WasmMemory {
                 (*self.desc).size = pages * PAGE_SIZE;
             }
         }
+        self.size_bytes.fetch_max(pages * PAGE_SIZE, Ordering::Release);
         true
     }
 }
@@ -255,6 +265,12 @@ pub fn footprint() -> (Option<u64>, Option<u64>) {
 
 /// The resource heap's budget, in bytes (0: none).
 static RESOURCE_BUDGET: AtomicU64 = AtomicU64::new(0);
+/// Largest resource heap observed since the current game started. The engine
+/// does not expose this in its public statistics, but it is the allocation
+/// that normally grows while driving through the world.
+static RESOURCE_HEAP_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+/// Avoid doing disk I/O from every streaming query once the budget is full.
+static RESOURCE_BUDGET_REACHED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// The streaming engine is asking how much memory is left.
@@ -264,6 +280,20 @@ thread_local! {
 /// Budgets the resource heap at `mb` MiB (the engine's `gameResourceMB`).
 pub(crate) fn budget_resource_heap(mb: u32) {
     RESOURCE_BUDGET.store((mb as u64) << 20, Ordering::Relaxed);
+    RESOURCE_HEAP_HIGH_WATER.store(0, Ordering::Relaxed);
+    RESOURCE_BUDGET_REACHED.store(false, Ordering::Relaxed);
+    crate::diagnostics::note(format_args!("memory: resource heap budget={}MiB", mb));
+}
+
+/// The configured resource budget and its observed high-water mark, in
+/// bytes. This is deliberately lock-free: the app's heartbeat may sample it
+/// while the engine is streaming on another thread.
+pub(crate) fn resource_heap_stats() -> (u64, u64) {
+    (RESOURCE_BUDGET.load(Ordering::Relaxed), RESOURCE_HEAP_HIGH_WATER.load(Ordering::Relaxed))
+}
+
+fn note_resource_heap_size(size: u64) {
+    RESOURCE_HEAP_HIGH_WATER.fetch_max(size, Ordering::Relaxed);
 }
 
 /// Hook for `rage::sysMemGrowBuddyAllocator::GrowHeap()`. The PC build's
@@ -281,7 +311,16 @@ pub(crate) unsafe extern "C" fn grow_heap(env: *mut Env, this: u64) -> u32 {
     // smallest growth step of the budget counts as there.
     const STEP: u64 = 16 << 20;
     let budget = RESOURCE_BUDGET.load(Ordering::Relaxed);
-    if budget != 0 && ASKING.get() && unsafe { orig::heap_size(env, this) } + STEP > budget {
+    let size = unsafe { orig::heap_size(env, this) };
+    note_resource_heap_size(size);
+    if budget != 0 && ASKING.get() && size + STEP > budget {
+        if !RESOURCE_BUDGET_REACHED.swap(true, Ordering::Relaxed) {
+            crate::diagnostics::note(format_args!(
+                "memory: streaming reached resource budget (heap={}MiB budget={}MiB); asking it to evict",
+                size >> 20,
+                budget >> 20,
+            ));
+        }
         return u32::MAX;
     }
     unsafe { orig::grow_heap(env, this) }
@@ -316,7 +355,11 @@ pub(crate) unsafe extern "C" fn largest_block(env: *mut Env, this: u64) -> u64 {
 unsafe fn over_budget(env: *mut Env, this: u64) -> u64 {
     match RESOURCE_BUDGET.load(Ordering::Relaxed) {
         0 => 0,
-        budget => unsafe { orig::heap_size(env, this) }.saturating_sub(budget),
+        budget => {
+            let size = unsafe { orig::heap_size(env, this) };
+            note_resource_heap_size(size);
+            size.saturating_sub(budget)
+        }
     }
 }
 

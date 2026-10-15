@@ -62,6 +62,7 @@ fn run() -> Result<()> {
         println!("cargo:rerun-if-changed={}", manifest.join(path).display());
     }
     println!("cargo:rerun-if-env-changed=GLUE5_GAME_DIR");
+    println!("cargo:rerun-if-env-changed=GLUE5_IOS_CPU");
     println!("cargo:rerun-if-env-changed=GLUE5_ALLOW_UNKNOWN_BUILD");
 
     // 1. The game.
@@ -149,9 +150,11 @@ fn run() -> Result<()> {
     }
     // iOS devices default to the Apple A7's ARMv8.0: no LSE atomics (the
     // engine synchronises a lot) and old scheduling. iOS 16.4 runs on A11
-    // and later.
+    // and later. Personal builds may select a newer compatible CPU, e.g.
+    // GLUE5_IOS_CPU=apple-a17, for better code generation on newer phones.
     if env::var("TARGET")? == "aarch64-apple-ios" {
-        build.flag("-mcpu=apple-a11");
+        let cpu = env::var("GLUE5_IOS_CPU").unwrap_or_else(|_| "apple-a11".into());
+        build.flag(format!("-mcpu={cpu}"));
     }
     if env::var("CARGO_CFG_TARGET_ARCH")? == "x86_64" {
         build.flag_if_supported("-msse4.1"); // SIMDe maps wasm SIMD much better with SSE4.1

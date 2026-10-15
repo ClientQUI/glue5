@@ -9,13 +9,20 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::byte_cache::ByteCache;
+
 const CHUNK: u64 = 4 << 20;
 /// Chunks kept for reuse, at most: loading needs many at once, play few,
 /// and memory is scarce on phones.
 const KEEP: usize = 16;
+const CACHE_BYTES: u64 = if cfg!(any(target_os = "ios", target_os = "android")) { 32 << 20 } else { 64 << 20 };
+const CACHE_BUFFER_BYTES: u64 = if cfg!(any(target_os = "ios", target_os = "android")) { 8 << 20 } else { 16 << 20 };
+/// Submit large streaming bursts incrementally instead of retaining all their
+/// staging chunks in one command batch. A single larger upload is still valid.
+pub const BATCH_BYTES: u64 = 32 << 20;
 
 /// Mapped chunks, ready to be written.
-pub type FreeChunks = Arc<Mutex<Vec<wgpu::Buffer>>>;
+pub type FreeChunks = Arc<Mutex<ByteCache<wgpu::Buffer>>>;
 
 pub struct Uploads {
     device: wgpu::Device,
@@ -26,15 +33,32 @@ pub struct Uploads {
     used: Vec<wgpu::Buffer>,
     free: FreeChunks,
     pub bytes: u64,
+    batch_bytes: u64,
 }
 
 impl Uploads {
     pub fn new(device: wgpu::Device) -> Uploads {
-        Uploads { device, encoder: None, current: None, used: Vec::new(), free: FreeChunks::default(), bytes: 0 }
+        Uploads {
+            device,
+            encoder: None,
+            current: None,
+            used: Vec::new(),
+            free: Arc::new(Mutex::new(ByteCache::new(CACHE_BYTES, CACHE_BUFFER_BYTES, KEEP))),
+            bytes: 0,
+            batch_bytes: 0,
+        }
     }
 
     pub fn free_chunks(&self) -> FreeChunks {
         self.free.clone()
+    }
+
+    pub fn cached_bytes(&self) -> u64 {
+        self.free.lock().unwrap().bytes()
+    }
+
+    pub fn batch_full(&self) -> bool {
+        self.batch_bytes >= BATCH_BYTES
     }
 
     fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -57,10 +81,7 @@ impl Uploads {
         if let Some((full, _)) = self.current.take() {
             self.used.push(full);
         }
-        let reused = {
-            let mut free = self.free.lock().unwrap();
-            free.iter().position(|b| b.size() >= size).map(|i| free.swap_remove(i))
-        };
+        let reused = self.free.lock().unwrap().take(size.max(CHUNK), false);
         let buffer = reused.unwrap_or_else(|| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("upload staging"),
@@ -81,6 +102,7 @@ impl Uploads {
             return;
         }
         self.bytes += size;
+        self.batch_bytes += size;
         let (chunk, at) = self.allocate(size, wgpu::COPY_BUFFER_ALIGNMENT);
         {
             let mut view = chunk.slice(at..at + size).get_mapped_range_mut().expect("staging memory is mapped");
@@ -110,6 +132,7 @@ impl Uploads {
             return;
         }
         self.bytes += size;
+        self.batch_bytes += size;
         let (chunk, base) = self.allocate(size, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64);
         {
             let mut view = chunk.slice(base..base + size).get_mapped_range_mut().expect("staging memory is mapped");
@@ -139,6 +162,7 @@ impl Uploads {
     /// The uploads to submit before the next commands, and the chunks they
     /// copy from (unmapped; to [`recycle`] after the submit).
     pub fn finish(&mut self) -> (Option<wgpu::CommandEncoder>, Vec<wgpu::Buffer>) {
+        self.batch_bytes = 0;
         if let Some((chunk, _)) = self.current.take() {
             self.used.push(chunk);
         }
@@ -155,12 +179,77 @@ pub fn recycle(chunks: Vec<wgpu::Buffer>, free: &FreeChunks) {
     for chunk in chunks {
         let (back, free) = (chunk.clone(), free.clone());
         chunk.slice(..).map_async(wgpu::MapMode::Write, move |r| {
-            let mut free = free.lock().unwrap();
-            if r.is_ok() && free.len() < KEEP {
-                free.push(back);
-            } else {
+            let kept = if r.is_ok() { free.lock().unwrap().insert(back.size(), back) } else { Err(back) };
+            if let Err(back) = kept {
                 back.destroy();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a Metal or Vulkan device"]
+    fn upload_bursts_submit_in_order_and_cache_is_byte_bounded() {
+        let gpu = crate::Device::open(&crate::instance(), None).unwrap();
+        let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut uploads = Uploads::new(gpu.device.clone());
+        // A small test budget exercises the same policy without relying on
+        // the platform on which this test is run.
+        uploads.free = Arc::new(Mutex::new(ByteCache::new(CHUNK * 2, CHUNK, KEEP)));
+        let target = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("upload budget test"),
+            size: CHUNK,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let mut data = vec![0; CHUNK as usize];
+        for i in 0..9 {
+            data.fill(i);
+            uploads.buffer(&target, 0, &data);
+            assert_eq!(uploads.batch_full(), i == 7);
+            if uploads.batch_full() || i == 8 {
+                let (encoder, chunks) = uploads.finish();
+                let index = gpu.queue.submit(encoder.map(|e| e.finish()));
+                recycle(chunks, &uploads.free);
+                gpu.device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(index),
+                        timeout: Some(std::time::Duration::from_secs(10)),
+                    })
+                    .unwrap();
+                assert!(uploads.cached_bytes() <= CHUNK * 2);
+                assert!(!uploads.batch_full());
+            }
+        }
+        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: CHUNK,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&target, 0, &readback, 0, CHUNK);
+        let index = gpu.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        gpu.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(index),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .unwrap();
+        rx.recv().unwrap().unwrap();
+        {
+            let view = readback.slice(..).get_mapped_range().unwrap();
+            assert!(view.iter().all(|b| *b == 8), "latest upload wins across budget submits");
+        }
+        readback.unmap();
+        assert!(pollster::block_on(scope.pop()).is_none());
     }
 }

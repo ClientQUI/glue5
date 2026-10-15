@@ -230,6 +230,7 @@ pub struct Gpu {
     /// the first one comes): copied in at a flush once decoded.
     pub decoder: Option<Pool>,
     pub decodes: Vec<Decode>,
+    pub decode_peak_bytes: u64,
 
     // queries
     pub occlusion: crate::ops::Occlusion,
@@ -257,6 +258,10 @@ pub struct Gpu {
 /// (a batch's uploads go before its commands anyway).
 pub struct Decode {
     data: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// Queued jobs release their compressed copy immediately on cancellation;
+    /// an already-running job owns it until that decode finishes.
+    source: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    bytes: u64,
     /// The texture's object, and the texture it was when the data came.
     id: u32,
     texture: wgpu::Texture,
@@ -267,6 +272,19 @@ pub struct Decode {
     rows: u32,
     extent: wgpu::Extent3d,
     row_bytes: u32,
+}
+
+impl Drop for Decode {
+    fn drop(&mut self) {
+        self.source.lock().unwrap().take();
+    }
+}
+
+const DECODE_BYTES: u64 = if cfg!(any(target_os = "ios", target_os = "android")) { 32 << 20 } else { 128 << 20 };
+const DECODE_COUNT: usize = 64;
+
+fn decode_backpressure(pending: u64, count: usize, incoming: u64) -> bool {
+    count != 0 && (count >= DECODE_COUNT || incoming > DECODE_BYTES.saturating_sub(pending))
 }
 
 /// Recorded work waits this long for more before an idle ring submits it.
@@ -302,7 +320,11 @@ impl Gpu {
     fn execute_until(&mut self, reader: &mut Reader, head: u32) {
         let mut n = 0u32;
         while let Some(c) = reader.next(head) {
+            glue5_runtime::diagnostics::gpu_command(c.op);
             self.execute(c);
+            if self.uploads.batch_full() {
+                self.flush("upload budget");
+            }
             n += 1;
             if n.is_multiple_of(512) {
                 // Every command copies what it needs: the space can be reused.
@@ -587,7 +609,7 @@ impl Gpu {
         self.uniforms.flush(&mut self.uploads);
         self.resolve_occlusion();
         self.resolve_profile();
-        self.finish_decodes();
+        self.finish_decodes(false);
         self.recycler.trim(self.epoch, &mut self.graveyard);
         let (uploads, staging) = self.uploads.finish();
         let encoders = uploads.into_iter().chain(self.encoder.take()).collect();
@@ -648,19 +670,20 @@ impl Gpu {
             height: if dim == 1 { 1 } else { h.max(1) },
             depth_or_array_layers: layers.max(1),
         };
-        // BC decoded on the CPU takes 4-8 times the memory (1-2 times
-        // re-encoded as ETC2), which phones cannot spare (on iOS it counts
-        // against the app's limit): large mipmapped textures lose their first
-        // level, a quarter of the texels to decode and keep. Small and
-        // unmipmapped ones (UI) stay whole.
-        let dropped = match tf.upload {
-            format::Upload::Bc(_)
-                if mips >= 2 && dimension == wgpu::TextureDimension::D2 && size.width.max(size.height) >= 512 =>
-            {
-                1
-            }
-            _ => 0,
-        };
+        // BC decoded on the CPU takes 4-8 times the memory, which phones
+        // cannot spare (on iOS it counts against the app's limit): large
+        // mipmapped textures lose their first level, a quarter of the texels
+        // to decode and keep. Small and unmipmapped ones (UI) stay whole.
+        let dropped = texture_mips_to_drop(
+            size,
+            mips,
+            dimension,
+            bind,
+            samples,
+            format::block(tf.format).1 == 4 || matches!(tf.upload, format::Upload::Bc(_)),
+            matches!(tf.upload, format::Upload::Bc(_)),
+            self.settings.max_texture_dimension,
+        );
         let gpu_size = wgpu::Extent3d {
             width: (size.width >> dropped).max(1),
             height: (size.height >> dropped).max(1),
@@ -895,16 +918,38 @@ impl Gpu {
                 let (cw, ch) = (w.min(mw.saturating_sub(x)), h.min(mh.saturating_sub(y)));
                 (cols * 4 * texel, block_rows * 4, ch, (cw, ch), cw * texel)
             };
-            let (texture, src) = (t.tex.clone(), data.to_vec());
-            t.uploaded.set(self.epoch);
+            let texture = t.tex.clone();
+            // ETC2 encoding temporarily owns both the decoded texels and
+            // its compressed result; include both in upload backpressure.
+            let encoded_bytes = if etc2 {
+                u64::from(cols) * u64::from(block_rows) * u64::from(d) * u64::from(crate::bc::ETC2_RGBA_BLOCK_BYTES)
+            } else {
+                0
+            };
+            let bytes = (data.len() as u64)
+                .saturating_add(crate::bc::decoded_bytes(bc, cols, block_rows, d))
+                .saturating_add(encoded_bytes);
+            let pending = self.decodes.iter().map(|d| d.bytes).sum::<u64>();
+            if decode_backpressure(pending, self.decodes.len(), bytes) {
+                // Backpressure, not failed allocations or missing textures:
+                // drain older jobs in order and submit their staging first.
+                self.finish_decodes(true);
+                self.flush("decode budget");
+            }
+            self.objs.tex(id).unwrap().uploaded.set(self.epoch);
+            let source = Arc::new(std::sync::Mutex::new(Some(data.to_vec())));
+            let job_source = source.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             let bpr = bpr as usize;
             self.decoder.get_or_insert_with(|| Pool::new("gpu decode", 2)).urgent(move || {
+                let Some(src) = job_source.lock().unwrap().take() else { return };
                 let texels = crate::bc::decode(bc, &src, bpr, src_rows, cols as usize, block_rows as usize, d as usize);
                 let _ = tx.send(if etc2 { crate::bc::etc2_rgba(texels, cols * 4, block_rows * 4 * d) } else { texels });
             });
             self.decodes.push(Decode {
                 data: rx,
+                source,
+                bytes,
                 id,
                 texture,
                 level,
@@ -915,6 +960,7 @@ impl Gpu {
                 extent: wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: d },
                 row_bytes,
             });
+            self.decode_peak_bytes = self.decode_peak_bytes.max(self.decodes.iter().map(|d| d.bytes).sum());
             return;
         }
         let converted;
@@ -960,7 +1006,7 @@ impl Gpu {
     /// the frame waits only for the textures it draws (streaming brings
     /// hundreds of decodes at once, hundreds of milliseconds on a phone).
     /// A texture's regions go in the order they came.
-    fn finish_decodes(&mut self) {
+    fn finish_decodes(&mut self, force: bool) {
         let mut later: Vec<Decode> = Vec::new();
         for d in std::mem::take(&mut self.decodes) {
             let Some(t) = self.objs.tex(d.id).filter(|t| t.tex == d.texture) else {
@@ -969,7 +1015,7 @@ impl Gpu {
             let used_now = t.used.get() == self.epoch;
             let texels = if later.iter().any(|l| l.texture == d.texture) {
                 None
-            } else if used_now {
+            } else if used_now || force {
                 let Ok(texels) = d.data.recv() else { continue };
                 Some(texels)
             } else {
@@ -1072,21 +1118,25 @@ impl Gpu {
             self.pdirty = true;
         }
         self.clears.retain(|c| c.tex != id);
+        // Do not decode or retain uploads for textures the streamer evicted.
+        self.decodes.retain(|d| d.id != id);
         // Memory goes right after the next submit: batches handed over
         // earlier may still be waiting for theirs. Cached bind groups must
         // not keep it.
         // What decides program variants may have gone with it.
         self.formats_seen.iter_mut().for_each(|n| *n += 1);
         match self.objs.remove(id) {
-            Some(Obj::Texture(t)) => match t.recycle {
-                Some(key) => self.recycler.keep_texture(self.epoch, key, t.tex, t.bytes),
-                None => self.graveyard.push(Grave::Texture(t.tex)),
-            },
-            Some(Obj::Buffer(b)) => match (b.slot, b.gpu) {
-                (Some(slot), _) => self.slabs.free(self.epoch, slot),
-                (None, Some(g)) => self.recycler.keep_buffer(self.epoch, g),
-                (None, None) => {}
-            },
+            Some(Obj::Texture(t)) => t.retire(self.epoch, &mut self.recycler, &mut self.graveyard),
+            Some(Obj::Buffer(b)) => {
+                match (b.slot, b.gpu) {
+                    (Some(slot), _) => self.slabs.free(self.epoch, slot),
+                    (None, Some(g)) => self.recycler.keep_buffer(self.epoch, g),
+                    (None, None) => {}
+                }
+                if let Some(counter) = b.counter {
+                    self.graveyard.push(Grave::Buffer(counter));
+                }
+            }
             _ => {}
         }
     }
@@ -1180,13 +1230,33 @@ impl Gpu {
         let ends: Vec<String> =
             ends.iter().take(6).map(|(op, n)| format!("op {op} {:.1}", **n as f64 / frames as f64)).collect();
         let (mut textures, mut buffers) = (0u64, 0u64);
+        let mut counts = [0usize; 4];
+        let mut proxy_bytes = 0u64;
         for o in self.objs.values() {
             match o {
-                Obj::Texture(t) => textures += t.bytes,
-                Obj::Buffer(b) => buffers += b.gpu.as_ref().map_or(0, |_| b.bytes),
-                _ => {}
+                Obj::Texture(t) => {
+                    counts[0] += 1;
+                    let bytes = t.resident_bytes();
+                    textures += bytes;
+                    proxy_bytes += bytes.saturating_sub(t.bytes);
+                }
+                Obj::Buffer(b) => {
+                    counts[1] += 1;
+                    buffers += b.gpu.as_ref().map_or(0, |_| b.bytes);
+                }
+                Obj::Srv(_) | Obj::Uav(_) => counts[2] += 1,
+                _ => counts[3] += 1,
             }
         }
+        glue5_runtime::diagnostics::note(format_args!(
+            "gpu live objects: textures={} buffers={} views={} other={} proxy_bytes={}KiB cached_bind_groups={}",
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            proxy_bytes >> 10,
+            self.binds.len(),
+        ));
         let memory = format!(
             "textures {} MiB, buffers {} MiB (small ones {} MiB in {} MiB of slabs), constants {} MiB; {} reused",
             textures >> 20,
@@ -1205,9 +1275,13 @@ impl Gpu {
         let mut skipped: Vec<_> = st.skipped.iter().map(|(k, n)| format!("{k} {n}")).collect();
         skipped.sort();
         let c = &self.compiler;
+        let pipelines = c.compiled.load(std::sync::atomic::Ordering::Relaxed);
+        let failed_pipelines = c.failed.load(std::sync::atomic::Ordering::Relaxed);
+        let compiling_ms = c.compile_us.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
+        let fps = st.presents as f64 / secs;
         log::info!(
             "gpu: {:.1} fps ({frames_line}), {} draws/frame, {} dispatches, {:.1} passes/frame (ended by {}), {:.1} submits/frame ({}), recording {:.0}% ({:.1} ms/frame), encoding {:.1} ms/frame, submitting {:.1}, presenting {:.1}, releasing {:.1}, waiting for the GPU {:.1}, for a drawable {:.1}; pipelines {} ({} failed, {:.0} ms compiling), draws waiting for one {}, skipped [{}], clamped {}, bind groups +{} ({} cached), objects {} ({memory}), errors +{}",
-            st.presents as f64 / secs,
+            fps,
             st.draws / frames,
             st.dispatches / frames,
             st.passes as f64 / frames as f64,
@@ -1222,9 +1296,9 @@ impl Gpu {
             per_frame(release),
             per_frame(gpu_wait),
             per_frame(drawable),
-            c.compiled.load(std::sync::atomic::Ordering::Relaxed),
-            c.failed.load(std::sync::atomic::Ordering::Relaxed),
-            c.compile_us.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+            pipelines,
+            failed_pipelines,
+            compiling_ms,
             st.pending_skips,
             skipped.join(", "),
             st.clamped,
@@ -1233,6 +1307,25 @@ impl Gpu {
             self.objs.len(),
             st.errors,
         );
+        glue5_runtime::diagnostics::gpu_snapshot(
+            fps,
+            textures,
+            buffers,
+            self.uniforms.bytes_allocated(),
+            self.objs.len(),
+            pipelines,
+            failed_pipelines,
+            st.errors,
+        );
+        glue5_runtime::diagnostics::note(format_args!(
+            "gpu memory caches: uploads={}KiB readbacks={}KiB recycled={}KiB decode_pending={}KiB decode_peak={}KiB driver_allocated={}MiB (live textures include proxies; decodes estimate compressed + decoded copies)",
+            self.uploads.cached_bytes() >> 10,
+            self.staging.cached_bytes() >> 10,
+            self.recycler.cached_bytes() >> 10,
+            self.decodes.iter().map(|d| d.bytes).sum::<u64>() >> 10,
+            self.decode_peak_bytes >> 10,
+            crate::driver_allocated_bytes(&self.device).unwrap_or(0) >> 20,
+        ));
         self.stats.errors = 0;
         if let Some(p) = &self.profiler {
             log::info!("{}", crate::profile::report(&p.totals, frames));
@@ -1338,7 +1431,7 @@ pub fn depth_attachment(
 }
 
 /// Rough GPU memory of a texture, for statistics.
-fn texture_bytes(f: TextureFormat, size: wgpu::Extent3d, mips: u32, dim: wgpu::TextureDimension) -> u64 {
+pub(crate) fn texture_bytes(f: TextureFormat, size: wgpu::Extent3d, mips: u32, dim: wgpu::TextureDimension) -> u64 {
     let (bytes, bw) = format::block(f);
     (0..mips)
         .map(|m| {
@@ -1352,4 +1445,222 @@ fn texture_bytes(f: TextureFormat, size: wgpu::Extent3d, mips: u32, dim: wgpu::T
             w * h * d as u64 * bytes as u64
         })
         .sum()
+}
+
+/// Keep engine mip numbering intact while allocating only a sampled BC tail.
+/// This is not eviction: every retained mip still receives its own upload.
+#[allow(clippy::too_many_arguments)]
+fn texture_mips_to_drop(
+    size: wgpu::Extent3d,
+    mips: u32,
+    dim: wgpu::TextureDimension,
+    bind: u32,
+    samples: u32,
+    bc: bool,
+    decoded: bool,
+    limit: u32,
+) -> u32 {
+    let d2 = dim == wgpu::TextureDimension::D2;
+    let mut dropped = u32::from(decoded && mips >= 2 && d2 && size.width.max(size.height) >= 512);
+    if !bc
+        || mips < 2
+        || !d2
+        || samples != 1
+        || limit == 0
+        || bind & format::BIND_SRV == 0
+        || bind & (format::BIND_RT | format::BIND_DS | format::BIND_UAV) != 0
+        || !size.width.is_power_of_two()
+        || !size.height.is_power_of_two()
+    {
+        return dropped;
+    }
+    let limit = limit.clamp(256, 4096);
+    while dropped + 1 < mips && (size.width >> dropped).max(size.height >> dropped) > limit {
+        // BC copies need complete blocks even in a texture's base level.
+        if (size.width >> (dropped + 1)).min(size.height >> (dropped + 1)) < 4 {
+            break;
+        }
+        dropped += 1;
+    }
+    dropped
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    fn size(w: u32, h: u32) -> wgpu::Extent3d {
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }
+    }
+
+    #[test]
+    fn decode_backpressure_allows_one_large_job_but_not_a_backlog() {
+        assert!(!decode_backpressure(0, 0, DECODE_BYTES * 2));
+        assert!(!decode_backpressure(DECODE_BYTES - 1, 1, 1));
+        assert!(decode_backpressure(DECODE_BYTES - 1, 1, 2));
+        assert!(decode_backpressure(0, DECODE_COUNT, 1));
+    }
+
+    #[test]
+    fn world_textures_keep_a_valid_tail_and_reduce_allocated_bytes() {
+        let d = texture_mips_to_drop(
+            size(2048, 2048),
+            12,
+            wgpu::TextureDimension::D2,
+            format::BIND_SRV,
+            1,
+            true,
+            false,
+            512,
+        );
+        assert_eq!(d, 2);
+        let full = texture_bytes(TextureFormat::Bc1RgbaUnorm, size(2048, 2048), 12, wgpu::TextureDimension::D2);
+        let tail = texture_bytes(TextureFormat::Bc1RgbaUnorm, size(512, 512), 10, wgpu::TextureDimension::D2);
+        assert!(tail * 15 < full);
+        assert_eq!(
+            texture_mips_to_drop(
+                size(2048, 2048),
+                2,
+                wgpu::TextureDimension::D2,
+                format::BIND_SRV,
+                1,
+                true,
+                false,
+                256
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn texture_limits_do_not_change_render_targets_ui_or_writable_resources() {
+        for (bind, mips, bc, samples) in [
+            (0, 12, true, 1),
+            (format::BIND_RT, 12, true, 1),
+            (format::BIND_DS, 12, true, 1),
+            (format::BIND_UAV, 12, true, 1),
+            (format::BIND_SRV, 1, true, 1),
+            (format::BIND_SRV, 12, false, 1),
+            (format::BIND_SRV, 12, true, 4),
+        ] {
+            assert_eq!(
+                texture_mips_to_drop(size(2048, 2048), mips, wgpu::TextureDimension::D2, bind, samples, bc, false, 256),
+                0
+            );
+        }
+        assert_eq!(texture_mips_to_drop(size(2048, 2048), 12, wgpu::TextureDimension::D3, 0, 1, true, false, 256), 0);
+        assert_eq!(texture_mips_to_drop(size(2048, 2), 12, wgpu::TextureDimension::D2, 0, 1, true, false, 256), 0);
+    }
+
+    #[test]
+    fn existing_decoded_texture_policy_and_original_mode_are_preserved() {
+        assert_eq!(
+            texture_mips_to_drop(size(1024, 1024), 11, wgpu::TextureDimension::D2, format::BIND_SRV, 1, true, true, 0),
+            1
+        );
+        assert_eq!(
+            texture_mips_to_drop(size(1024, 1024), 11, wgpu::TextureDimension::D2, format::BIND_SRV, 1, true, false, 0),
+            0
+        );
+        assert_eq!(
+            texture_mips_to_drop(
+                size(1024, 1024),
+                11,
+                wgpu::TextureDimension::D2,
+                format::BIND_SRV,
+                1,
+                true,
+                true,
+                256
+            ),
+            2
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Metal or Vulkan device"]
+    fn limited_texture_tails_upload_and_make_valid_views() {
+        let gpu = crate::Device::open(&crate::instance(), None).unwrap();
+        let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut uploads = crate::uploads::Uploads::new(gpu.device.clone());
+        let compressed = gpu.features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+        let format = if compressed { TextureFormat::Bc1RgbaUnorm } else { TextureFormat::Rgba8Unorm };
+        for limit in [0, 1024, 512, 256] {
+            let dropped = texture_mips_to_drop(
+                size(2048, 2048),
+                12,
+                wgpu::TextureDimension::D2,
+                format::BIND_SRV,
+                1,
+                true,
+                !compressed,
+                limit,
+            );
+            let base = 2048 >> dropped;
+            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("mip budget test"),
+                size: size(base, base),
+                mip_level_count: 12 - dropped,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            for mip in dropped..12 {
+                let side = (2048u32 >> mip).max(1);
+                let (bytes, block) = format::block(format);
+                let rows = side.div_ceil(block);
+                let row_bytes = rows * bytes;
+                let data = vec![0; (row_bytes * rows) as usize];
+                uploads.texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: mip - dropped,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &data,
+                    row_bytes,
+                    rows,
+                    rows,
+                    size(rows * block, rows * block),
+                    row_bytes,
+                );
+            }
+            let _whole_view = texture.create_view(&Default::default());
+            let _last_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                base_mip_level: 11 - dropped,
+                mip_level_count: Some(1),
+                ..Default::default()
+            });
+            // Simulate eviction before a queued worker takes its source.
+            let source = Arc::new(std::sync::Mutex::new(Some(vec![0; 1 << 20])));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let queued = Decode {
+                data: rx,
+                source: source.clone(),
+                bytes: 1 << 20,
+                id: 1,
+                texture: texture.clone(),
+                level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                bpr: 0,
+                src_rows: 0,
+                rows: 0,
+                extent: size(1, 1),
+                row_bytes: 0,
+            };
+            drop(queued);
+            assert!(source.lock().unwrap().is_none(), "eviction frees queued compressed bytes");
+            assert!(tx.send(Vec::new()).is_err(), "eviction drops a future decoded result too");
+            let (encoder, chunks) = uploads.finish();
+            let index = gpu.queue.submit(encoder.map(|e| e.finish()));
+            crate::uploads::recycle(chunks, &uploads.free_chunks());
+            gpu.device
+                .poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(Duration::from_secs(10)) })
+                .unwrap();
+        }
+        assert!(pollster::block_on(scope.pop()).is_none());
+    }
 }

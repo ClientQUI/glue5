@@ -65,6 +65,7 @@ pub(crate) fn spawn_main() -> Result<JoinHandle<i32>> {
 
 fn run_main() -> i32 {
     crate::qos::set(crate::qos::Qos::Interactive);
+    crate::diagnostics::note(format_args!("engine main: starting"));
     let env = new_env();
     let result = (|| -> Result<u32, Trap> {
         unsafe {
@@ -80,10 +81,12 @@ fn run_main() -> i32 {
     match result {
         Ok(code) => {
             log::info!("engine main returned {code}");
+            crate::diagnostics::note(format_args!("engine main: returned {code}"));
             code as i32
         }
         Err(trap) if trap == glue5_game::UNWIND => {
             log::info!("engine main unwound with a live runtime");
+            crate::diagnostics::note(format_args!("engine main: unwound with live runtime"));
             loop {
                 thread::park();
             }

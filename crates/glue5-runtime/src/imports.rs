@@ -42,7 +42,11 @@ fn unsupported(name: &str) {
 // ---- game (game.js) ----------------------------------------------------------
 
 pub unsafe extern "C" fn wasm_now_ms(_: *mut Env) -> f64 {
-    rt().clock.now_ms()
+    let runtime = rt();
+    let now = runtime.clock.now_ms();
+    runtime.wasm_clock_ms.store(now as u64, Ordering::Relaxed);
+    crate::diagnostics::engine_clock(now as u64);
+    now
 }
 
 pub unsafe extern "C" fn wasm_print_line_js(env: *mut Env, line: u64) {
@@ -50,22 +54,36 @@ pub unsafe extern "C" fn wasm_print_line_js(env: *mut Env, line: u64) {
 }
 
 pub unsafe extern "C" fn wasm_hang_line_js(env: *mut Env, line: u64) {
-    gamelog::line(&format!("[hang] {}", mem(env).str(line)));
+    let line = mem(env).str(line);
+    // Regular profiles are emitted every 30 seconds even during healthy play.
+    // They are not faults and should not force synchronous disk writes.
+    if line.contains("frame profile") {
+        if crate::diagnostics::verbose_logs() {
+            gamelog::line(&format!("[hang] {line}"));
+            crate::diagnostics::note(format_args!("engine frame profile: {line}"));
+        }
+        return;
+    }
+    gamelog::line(&format!("[hang] {line}"));
+    crate::diagnostics::fault(format_args!("engine hang report: {line}"));
 }
 
 pub unsafe extern "C" fn wasm_audio_publish_js(_: *mut Env, ring: u64, capacity: u32) {
     log::info!("audio: ring at {ring:#x}, {capacity} frames");
     rt().audio_ring.store(ring, Ordering::Release);
+    crate::diagnostics::note(format_args!("audio ring published: address={ring:#x} capacity={capacity}"));
 }
 
 pub unsafe extern "C" fn wasm_input_publish_js(_: *mut Env, block: u64) {
     log::info!("input: block at {block:#x}");
     rt().input_block.store(block, Ordering::Release);
+    crate::diagnostics::note(format_args!("input block published: address={block:#x}"));
 }
 
 pub unsafe extern "C" fn wgpu_start_worker(env: *mut Env, ring: u64, size: u64, _dbg: u64) {
     log::info!("gpu: ring at {ring:#x}, {} MiB", size >> 20);
     rt().gpu_ring.store(ring, Ordering::Release);
+    crate::diagnostics::note(format_args!("gpu ring published: address={ring:#x} size={}MiB", size >> 20));
     match rt().gpu_backend.lock().unwrap().take() {
         Some(backend) => backend(gpu::GpuRing::new(mem(env), ring, size)),
         None => log::error!("gpu: the engine started a second GPU worker"),
@@ -98,31 +116,89 @@ pub unsafe extern "C" fn wasm_has_page_js(_: *mut Env) -> u32 {
 pub unsafe extern "C" fn wasm_module_int_js(env: *mut Env, name: u64, default: u32) -> u32 {
     let name = mem(env).str(name);
     let low = rt().config.low_memory;
-    let value = match std::env::var(name.to_ascii_uppercase()).ok().and_then(|v| v.parse().ok()) {
-        Some(v) => v,
-        None if name == "gameResourceMB" && low => default.min(768),
-        // The engine skips some threads, unless their bit is set here.
-        None if name == "keepThreads" => {
-            // The videos' thread (bit 4, `AsyncBink`). TVs and some
-            // cutscenes queue their video for it and wait, with no time
-            // limit, until it has tried to open it; without the thread
-            // nothing answered, and the queue (32 requests) filled up. It
-            // fails at once (the build has no Bink, the data no videos)
-            // and marks the video as failed, as the engine expects.
-            let videos = default | 4;
-            // Online, the network's threads run (bit 2).
-            if rt().config.online.is_some() { videos | 2 } else { videos }
+    let module_override = std::env::var(name.to_ascii_uppercase()).ok().and_then(|v| v.parse::<u32>().ok());
+    let mobile = cfg!(any(target_os = "ios", target_os = "android"));
+
+    // The resource heap is separate from the WASM heap and, on the PC build,
+    // grows whenever the streamer asks how much space is available.  Leaving
+    // that behaviour unchanged on a phone retains whole areas the player has
+    // left and can push the process into the iOS jetsam limit.  Do not reuse
+    // the 768 MiB low-memory value for normal mode: it is enough for the low
+    // preset but evicts normal-quality textures too aggressively.
+    if name == "gameResourceMB" {
+        let glue_override = std::env::var("GLUE5_RESOURCE_MB").ok().and_then(|v| v.parse::<u32>().ok());
+        // `gameResourceMB` is a starting allocation, not an upper limit for
+        // the streaming heap.  On the supported web build its default is
+        // 1024 MiB, but normal mobile mode has enough headroom for the
+        // documented 2048 MiB budget.  Capping the normal fallback to that
+        // web default made the streamer evict cutscene resources mid-load:
+        // first missing ped textures, then a render thread waiting forever
+        // at a cutscene transition.  Explicit environment overrides still
+        // take precedence for experiments.
+        let configured = rt().config.resource_mb;
+        let value = resource_budget_mb(low, mobile, default, configured, module_override.or(glue_override));
+        let budgeted = (low || mobile || configured != 0) && value != 0;
+        if budgeted {
+            crate::memory::budget_resource_heap(value);
         }
-        None => default,
-    };
-    // Phones, and low memory anywhere: the resource heap's budget is its
-    // starting size. Unbudgeted, the streaming engine keeps it full and it
-    // grows by 256 MiB each time: past 2.5 GiB in the game's benchmark.
-    let phone = cfg!(any(target_os = "ios", target_os = "android"));
-    if name == "gameResourceMB" && (low || phone) {
-        crate::memory::budget_resource_heap(value);
+        crate::diagnostics::note(format_args!(
+            "memory: selected resource heap={}MiB (requested={}MiB, engine default={}MiB, low_memory={low}, budget enabled={budgeted})",
+            value, configured, default,
+        ));
+        log::info!(
+            "memory: gameResourceMB={value} (engine default {default}, low_memory={low}, mobile={mobile}, budget enabled={})",
+            budgeted
+        );
+        return value;
     }
-    value
+
+    module_override.unwrap_or_else(|| {
+        if name == "keepThreads" {
+            // Keep upstream's AsyncBink failure worker and online networking.
+            default | 4 | if rt().config.online.is_some() { 2 } else { 0 }
+        } else {
+            default
+        }
+    })
+}
+
+fn resource_budget_mb(low: bool, mobile: bool, default: u32, configured: u32, env_override: Option<u32>) -> u32 {
+    env_override.unwrap_or_else(|| {
+        if configured != 0 {
+            configured.clamp(1280, 2048)
+        } else if low {
+            768
+        } else if mobile {
+            2048
+        } else {
+            default
+        }
+    })
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::resource_budget_mb;
+
+    #[test]
+    fn explicit_budget_is_independent_of_legacy_low_graphics_and_platform() {
+        for low in [false, true] {
+            for mobile in [false, true] {
+                assert_eq!(resource_budget_mb(low, mobile, 1024, 1536, None), 1536);
+            }
+        }
+        assert_eq!(resource_budget_mb(false, true, 1024, 0, None), 2048);
+        assert_eq!(resource_budget_mb(true, true, 1024, 0, None), 768);
+        assert_eq!(resource_budget_mb(false, false, 1024, 0, None), 1024);
+    }
+
+    #[test]
+    fn application_budgets_are_bounded_but_explicit_environment_experiments_win() {
+        assert_eq!(resource_budget_mb(false, true, 1024, 1, None), 1280);
+        assert_eq!(resource_budget_mb(false, true, 1024, 99999, None), 2048);
+        assert_eq!(resource_budget_mb(false, true, 1024, 1536, Some(2304)), 2304);
+        assert_eq!(resource_budget_mb(false, true, 1024, 1536, Some(0)), 0);
+    }
 }
 
 // ---- Emscripten runtime ----------------------------------------------------------

@@ -18,6 +18,10 @@ const BLOCKS_PER_THREAD: usize = 16384;
 /// Threads for `blocks` blocks of work: one per [`BLOCKS_PER_THREAD`], at
 /// most 8.
 fn threads_for(blocks: usize) -> usize {
+    // Two persistent upload workers already parallelize streaming on phones.
+    if cfg!(any(target_os = "ios", target_os = "android")) {
+        return 1;
+    }
     (blocks / BLOCKS_PER_THREAD).clamp(1, glue5_runtime::cores().min(8))
 }
 
@@ -41,6 +45,10 @@ impl Bc {
     }
 }
 
+pub fn decoded_bytes(bc: Bc, cols: u32, rows: u32, layers: u32) -> u64 {
+    (cols as u64).saturating_mul(rows as u64).saturating_mul(layers as u64).saturating_mul(16 * bc.texel_bytes() as u64)
+}
+
 /// Decodes `cols` x `rows` blocks per layer (`layers` layers of `src_rows`
 /// block rows, `src_bpr` bytes per block row) into tightly packed texels:
 /// `cols * 4` texels per row, `rows * 4` rows per layer.
@@ -49,8 +57,9 @@ pub fn decode(bc: Bc, src: &[u8], src_bpr: usize, src_rows: usize, cols: usize, 
     let pitch = cols * 4 * texel;
     let band = pitch * 4; // one row of blocks
     let mut out = vec![0u8; band * rows * layers];
-    // Block rows, all layers: split into bands across threads for big uploads.
-    let jobs: Vec<(usize, &mut [u8])> = out.chunks_mut(band).enumerate().collect();
+    if out.is_empty() {
+        return out;
+    }
     let threads = threads_for(cols * rows * layers);
     let decode_band = |(i, dst): (usize, &mut [u8])| {
         let (layer, row) = (i / rows, i % rows);
@@ -62,15 +71,15 @@ pub fn decode(bc: Bc, src: &[u8], src_bpr: usize, src_rows: usize, cols: usize, 
         }
     };
     if threads <= 1 {
-        jobs.into_iter().for_each(decode_band);
+        out.chunks_mut(band).enumerate().for_each(decode_band);
     } else {
-        let per = jobs.len().div_ceil(threads);
-        let mut jobs = jobs;
+        let per = (rows * layers).div_ceil(threads);
         std::thread::scope(|s| {
-            while !jobs.is_empty() {
-                let rest = jobs.split_off(per.min(jobs.len()));
-                let chunk = std::mem::replace(&mut jobs, rest);
-                s.spawn(move || chunk.into_iter().for_each(decode_band));
+            for (i, chunk) in out.chunks_mut(per * band).enumerate() {
+                let decode_band = &decode_band;
+                s.spawn(move || {
+                    chunk.chunks_mut(band).enumerate().for_each(|(row, dst)| decode_band((i * per + row, dst)))
+                });
             }
         });
     }
@@ -109,6 +118,54 @@ pub fn etc2_rgba(mut texels: Vec<u8>, width: u32, height: u32) -> Vec<u8> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    #[test]
+    fn decoded_size_accounts_for_format_and_layers() {
+        assert_eq!(decoded_bytes(Bc::Bc1, 128, 128, 1), 512 * 512 * 4);
+        assert_eq!(decoded_bytes(Bc::Bc6h, 128, 128, 6), 512 * 512 * 8 * 6);
+        assert_eq!(decoded_bytes(Bc::Bc5, u32::MAX, u32::MAX, u32::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn decodes_pitched_layers_without_copying_padding() {
+        let mut src = vec![0u8; 64];
+        // BC1 red / green blocks: endpoint 0 is selected by all indices.
+        src[0..2].copy_from_slice(&0xf800u16.to_le_bytes());
+        src[32..34].copy_from_slice(&0x07e0u16.to_le_bytes());
+        let out = decode(Bc::Bc1, &src, 16, 2, 1, 1, 2);
+        assert_eq!(out.len(), 128);
+        assert!(out[..64].chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+        assert!(out[64..].chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn empty_and_truncated_uploads_remain_zero_filled() {
+        assert!(decode(Bc::Bc1, &[], 0, 0, 0, 0, 0).is_empty());
+        assert_eq!(decode(Bc::Bc1, &[], 8, 1, 1, 1, 1), vec![0; 64]);
+    }
+
+    #[test]
+    fn large_decode_bands_preserve_pitched_layer_boundaries() {
+        let (cols, rows, src_rows, bpr) = (64, 64, 66, 528);
+        let mut src = vec![0; bpr * src_rows * 2];
+        for layer in 0..2 {
+            for row in 0..rows {
+                for col in 0..cols {
+                    let at = (layer * src_rows + row) * bpr + col * 8;
+                    src[at..at + 2].copy_from_slice(&if layer == 0 { 0xf800u16 } else { 0x07e0u16 }.to_le_bytes());
+                }
+            }
+        }
+        let out = decode(Bc::Bc1, &src, bpr, src_rows, cols, rows, 2);
+        let layer_bytes = cols * rows * 16 * 4;
+        assert!(out[..layer_bytes].chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+        assert!(out[layer_bytes..].chunks_exact(4).all(|p| p == [0, 255, 0, 255]));
+    }
 }
 
 /// One block into `dst` (its top-left texel), `pitch` bytes per texel row.

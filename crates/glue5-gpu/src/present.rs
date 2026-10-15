@@ -359,35 +359,18 @@ pub(crate) fn paced_fps(requested: u32, background: bool) -> u32 {
 pub(crate) fn timed(device: &wgpu::Device, commands: Vec<wgpu::CommandBuffer>) -> Vec<wgpu::CommandBuffer> {
     #[cfg(target_vendor = "apple")]
     {
-        use block2::RcBlock;
-        use objc2_metal::MTLCommandBuffer;
         let ended = Arc::new(Mutex::new(None::<f64>));
-        // An empty command buffer calling `done` with itself once the GPU is past it.
-        let marker = |done: RcBlock<dyn Fn(std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>)>| {
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("timing") });
-            unsafe {
-                encoder.as_hal_mut::<Metal, _, _>(|e| {
-                    if let Some(commands) = e.and_then(|e| e.raw_command_buffer()) {
-                        commands.addCompletedHandler(RcBlock::as_ptr(&done));
-                    }
-                })
-            };
-            encoder.finish()
-        };
         let before = {
             let ended = ended.clone();
-            marker(RcBlock::new(move |c: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                *ended.lock().unwrap() = Some(unsafe { c.as_ref() }.GPUEndTime());
-            }))
+            crate::perf::marker(device, move |_, end| *ended.lock().unwrap() = Some(end))
         };
-        let after = marker(RcBlock::new(move |c: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-            let start = unsafe { c.as_ref() }.GPUStartTime();
+        let after = crate::perf::marker(device, move |start, _| {
             if let Some(end) = ended.lock().unwrap().take()
                 && start > end
             {
                 UPSCALING.lock().unwrap().0 += start - end;
             }
-        }));
+        });
         UPSCALING.lock().unwrap().1 += 1;
         let mut all = Vec::with_capacity(commands.len() + 2);
         all.push(before);
@@ -1219,7 +1202,14 @@ impl Gpu {
         self.flush_with("present", present, true);
         let now = Instant::now();
         if let Some(last) = self.last_present.replace(now) {
-            self.stats.frame_ms.push((now - last).as_secs_f32() * 1000.0);
+            let ms = (now - last).as_secs_f32() * 1000.0;
+            self.stats.frame_ms.push(ms);
+            if crate::perf::on() {
+                let st = &self.stats;
+                if self.perf.frame(ms, st.draws, st.passes, st.busy, self.epoch) {
+                    crate::perf::gpu_bytes(self.gpu_bytes().into_iter().sum());
+                }
+            }
         }
         self.uniforms.next_frame();
         // The next frame: drawn jittered, its scene kept, while a temporal

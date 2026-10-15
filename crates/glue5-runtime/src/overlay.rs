@@ -8,9 +8,10 @@ type Patch = fn(String) -> Option<String>;
 
 /// The files (under the game's `data/`), whether this run changes them, and
 /// how.
-const OVERLAYS: [(&str, fn() -> bool, Patch); 2] = [
+const OVERLAYS: [(&str, fn() -> bool, Patch); 3] = [
     ("common/data/gameconfig.xml", online, crate::online::more_broadcast_data),
     ("common/data/ui/pausemenu.xml", always, autosave_first),
+    ("common/data/ui/frontend.xml", always, feed_width),
 ];
 
 fn online() -> bool {
@@ -58,6 +59,26 @@ fn autosave_first(text: String) -> Option<String> {
     let (flow, autosave) = (line("PREF_STARTUP_FLOW")?, line("PREF_AUTOSAVE")?);
     (flow.end == autosave.start)
         .then(|| format!("{}{}{}{}", &text[..flow.start], &text[autosave.clone()], &text[flow], &text[autosave.end..]))
+}
+
+/// frontend.xml, the feed (GameStream): the engine stretches its movie to the
+/// rectangle given here (exact fit). The movie is drawn for the minimap's
+/// width (0.150, the PC's value), but this data gives 0.1989, so the
+/// notifications came out a third wider, portraits no longer square. Same
+/// length: zeros pad it.
+fn feed_width(text: String) -> Option<String> {
+    let start = text.find("<GameStream>")?;
+    let end = start + text[start..].find("</GameStream>")?;
+    let block = &text[start..end];
+    let (old, new) = ("sizeX=\"0.19890859375\"", "sizeX=\"0.15000000000\"");
+    block.contains(old).then(|| format!("{}{}{}", &text[..start], block.replace(old, new), &text[end..]))
+}
+
+#[test]
+fn feed_is_the_minimap_width() {
+    let text = "<GameStream>\r\n\t<position posX=\"0.0\" sizeX=\"0.19890859375\" />\r\n\t<posloading sizeX=\"0.19890859375\" />\r\n</GameStream>\r\n";
+    let want = "<GameStream>\r\n\t<position posX=\"0.0\" sizeX=\"0.15000000000\" />\r\n\t<posloading sizeX=\"0.15000000000\" />\r\n</GameStream>\r\n";
+    assert_eq!(feed_width(text.into()).as_deref(), Some(want));
 }
 
 #[test]

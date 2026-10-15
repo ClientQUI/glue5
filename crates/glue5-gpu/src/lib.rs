@@ -24,6 +24,7 @@ mod metalfx;
 mod objects;
 mod ops;
 mod overlay;
+pub mod perf;
 mod pipeline;
 mod pool;
 mod prepare;
@@ -340,7 +341,10 @@ impl Device {
         }
         let profile = std::env::var_os("GLUE5_GPU_PROFILE").is_some()
             && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        if profile {
+        // The performance overlay's GPU time (Apple GPUs time it otherwise).
+        if profile
+            || (cfg!(not(target_vendor = "apple")) && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY))
+        {
             features |= wgpu::Features::TIMESTAMP_QUERY;
         }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -457,6 +461,7 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
     log::info!("gpu: ready in {:.0} ms ({threads} compile threads)", t0.elapsed().as_secs_f64() * 1000.0);
 
     let profiler = profile.then(|| profile::Profiler::new(&device, &queue));
+    let gpu_timer = perf::GpuTimer::new(&device, &queue);
     let uploads = uploads::Uploads::new(device.clone());
     let recycler = recycle::Recycler::default();
     let slabs = slabs::Slabs::new(device.clone(), recycler.finished.clone());
@@ -532,6 +537,8 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         total_presents: 0,
         started: Instant::now(),
         last_stats: Instant::now(),
+        perf: Default::default(),
+        gpu_timer,
         last_save: Instant::now(),
         saved_compiled,
     })

@@ -363,17 +363,30 @@ pub(crate) unsafe extern "C" fn script_program_loaded(env: *mut Env, this: u64, 
 }
 
 /// gameconfig.xml: the scripts are a later version than the game data, and
-/// freemode registers more large player broadcast data blocks than it
-/// provides (the engine quits when they run out): the two largest sizes get
-/// more instances.
+/// they register more player broadcast data blocks than it provides; the
+/// engine quits when a script finds none free ("No local player broadcast
+/// data handler"). Freemode alone fills the larger sizes, and with the shops
+/// and ambient scripts around the player all 31 were in use (an iPhone log
+/// listed them), so the two largest sizes and the three smallest get more
+/// instances. A smaller block takes a larger one when its size has none
+/// left. Each longer number costs a tab of its line's indentation, so the
+/// file keeps its length.
 pub(crate) fn more_broadcast_data(text: String) -> Option<String> {
+    const FIELD: &str = "<NumInstances value=\"";
     let start = text.find("<PlayerBroadcastData>")?;
     let end = start + text[start..].find("</PlayerBroadcastData>")?;
     let mut block = text[start..end].to_string();
-    for (size, instances) in [(3600, 3), (2500, 4)] {
+    for (size, instances) in [(3600, 3), (2500, 4), (150, 12), (80, 12), (40, 16)] {
         let at = block.find(&format!("<SizeOfData value=\"{size}\"/>"))?;
-        let field = at + block[at..].find("<NumInstances value=\"")? + "<NumInstances value=\"".len();
-        block.replace_range(field..field + 1, &instances.to_string());
+        let field = at + block[at..].find(FIELD)?;
+        let digits = field + FIELD.len()..field + FIELD.len() + block[field + FIELD.len()..].find('"')?;
+        let new = instances.to_string();
+        let longer = new.len().checked_sub(digits.len())?;
+        if !block[..field].ends_with(&"\t".repeat(longer)) {
+            return None;
+        }
+        block.replace_range(digits, &new);
+        block.drain(field - longer..field);
     }
     Some(format!("{}{}{}", &text[..start], block, &text[end..]))
 }
@@ -417,4 +430,25 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.populate_store_data = Some(populate_store_data);
     hooks.photo_to_jpeg = Some(photo_to_jpeg);
     hooks.can_access_network_features = Some(can_access_network_features);
+}
+
+#[test]
+fn broadcast_data_keeps_the_length() {
+    let item = |size: u32, n: u32| {
+        format!(
+            "\t\t<Item>\r\n\t\t\t<SizeOfData value=\"{size}\"/>\r\n\t\t\t<NumInstances value=\"{n}\"/>\r\n\t\t</Item>\r\n"
+        )
+    };
+    let sizes = [(3600, 1), (2500, 2), (150, 4), (80, 4), (40, 8)];
+    let text = format!(
+        "<HostBroadcastData>\r\n{}</HostBroadcastData>\r\n<PlayerBroadcastData>\r\n{}</PlayerBroadcastData>\r\n",
+        item(40, 8),
+        sizes.map(|(s, n)| item(s, n)).concat()
+    );
+    let patched = more_broadcast_data(text.clone()).unwrap();
+    assert_eq!(patched.len(), text.len());
+    assert!(patched.starts_with(&format!("<HostBroadcastData>\r\n{}", item(40, 8))));
+    assert!(patched.contains("<SizeOfData value=\"3600\"/>\r\n\t\t\t<NumInstances value=\"3\"/>"));
+    assert!(patched.contains("<SizeOfData value=\"150\"/>\r\n\t\t<NumInstances value=\"12\"/>"));
+    assert!(patched.contains("<SizeOfData value=\"40\"/>\r\n\t\t<NumInstances value=\"16\"/>"));
 }

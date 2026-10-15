@@ -156,6 +156,8 @@ pub struct Program {
     pub vertex_index: bool,
     pub instance_index: bool,
     pub clip_distances: bool,
+    /// Pixel shader: writes `frag_depth` (D3D's SV_Depth).
+    pub frag_depth: bool,
     /// Indices into `bindings` of the sampled textures.
     pub textures: Vec<usize>,
     /// Inter-stage locations (vertex outputs / pixel inputs).
@@ -333,6 +335,10 @@ impl Library {
         } else {
             source
         };
+        let source = match stage {
+            Stage::Pixel => with_opaque_sample_inputs(&source).unwrap_or(source),
+            _ => source,
+        };
         let (text, pack) = pack_uniforms(&source);
         let clip_distances = text.contains("@builtin(clip_distances)");
         let text = if clip_distances && !device.features().contains(wgpu::Features::CLIP_DISTANCES) {
@@ -393,6 +399,7 @@ impl Library {
             vertex_index: RE_VERTEX_INDEX.is_match(&text),
             instance_index: RE_INSTANCE_INDEX.is_match(&text),
             clip_distances,
+            frag_depth: text.contains("@builtin(frag_depth)"),
             textures,
             locations,
             pairs: sampling_pairs(&text),
@@ -460,6 +467,7 @@ impl Program {
             vertex_index: self.vertex_index,
             instance_index: self.instance_index,
             clip_distances: self.clip_distances,
+            frag_depth: self.frag_depth,
             textures: self.textures.clone(),
             locations: self.locations.clone(),
             pairs: self.pairs.clone(),
@@ -493,6 +501,7 @@ impl Program {
                 p.locations = ps_input_locations(&text);
                 p.interpolation = interpolations(&text);
                 p.outputs = fragment_outputs(&text);
+                p.frag_depth = text.contains("@builtin(frag_depth)");
                 p.text = Wgsl::new(&text);
                 p.modules = Arc::new(Modules::with(module));
                 p.layout = p.make_layout(device);
@@ -666,6 +675,13 @@ re!(RE_MAIN_INNER_CALL, r"(\n\s*main_inner\([^;]*\);)");
 re!(RE_PS_MAIN_BODY, r"(@fragment\s*fn\s+main\s*\()((?:[^()]|\([^)]*\))*)(\)[^{]*\{)");
 re!(RE_CLIP_ENABLE, r"enable\s+clip_distances\s*;\s*");
 re!(RE_CLIP_MEMBER, r"@builtin\(clip_distances\)\s*(\w+)\s*:\s*array<f32,\s*\d+u?>\s*,?\s*");
+re!(RE_DEPTH_MEMBER, r"@builtin\(frag_depth\)\s*(\w+)\s*:\s*f32\s*,?\s*");
+re!(
+    RE_DEPTH_ONLY_MAIN,
+    r"(@fragment\s*fn\s+main\s*\((?:[^()]|\([^)]*\))*\))\s*->\s*@builtin\(frag_depth\)\s*f32\s*\{([^{}]*?)\n\s*return\s+\w+;"
+);
+re!(RE_SAMPLE_INPUT, r"^(@location\(\d+u?\)\s*@interpolate\(perspective,\s*sample\)\s*)(\w+)(\s*:\s*vec4<f32>)$");
+re!(RE_SAMPLE_INDEX, r"^@builtin\(sample_index\)\s*(\w+)\s*:");
 re!(RE_VERTEX_INDEX, r"\bvertex_index\b");
 re!(RE_INSTANCE_INDEX, r"\binstance_index\b");
 
@@ -913,20 +929,69 @@ pub const CLIP_LOCATION: u32 = 15;
 /// [`CLIP_LOCATION`] ([`with_clipping`]).
 pub fn without_clip_distances(text: &str) -> Option<String> {
     let name = vs_output_struct(text)?;
-    let body = struct_body(text, &name)?;
-    let member = RE_CLIP_MEMBER.captures(body)?;
-    let field = member[1].to_owned();
-    let body = body.replace(&member[0], "");
-    let text = text.replacen(struct_body(text, &name)?, &body, 1);
-    let text = RE_CLIP_ENABLE.replace(&text, "").into_owned();
-    // The output's constructor, fields in order: the clip distances' goes.
-    let call = Regex::new(&format!(r"return {}\(([^;]*)\);", regex::escape(&name))).ok()?;
+    let text = without_output_member(text, &name, &RE_CLIP_MEMBER)?;
+    Some(RE_CLIP_ENABLE.replace(&text, "").into_owned())
+}
+
+/// A pixel shader without its depth output, for a draw without a depth
+/// target: D3D ignores SV_Depth there, wgpu rejects the pipeline.
+pub fn without_frag_depth(text: &str) -> Option<String> {
+    if let Some(c) = RE_DEPTH_ONLY_MAIN.captures(text) {
+        return Some(text.replacen(&c[0], &format!("{} {{{}", &c[1], &c[2]), 1));
+    }
+    let name = RE_FRAGMENT_MAIN.captures(text)?[1].trim().to_owned();
+    without_output_member(text, &name, &RE_DEPTH_MEMBER)
+}
+
+/// The text without the member of output struct `name` that `member`
+/// matches (the field name in its first group), nor its argument in the
+/// struct's constructor.
+fn without_output_member(text: &str, name: &str, member: &Regex) -> Option<String> {
+    let body = struct_body(text, name)?;
+    let m = member.captures(body)?;
+    let field = m[1].to_owned();
+    let text = text.replacen(body, &body.replace(&m[0], ""), 1);
+    // The output's constructor, fields in order: the member's goes.
+    let call = Regex::new(&format!(r"return {}\(([^;]*)\);", regex::escape(name))).ok()?;
     let args = call.captures(&text)?.get(1)?.as_str().to_owned();
     let kept: Vec<&str> = args.split(',').map(str::trim).filter(|a| *a != field).collect();
     if kept.len() + 1 != args.split(',').count() {
         return None;
     }
     Some(call.replace(&text, format!("return {name}({});", kept.join(", ")).as_str()).into_owned())
+}
+
+/// Apple's M1 compiler (AGX G13) fails on a sample at a projected
+/// per-sample input, `textureSample(t, s, v.xy / v.w)` with `v`
+/// `@interpolate(perspective, sample)` ("Undefined symbols:
+/// llvm.agx2.sample.itrproj"), as the MSAA light shaders do. Such inputs
+/// arrive through an identity it cannot see through (sample indices are
+/// below 32). `None` if the pixel shader has none.
+pub fn with_opaque_sample_inputs(text: &str) -> Option<String> {
+    let main = RE_PS_MAIN_BODY.captures(text)?;
+    let mut params: Vec<String> =
+        split_args(&main[2]).iter().map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).collect();
+    let mut inputs = Vec::new();
+    for p in &mut params {
+        if let Some(c) = RE_SAMPLE_INPUT.captures(p) {
+            inputs.push(c[2].to_owned());
+            *p = format!("{}g5_{}{}", &c[1], &c[2], &c[3]);
+        }
+    }
+    if inputs.is_empty() {
+        return None;
+    }
+    let index = params.iter().find_map(|p| RE_SAMPLE_INDEX.captures(p).map(|c| c[1].to_owned()));
+    let index = index.unwrap_or_else(|| {
+        params.push("@builtin(sample_index) g5_sample : u32".to_owned());
+        "g5_sample".to_owned()
+    });
+    let lets: String = inputs
+        .iter()
+        .map(|v| format!("\n  let {v} = bitcast<vec4<f32>>(bitcast<vec4<u32>>(g5_{v}) | vec4<u32>({index} >> 31u));"))
+        .collect();
+    let head = format!("{}{}{}{lets}", &main[1], params.join(", "), &main[3]);
+    Some(text.replacen(&main[0], &head, 1))
 }
 
 /// A pixel shader that first discards the fragments outside the clip
@@ -1211,9 +1276,24 @@ fn main(@location(0u) v0 : vec2<f32>) -> tint_symbol_1 {
             let source = std::fs::read_to_string(&path).unwrap();
             let (mut text, _) = pack_uniforms(&source);
             if text.contains("@fragment")
+                && let Some(opaque) = with_opaque_sample_inputs(&text)
+            {
+                text = opaque;
+            }
+            if text.contains("@fragment")
                 && let Some(alpha_tested) = with_alpha_test(&text)
             {
                 text = alpha_tested;
+            }
+            if text.contains("@builtin(frag_depth)") {
+                let ok = without_frag_depth(&text)
+                    .filter(|t| !t.contains("frag_depth"))
+                    .ok_or_else(|| "not rewritten".to_owned())
+                    .and_then(|t| naga::front::wgsl::parse_str(&t).map_err(|e| e.to_string()))
+                    .and_then(|m| validator.validate(&m).map(|_| ()).map_err(|e| format!("{e:?}")));
+                if let Err(e) = ok {
+                    failed.push(format!("{} (no depth output): {}", path.display(), e.lines().next().unwrap_or("")));
+                }
             }
             n += 1;
             let ok = naga::front::wgsl::parse_str(&text)
@@ -1249,6 +1329,63 @@ fn main(@location(0u) v0 : vec2<f32>) -> tint_symbol_1 {
         }
         assert!(failed.is_empty(), "{} of {n} failed:\n{}", failed.len(), failed[..failed.len().min(10)].join("\n"));
         assert!(n > 4000);
+    }
+
+    #[test]
+    fn makes_sample_inputs_opaque() {
+        let ps = "@fragment
+fn main(@location(1u) @interpolate(perspective, sample) v1 : vec4<f32>, @location(2u) v2 : vec4<f32>) -> @location(0u) vec4<f32> {
+  return v1 / v1.w + v2;
+}
+";
+        let out = with_opaque_sample_inputs(ps).unwrap();
+        assert!(out.contains("@location(1u) @interpolate(perspective, sample) g5_v1 : vec4<f32>, @location(2u) v2 : vec4<f32>, @builtin(sample_index) g5_sample : u32"));
+        assert!(out.contains("{\n  let v1 = bitcast<vec4<f32>>(bitcast<vec4<u32>>(g5_v1) | vec4<u32>(g5_sample >> 31u));\n  return v1 / v1.w + v2;"));
+        assert_eq!(interpolations(&out), interpolations(ps));
+        naga::front::wgsl::parse_str(&out).unwrap();
+        let indexed = ps.replace("v2 : vec4<f32>)", "v2 : vec4<f32>, @builtin(sample_index) v3 : u32)");
+        let out = with_opaque_sample_inputs(&indexed).unwrap();
+        assert!(out.contains("(g5_v1) | vec4<u32>(v3 >> 31u));") && !out.contains("g5_sample"));
+        naga::front::wgsl::parse_str(&out).unwrap();
+        assert!(with_opaque_sample_inputs(&ps.replace(", sample", ", center")).is_none());
+    }
+
+    #[test]
+    fn drops_the_depth_output() {
+        let ps = "var<private> o0 : f32;
+var<private> oDepth : f32;
+fn main_inner() {
+  o0 = 1.0f;
+  oDepth = 0.5f;
+}
+struct tint_symbol {
+  @location(0u)
+  o0 : f32,
+  @builtin(frag_depth)
+  oDepth : f32,
+}
+@fragment
+fn main() -> tint_symbol {
+  main_inner();
+  return tint_symbol(o0, oDepth);
+}
+";
+        let out = without_frag_depth(ps).unwrap();
+        assert!(!out.contains("frag_depth") && out.contains("return tint_symbol(o0);"));
+        naga::front::wgsl::parse_str(&out).unwrap();
+        let only = "var<private> oDepth : f32;
+fn main_inner(p : vec4<f32>) {
+  oDepth = p.z;
+}
+@fragment
+fn main(@builtin(position) v_5 : vec4<f32>) -> @builtin(frag_depth) f32 {
+  main_inner(v_5);
+  return oDepth;
+}
+";
+        let out = without_frag_depth(only).unwrap();
+        assert!(out.contains("fn main(@builtin(position) v_5 : vec4<f32>) {\n  main_inner(v_5);\n}"));
+        naga::front::wgsl::parse_str(&out).unwrap();
     }
 
     #[test]

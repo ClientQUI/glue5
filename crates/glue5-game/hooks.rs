@@ -23,6 +23,7 @@ pub const HOOKS: &[&[(&str, &str)]] = &[
     include!("hooks/device_reset.rs"),
     include!("hooks/readback.rs"),
     include!("hooks/audio_update.rs"),
+    include!("hooks/granular.rs"),
     include!("hooks/script_assets.rs"),
     include!("hooks/gamer_tags.rs"),
     include!("hooks/scenario.rs"),

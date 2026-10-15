@@ -264,6 +264,9 @@ pub struct Gpu {
     pub total_presents: u64,
     pub started: Instant,
     pub last_stats: Instant,
+    /// The counters at the last frame, for the performance overlay.
+    pub perf: crate::perf::Mark,
+    pub gpu_timer: crate::perf::GpuTimer,
     pub last_save: Instant,
     /// Pipelines compiled when the driver's cache was last saved.
     pub saved_compiled: u32,
@@ -628,7 +631,10 @@ impl Gpu {
         self.finish_decodes(false);
         self.recycler.trim(self.epoch, &mut self.graveyard);
         let (uploads, staging) = self.uploads.finish();
-        let encoders = uploads.into_iter().chain(self.encoder.take()).collect();
+        let mut encoders = uploads.into_iter().chain(self.encoder.take()).collect();
+        if let Some(timing) = self.gpu_timer.time(&self.device, &mut encoders, frame, &self.staging) {
+            self.maps.push(timing.map());
+        }
         *self.stats.submits.entry(reason).or_default() += 1;
         self.submitter.send(crate::submit::Batch {
             encoders,
@@ -1268,6 +1274,7 @@ impl Gpu {
         ends.sort_by(|a, b| b.1.cmp(a.1));
         let ends: Vec<String> =
             ends.iter().take(6).map(|(op, n)| format!("op {op} {:.1}", **n as f64 / frames as f64)).collect();
+        self.perf.reset();
         let (mut textures, mut buffers) = (0u64, 0u64);
         let mut counts = [0usize; 4];
         let mut proxy_bytes = 0u64;
@@ -1383,6 +1390,19 @@ impl Gpu {
             let more = available.map_or(String::new(), |a| format!(", {} MiB more allowed", a >> 20));
             log::info!("memory: process footprint {} MiB{more}{}", used >> 20, self.gpu_memory());
         }
+    }
+
+    /// The textures' and buffers' bytes.
+    pub(crate) fn gpu_bytes(&self) -> [u64; 2] {
+        let (mut textures, mut buffers) = (0u64, 0u64);
+        for o in self.objs.values() {
+            match o {
+                Obj::Texture(t) => textures += t.bytes,
+                Obj::Buffer(b) => buffers += b.gpu.as_ref().map_or(0, |_| b.bytes),
+                _ => {}
+            }
+        }
+        [textures, buffers]
     }
 
     /// What Metal has allocated for the device, all resources included.

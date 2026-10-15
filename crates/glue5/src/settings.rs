@@ -51,8 +51,11 @@ pub struct Settings {
     /// macOS and iOS 26): twice the frames shown, half a frame more of
     /// latency.
     pub frame_generation: bool,
-    /// Apple's driver-level performance overlay.
-    pub metal_hud: bool,
+    /// The performance overlay over the game, and how the application's
+    /// own shows.
+    pub overlay: PerfOverlay,
+    pub overlay_detail: OverlayDetail,
+    pub overlay_corner: Corner,
     /// Distance fog over the world. Near surfaces are never tinted.
     pub fog: bool,
     /// Where fog is fully mixed, in metres. 0 uses the view distance.
@@ -99,6 +102,42 @@ pub struct Settings {
     /// on or off.
     #[serde(skip_serializing)]
     metalfx: Option<bool>,
+    /// Settings saved before the choice of overlays: Apple's HUD on or off.
+    #[serde(skip_serializing)]
+    metal_hud: Option<bool>,
+}
+
+/// The performance overlay over the game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PerfOverlay {
+    Off,
+    /// Apple's, drawn by Metal (shown from the launch it is on at).
+    MetalHud,
+    /// The application's (ui/perf.rs), on every platform.
+    Glue5,
+}
+
+/// How much the application's overlay shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OverlayDetail {
+    /// One line: frame rate, frame time, GPU time.
+    Minimal,
+    /// The frame times as a graph, and where they go.
+    Standard,
+    /// The busiest threads, the renderer's counts, resolution and memory too.
+    Full,
+}
+
+/// A corner of the safe area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 /// How the game's frames are scaled up to the window.
@@ -337,7 +376,9 @@ impl Default for Settings {
             upscaler: Upscaling::MetalFx,
             sharpness: 0.5,
             frame_generation: false,
-            metal_hud: false,
+            overlay: PerfOverlay::Off,
+            overlay_detail: OverlayDetail::Standard,
+            overlay_corner: Corner::TopLeft,
             fog: true,
             fog_distance: 0.0,
             view_distance: default_view_distance(),
@@ -358,6 +399,7 @@ impl Default for Settings {
             online_lobby: String::new(),
             render_height: None,
             metalfx: None,
+            metal_hud: None,
         }
     }
 }
@@ -415,6 +457,9 @@ impl Settings {
         };
         if settings.metalfx.take() == Some(false) {
             settings.upscaler = Upscaling::Bicubic;
+        }
+        if settings.metal_hud.take() == Some(true) {
+            settings.overlay = PerfOverlay::MetalHud;
         }
         settings
     }
@@ -552,7 +597,7 @@ impl Settings {
         self.max_fps = if profile == 2 { 60 } else { 30 };
         self.thermal_protection = true;
         self.verbose_logs = false;
-        self.metal_hud = false;
+        self.overlay = PerfOverlay::Off;
         self.set_scaling_preset(match profile {
             0 => 1,
             2 => 4,
@@ -611,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn upscaler_from_older_settings() {
+    fn upscaler_and_overlay_from_older_settings() {
         let dir = std::env::temp_dir().join(format!("glue5-settings-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("glue5.json"), r#"{"metalfx": false}"#).unwrap();
@@ -620,6 +665,10 @@ mod tests {
         assert_eq!(Settings::load(&dir).upscaler, Upscaling::MetalFx);
         std::fs::write(dir.join("glue5.json"), r#"{"upscaler": "metalfx-temporal"}"#).unwrap();
         assert_eq!(Settings::load(&dir).upscaler, Upscaling::MetalFxTemporal);
+        std::fs::write(dir.join("glue5.json"), r#"{"metal_hud": true}"#).unwrap();
+        assert_eq!(Settings::load(&dir).overlay, PerfOverlay::MetalHud);
+        std::fs::write(dir.join("glue5.json"), r#"{"metal_hud": false}"#).unwrap();
+        assert_eq!(Settings::load(&dir).overlay, PerfOverlay::Off);
         std::fs::write(dir.join("glue5.json"), r#"{"metalfx":true,"resource_budget":"Compact","texture_detail":"Minimal","render_lines":480,"upscale_lines":720,"world_preset":"Eco","max_fps":30}"#).unwrap();
         let migrated = Settings::load(&dir);
         assert_eq!(migrated.upscaler, Upscaling::MetalFx);
@@ -629,6 +678,7 @@ mod tests {
         assert!(migrated.fog);
         assert!(migrated.efficiency_cores);
         assert!(!migrated.efficiency_mode);
+        assert_eq!(migrated.overlay, PerfOverlay::Off);
         assert_eq!(migrated.render_boost, 1.0);
         assert_eq!(migrated.distance_policy().render_boost, 1.0);
         assert_eq!(migrated.input_size((2868, 1320)), (1042, 480));

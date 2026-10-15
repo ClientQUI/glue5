@@ -40,6 +40,13 @@ pub enum Work {
         staging: Staging,
         resolved: crate::profile::Resolved,
     },
+    /// A frame's batch timestamps, for the performance overlay.
+    #[cfg(not(target_vendor = "apple"))]
+    GpuTime {
+        staging: Staging,
+        pairs: u32,
+        period: f32,
+    },
     Screenshot {
         staging: Staging,
         width: u32,
@@ -354,6 +361,13 @@ fn finish(device: &wgpu::Device, mem: Mem, pool: &StagingPool, work: Work) {
         Work::Profile { staging, resolved } => {
             if let Some(data) = mapped(device, &staging) {
                 resolved.add(&data);
+            }
+            release(pool, staging);
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        Work::GpuTime { staging, pairs, period } => {
+            if let Some(data) = mapped(device, &staging) {
+                crate::perf::timestamps_done(&data, pairs, period);
             }
             release(pool, staging);
         }

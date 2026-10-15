@@ -122,6 +122,17 @@ pub(crate) unsafe extern "C" fn pad_update(env: *mut Env, pad: u64) {
     mem.set_u8(pad + PAD_HAS_ANALOG, 1);
 }
 
+// ---- radio wheel ---------------------------------------------------------------
+
+/// Hook for `CRadioWheel::GetInputAxis`. The engine reads the radio wheel's
+/// own inputs (`INPUT_RADIO_WHEEL_LR`/`UD`), which the control files of this
+/// game data, older than the code, map to no device: the selector never
+/// moved, with the mouse or a pad. It reads the selection wheel's, as the
+/// weapon wheel does: the mouse (`fixed.meta`), the right stick.
+pub(crate) unsafe extern "C" fn radio_wheel_axes(env: *mut Env, this: u64, x: u64, y: u64) {
+    unsafe { orig::selection_wheel_axes(env, this, x, y) }
+}
+
 // ---- text entry ----------------------------------------------------------------
 
 static TEXT_BOX: AtomicBool = AtomicBool::new(false);
@@ -256,6 +267,7 @@ impl InputBlock {
 /// This module's hooks.
 pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.pad_update = Some(pad_update);
+    hooks.radio_wheel_axes = Some(radio_wheel_axes);
     hooks.text_box_open = Some(text_box_open_hook);
     hooks.text_box_close = Some(text_box_close_hook);
 }

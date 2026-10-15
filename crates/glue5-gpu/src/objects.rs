@@ -166,6 +166,10 @@ pub struct State {
     /// The sampler with nearest filtering, made when a program needs a
     /// non-filtering one (see `Program::unfiltered`).
     pub nearest: Option<wgpu::Sampler>,
+    /// The same sampler forced one to four mips coarser, for distant draws.
+    pub coarse: [Option<wgpu::Sampler>; 4],
+    /// Nearest filtering at those same mip floors.
+    pub coarse_nearest: [Option<wgpu::Sampler>; 4],
 }
 
 /// A shader resource view or unordered access view.

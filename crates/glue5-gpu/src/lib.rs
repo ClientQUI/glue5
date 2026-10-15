@@ -13,6 +13,7 @@
 
 mod bc;
 mod byte_cache;
+mod detail;
 mod done;
 mod draw;
 mod exec;
@@ -407,6 +408,11 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         caps.features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
         settings.max_texture_dimension,
     ));
+    let distant = detail::policy();
+    glue5_runtime::diagnostics::note(format_args!(
+        "distant detail: enabled={} aggressive={} mobile={} shadow_override={:?} (close draws unchanged; GLUE5_DISTANT_DETAIL=0/2, GLUE5_SHADOW_DISTANCE)",
+        distant.enabled, distant.aggressive, distant.mobile, distant.shadow_override,
+    ));
     let saved_compiled = compiler.compiled.load(Ordering::Relaxed);
     // On iOS, compiling several Metal pipelines at once creates large CPU
     // and temporary shader-memory spikes while the game is streaming. Two
@@ -469,6 +475,7 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         fast_pipes: Default::default(),
         pipes,
         known,
+        mip_floor: 0,
         pass_tails: Default::default(),
         recipes_new: Vec::new(),
         key: Vec::new(),

@@ -8,7 +8,7 @@ use glue5_runtime::qos::{self, Qos};
 use rustc_hash::FxHashMap;
 use wgpu::{TextureFormat, TextureViewDimension};
 
-use crate::exec::{Bound, Clear, Gpu, PassInfo, depth_attachment};
+use crate::exec::{Bound, Clear, Gpu, PassInfo, TailKey, depth_attachment};
 use crate::format;
 use crate::objects::{NO_LAYOUT, Objects, View};
 use crate::pipeline::{self, Recipe};
@@ -199,8 +199,10 @@ impl Gpu {
             self.flush("chunk");
         }
         let epoch = self.epoch;
-        let mut colors: Vec<Option<(wgpu::TextureView, Option<u32>, wgpu::LoadOp<wgpu::Color>)>> = Vec::new();
-        let mut targets = Vec::new();
+        // On the stack: a frame opens many passes, and these used to allocate.
+        let mut colors: ArrayVec<Option<(wgpu::TextureView, Option<u32>, wgpu::LoadOp<wgpu::Color>)>, 8> =
+            ArrayVec::new();
+        let mut targets: ArrayVec<Option<TextureFormat>, 8> = ArrayVec::new();
         let (mut samples, mut width, mut height) = (1, 1, 1);
         let mut clears = std::mem::take(&mut self.clears);
         let take_clear = |clears: &mut Vec<Clear>, tex, mip, slice| {
@@ -257,7 +259,7 @@ impl Gpu {
 
         self.pass_profile = self.time_pass("draw");
         let encoder = self.encoder.get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
-        let attachments: Vec<_> = colors
+        let attachments: ArrayVec<Option<wgpu::RenderPassColorAttachment>, 8> = colors
             .iter()
             .map(|c| {
                 c.as_ref().map(|(view, depth_slice, load)| wgpu::RenderPassColorAttachment {
@@ -283,7 +285,12 @@ impl Gpu {
         self.pass = Some(pass.forget_lifetime());
         self.stats.passes += 1;
         self.chunk_passes += 1;
-        let tail_key = (targets.clone(), depth_format, samples, ro);
+        let mut key_targets = [None; 8];
+        for (i, format) in targets.iter().enumerate() {
+            key_targets[i] = *format;
+        }
+        let tail_key =
+            TailKey { targets: key_targets, count: targets.len() as u8, depth: depth_format, samples, read_only: ro };
         let next = self.pass_tails.len() as u32 + 1;
         let tail = *self.pass_tails.entry(tail_key).or_insert(next);
         self.pass_info = Some(PassInfo {
@@ -349,7 +356,7 @@ impl Gpu {
                     blend: words(self.s.blend),
                     depth: words(self.s.depth_stencil),
                     raster: words(self.s.raster).map(|w| pipeline::without_depth_bias(&w)),
-                    targets: info.targets.clone(),
+                    targets: info.targets.iter().copied().collect(),
                     samples: info.samples,
                     depth_format: info.depth,
                     read_only: info.read_only,
@@ -435,7 +442,9 @@ impl Gpu {
         let epoch = self.epoch;
         let mut key = std::mem::take(&mut self.key);
         key.clear();
-        key.extend([prog.id, stage as u32, pack.map_or(0, |a| a.chunk_id)]);
+        // The mip floor is part of the key: a distant draw must not reuse the
+        // sharp bind group, or the other way round.
+        key.extend([prog.id, stage as u32, pack.map_or(0, |a| a.chunk_id), self.mip_floor]);
         for b in &prog.bindings {
             match &b.kind {
                 Kind::Uniform => {}
@@ -638,16 +647,35 @@ impl Gpu {
     }
 
     /// A sampler state's sampler (`nearest`: its non-filtering twin).
+    /// Comparison samplers and a floor of 0 are the engine's own.
     fn sampler(&mut self, id: u32, comparison: bool, nearest: bool) -> Option<wgpu::Sampler> {
-        let state = self.objs.state(id).filter(|s| s.comparison == comparison && s.sampler.is_some())?;
-        if !nearest {
-            return state.sampler.clone();
+        let floor = if comparison { 0 } else { self.mip_floor.min(4) };
+        let words = {
+            let state = self.objs.state(id).filter(|s| s.comparison == comparison && s.sampler.is_some())?;
+            if floor == 0 {
+                if !nearest {
+                    return state.sampler.clone();
+                }
+                if let Some(s) = &state.nearest {
+                    return Some(s.clone());
+                }
+            } else {
+                let cached = if nearest { &state.coarse_nearest } else { &state.coarse };
+                if let Some(s) = &cached[(floor - 1) as usize] {
+                    return Some(s.clone());
+                }
+            }
+            state.words.clone()
+        };
+        let sampler = self.make_sampler_at(&words, nearest, floor as f32);
+        let state = self.objs.state_mut(id)?;
+        if floor == 0 {
+            state.nearest = Some(sampler.clone());
+        } else if nearest {
+            state.coarse_nearest[(floor - 1) as usize] = Some(sampler.clone());
+        } else {
+            state.coarse[(floor - 1) as usize] = Some(sampler.clone());
         }
-        if let Some(s) = &state.nearest {
-            return Some(s.clone());
-        }
-        let sampler = self.make_sampler(&state.words, true);
-        self.objs.state_mut(id)?.nearest = Some(sampler.clone());
         Some(sampler)
     }
 
@@ -922,6 +950,14 @@ impl Gpu {
         if !self.ensure_pass() {
             return self.skip("no render target");
         }
+        self.observe_camera();
+        let distance = self.placed_distance();
+        if self.cull_distant_shadow(distance) {
+            return self.skip("distant shadow");
+        }
+        // Shadow maps sample alpha-tested cutouts. A coarser mip would change
+        // which pixels cast, so those draws are culled by distance instead.
+        self.mip_floor = if self.shadow_map_pass() { 0 } else { self.detail_mip_floor(distance) };
         let Some(cell) = self.pipeline(&vs, ps.as_ref(), [vs_float32, ps_float32]) else {
             return self.skip("no pipeline");
         };
@@ -940,7 +976,6 @@ impl Gpu {
             p.rename(i, &ps.as_ref().unwrap_or(&vs).label);
         }
 
-        self.observe_camera();
         let g0 = match &vs.layout {
             Some(l) => match self.bind_group(&vs, Stage::Vertex, l) {
                 Some(g) => Some(g),
@@ -1158,6 +1193,52 @@ impl Gpu {
         self.stats.draws += 1;
     }
 
+    /// World distance of this draw, when its constants place an object.
+    fn placed_distance(&self) -> Option<f32> {
+        if !crate::detail::policy().enabled || self.scene.hud {
+            return None;
+        }
+        let cam = self.scene.lod_camera?;
+        let cb = self.s.cb[0][1];
+        let shadow = self.objs.buf(cb.buf)?.shadow.as_deref()?;
+        let from = cb.first as usize * 16;
+        let bytes = shadow.get(from..from + 64)?;
+        let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        crate::detail::placed_distance([f(12), f(13), f(14)], cam)
+    }
+
+    fn detail_mip_floor(&self, distance: Option<f32>) -> u32 {
+        let Some(distance) = distance else { return 0 };
+        let policy = crate::detail::policy();
+        if !policy.enabled {
+            return 0;
+        }
+        let thermal = self.presentation.as_ref().map(crate::present::Presentation::thermal).unwrap_or(0);
+        crate::detail::mip_floor(distance, crate::detail::bands(policy.mobile, policy.aggressive, thermal), thermal)
+    }
+
+    /// A depth-only square target smaller than the scene is a shadow map.
+    fn shadow_map_pass(&self) -> bool {
+        let Some(info) = self.pass_info.as_ref() else { return false };
+        let depth_only = info.depth.is_some() && info.targets.iter().all(|t| t.is_none());
+        let square = info.width > 0 && info.width == info.height && info.width <= 4096;
+        let smaller = self.scene.size.is_none_or(|(w, h)| info.width < w || info.height < h);
+        depth_only && square && smaller
+    }
+
+    /// Casters past the cutoff are not drawn into the shadow map. Occlusion
+    /// queries and the HUD are left alone, and the colour pass still draws
+    /// the object.
+    fn cull_distant_shadow(&self, distance: Option<f32>) -> bool {
+        let policy = crate::detail::policy();
+        if !policy.enabled || self.scene.hud || self.occlusion.running() || !self.shadow_map_pass() {
+            return false;
+        }
+        let thermal = self.presentation.as_ref().map(crate::present::Presentation::thermal).unwrap_or(0);
+        let cutoff = crate::detail::shadow_cutoff(policy.mobile, thermal, policy.shadow_override);
+        distance.is_some_and(|d| d > cutoff)
+    }
+
     /// A draw into the scene's targets may show this frame's camera (see
     /// scene.rs): the vertex program's `rage_matrices`.
     fn observe_camera(&mut self) {
@@ -1184,6 +1265,7 @@ impl Gpu {
     // ---- compute ---------------------------------------------------------------------------
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
+        self.mip_floor = 0;
         self.flush_clears();
         let Some(cs) = self.program(self.s.shader[2]) else {
             return self.skip("no compute shader");

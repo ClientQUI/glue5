@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use glue5_gpu::{Presentation, Screen, Upscaler};
 use glue5_runtime::exit::Exit;
-use glue5_runtime::input::{Gamepad, InputBlock, mouse};
+use glue5_runtime::input::{mouse, Gamepad, InputBlock};
 use glue5_runtime::layout::is_game_dir;
 use sdl3::event::{Event, WindowEvent};
 use sdl3::keyboard::Scancode;
@@ -375,8 +375,19 @@ impl App {
             }
             let page = self.ui.page();
             // Before the game the loop sleeps until there is input or the UI
-            // animates; with it, it keeps the touch controls and pads current.
-            let wait = if self.game.is_some() { Duration::from_millis(16) } else { self.ui.idle_for() };
+            // animates; with it, it wakes on the frame cap (events still
+            // return early). In the background it wakes rarely: the renderer
+            // is held to a few frames a second for the same reason.
+            let background = self.lifecycle.background.load(Ordering::Relaxed);
+            self.presentation.set_background(background);
+            let wait = if background {
+                Duration::from_millis(250)
+            } else if self.game.is_some() {
+                let fps = self.effective_fps();
+                Duration::from_millis(if fps == 0 { 16 } else { (1000 / fps.clamp(20, 60)) as u64 })
+            } else {
+                self.ui.idle_for()
+            };
             let first = wait_event(&mut self.events, wait);
             let events: Vec<Event> = first.into_iter().chain(self.events.poll_iter()).collect();
             for event in events {
@@ -705,28 +716,31 @@ impl App {
     }
 
     fn update_thermal(&mut self) {
-        if !MOBILE || self.thermal_last_poll.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        self.thermal_last_poll = Instant::now();
-        let state = glue5_gpu::thermal_state();
-        if state != self.thermal_state {
-            glue5_runtime::diagnostics::note(format_args!("thermal state: {} -> {state}", self.thermal_state));
-            self.thermal_state = state;
-        }
-        if !self.settings.thermal_protection {
-            self.thermal_cap = None;
-            self.thermal_cool_since = None;
-        } else if let Some(cap) = hot_fps_cap(state) {
-            self.thermal_cap = Some(self.thermal_cap.map_or(cap, |old| old.min(cap)));
-            self.thermal_cool_since = None;
-        } else if self.thermal_cap.is_some() {
-            let since = self.thermal_cool_since.get_or_insert(Instant::now());
-            if since.elapsed() >= Duration::from_secs(30) {
+        // Polled on every platform. Off Apple the state stays nominal, so a
+        // desktop build that leaves thermal protection off is unchanged.
+        if self.thermal_last_poll.elapsed() >= Duration::from_secs(1) {
+            self.thermal_last_poll = Instant::now();
+            let state = glue5_gpu::thermal_state();
+            if state != self.thermal_state {
+                glue5_runtime::diagnostics::note(format_args!("thermal state: {} -> {state}", self.thermal_state));
+                self.thermal_state = state;
+            }
+            if !self.settings.thermal_protection {
                 self.thermal_cap = None;
                 self.thermal_cool_since = None;
+            } else if let Some(cap) = hot_fps_cap(state).filter(|_| MOBILE) {
+                self.thermal_cap = Some(self.thermal_cap.map_or(cap, |old| old.min(cap)));
+                self.thermal_cool_since = None;
+            } else if self.thermal_cap.is_some() {
+                let since = self.thermal_cool_since.get_or_insert(Instant::now());
+                if since.elapsed() >= Duration::from_secs(30) {
+                    self.thermal_cap = None;
+                    self.thermal_cool_since = None;
+                }
             }
         }
+        let state = if self.settings.thermal_protection { self.thermal_state } else { 0 };
+        self.presentation.set_thermal(state);
     }
 
     /// Starts the game once the pipelines known for it are prepared (the
@@ -994,7 +1008,11 @@ fn wait_event(events: &mut sdl3::EventPump, timeout: Duration) -> Option<Event> 
 /// The refresh rate of the window's display (60 if unknown).
 fn window_refresh_rate(window: &sdl3::video::Window) -> f32 {
     let rate = window.get_display().ok().and_then(|d| d.get_mode().ok()).map_or(0.0, |m| m.refresh_rate);
-    if rate > 0.0 { rate } else { 60.0 }
+    if rate > 0.0 {
+        rate
+    } else {
+        60.0
+    }
 }
 
 /// The system's preferred language as a tag like `it-IT`, for the game

@@ -136,6 +136,11 @@ pub struct Scene {
     /// This frame's camera, once a draw showed it, and the depth target
     /// that draw wrote.
     view: Option<View>,
+    /// Last camera position, kept across frames so shadow passes that run
+    /// before this frame's scene draw still know where the player is.
+    pub lod_camera: Option<[f64; 3]>,
+    /// `SCENE_DONE` has been seen: later draws are HUD and stay sharp.
+    pub hud: bool,
     depth_target: u32,
     /// The previous frame's, when that frame's inputs were drawn.
     prev: Option<View>,
@@ -168,15 +173,17 @@ impl Scene {
         self.drawn = false;
         self.size = size;
         self.view = None;
+        self.hud = false;
         self.done = None;
         self.phase = (self.phase + 1) % phases(scale);
         self.jitter =
             if wanted { [halton(self.phase + 1, 2) - 0.5, halton(self.phase + 1, 3) - 0.5] } else { [0.0; 2] };
     }
 
-    /// This frame's camera is still to be found.
+    /// This frame's camera is still to be found. Captured even when no
+    /// temporal upscaler is on, so distant draws can be simplified.
     pub fn wants_camera(&self) -> bool {
-        self.wanted && self.view.is_none()
+        self.view.is_none()
     }
 
     /// The jitter in clip space for a pass of `size`, if the scene is drawn
@@ -215,9 +222,11 @@ impl Scene {
             aspect: (proj[1][1] / proj[0][0]) as f32,
             reversed,
         };
+        let position = [view_inverse[3][0], view_inverse[3][1], view_inverse[3][2]];
+        self.lod_camera = Some(position);
         self.view = Some(View {
             view_proj: mul(&world_inv, &wvp),
-            position: [view_inverse[3][0], view_inverse[3][1], view_inverse[3][2]],
+            position,
             forward: [-view_inverse[2][0], -view_inverse[2][1], -view_inverse[2][2]],
             camera,
         });
@@ -229,6 +238,9 @@ impl Gpu {
     /// The scene is finished in the back buffer: its inputs, for the
     /// present that follows.
     pub fn scene_done(&mut self) {
+        // The hook marks the scene finished even when nothing is upscaling.
+        // Draws after it are HUD: maps, menus, the weapon wheel.
+        self.scene.hud = true;
         let sc = &self.scene;
         if !sc.wanted || sc.done.is_some() {
             return;
@@ -516,6 +528,8 @@ mod tests {
         let mut s = Scene::default();
         s.observe(&m, 7);
         let v = s.view.unwrap();
+        let cam = s.lod_camera.unwrap();
+        assert!((cam[0] + 16.77208).abs() < 1e-4, "{cam:?}");
         assert!(v.camera.reversed);
         assert!((v.camera.aspect - 16.0 / 9.0).abs() < 0.01, "{:?}", v.camera);
         assert!((v.camera.near - 0.15).abs() < 0.01, "{:?}", v.camera);

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
+use arrayvec::ArrayVec;
 use glue5_runtime::gpu::{Command, GpuRing, Reader, op};
 use rustc_hash::{FxHashMap, FxHashSet};
 use wgpu::TextureFormat;
@@ -93,10 +94,21 @@ impl Default for D3d {
 /// Destroyed while the commands being recorded use it.
 pub use crate::submit::Grave;
 
+/// Formats of one render-pass shape, without a heap key. The trailing
+/// slots past `count` are unused.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TailKey {
+    pub targets: [Option<TextureFormat>; 8],
+    pub count: u8,
+    pub depth: Option<TextureFormat>,
+    pub samples: u32,
+    pub read_only: u8,
+}
+
 /// The render pass being recorded.
 pub struct PassInfo {
     pub key: [u32; 37],
-    pub targets: Vec<Option<TextureFormat>>,
+    pub targets: ArrayVec<Option<TextureFormat>, 8>,
     pub depth: Option<TextureFormat>,
     pub samples: u32,
     pub read_only: u8,
@@ -195,6 +207,8 @@ pub struct Gpu {
     /// destroyed; and the variant last picked for that count.
     pub formats_seen: [u64; 3],
     pub bound_formats: [Option<(u32, u64, Arc<Program>, u128)>; 3],
+    /// Extra mips the current draw's samplers must skip (0: the engine's).
+    pub mip_floor: u32,
     /// Render passes recorded since the last submit.
     pub chunk_passes: u32,
     /// When the work not yet handed over started gathering (see `idle`).
@@ -211,7 +225,7 @@ pub struct Gpu {
     pub pipes: FxHashMap<Arc<Recipe>, Arc<pipeline::Cell>>,
     /// Recipes as recorded: those of the seed, of earlier runs and of this one.
     pub known: FxHashSet<Arc<Recipe>>,
-    pub pass_tails: FxHashMap<(Vec<Option<TextureFormat>>, Option<TextureFormat>, u32, u8), u32>,
+    pub pass_tails: FxHashMap<TailKey, u32>,
     pub recipes_new: Vec<Arc<Recipe>>,
     pub key: Vec<u32>,
 
@@ -1071,7 +1085,17 @@ impl Gpu {
         let words: Box<[u32]> = c.payload.get(2..).unwrap_or(&[]).into();
         let (sampler, comparison) =
             if kind == 3 { (Some(self.make_sampler(&words, false)), words[0] & 0x80 != 0) } else { (None, false) };
-        self.objs.insert(id, Obj::State(Box::new(State { words, sampler, comparison, nearest: None })));
+        self.objs.insert(
+            id,
+            Obj::State(Box::new(State {
+                words,
+                sampler,
+                comparison,
+                nearest: None,
+                coarse: Default::default(),
+                coarse_nearest: Default::default(),
+            })),
+        );
     }
 
     /// D3D11_SAMPLER_DESC: Filter, AddressU/V/W, MipLODBias, MaxAnisotropy,
@@ -1079,6 +1103,12 @@ impl Gpu {
     /// 2-3 mag, 0-1 mip (set = linear), 0x80 comparison, 0x55 anisotropic.
     /// `nearest`: without filtering, whatever the engine asked.
     pub fn make_sampler(&self, w: &[u32], nearest: bool) -> wgpu::Sampler {
+        self.make_sampler_at(w, nearest, 0.0)
+    }
+
+    /// `lod_add` raises the minimum mip. The engine's max clamp still wins,
+    /// so a short chain is not asked for a level it does not have.
+    pub fn make_sampler_at(&self, w: &[u32], nearest: bool, lod_add: f32) -> wgpu::Sampler {
         let w = |i: usize| w.get(i).copied().unwrap_or(0);
         let filter = if nearest { w(0) & 0x80 } else { w(0) };
         let aniso = filter & 0x7f == 0x55;
@@ -1089,6 +1119,7 @@ impl Gpu {
         let border_color = [7, 8, 9, 10].map(|i| f32::from_bits(w(i)));
         let lod_min = f32::from_bits(w(11)).max(0.0);
         let lod_max = f32::from_bits(w(12)).clamp(0.0, 32.0).max(lod_min);
+        let lod_min = (lod_min + lod_add.max(0.0)).min(lod_max);
         self.device.create_sampler(&wgpu::SamplerDescriptor {
             label: None,
             address_mode_u: format::address(w(1), border),

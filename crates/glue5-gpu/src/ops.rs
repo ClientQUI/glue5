@@ -237,6 +237,11 @@ pub struct Occlusion {
 const OCCLUSION_SLOTS: u32 = 4096;
 
 impl Occlusion {
+    /// A query is open: its draws have to run, or the count is short.
+    pub fn running(&self) -> bool {
+        self.active.is_some()
+    }
+
     pub fn ensure_set(&mut self, device: &wgpu::Device) {
         if self.set.is_none() {
             self.set = Some(device.create_query_set(&wgpu::QuerySetDescriptor {

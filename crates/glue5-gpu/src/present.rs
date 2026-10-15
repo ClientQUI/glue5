@@ -150,6 +150,11 @@ struct Shared {
     has_frame_generation: AtomicBool,
     /// Frames per second at most, shown evenly (0: as they come).
     frame_rate: AtomicU32,
+    /// The app is not visible. Presentation drops to [`BACKGROUND_FPS`] so
+    /// the engine, which waits on this queue, stops producing full frames.
+    background: AtomicBool,
+    /// Apple's thermal state, 0 when the platform has none.
+    thermal: AtomicU8,
     /// FSR's sharpening, 0 to 1 (f32 bits).
     sharpness: AtomicU32,
     /// A new surface for the window, to present into from the next frame.
@@ -169,6 +174,8 @@ impl Presentation {
             frame_generation: AtomicBool::new(false),
             has_frame_generation: AtomicBool::new(false),
             frame_rate: AtomicU32::new(0),
+            background: AtomicBool::new(false),
+            thermal: AtomicU8::new(0),
             sharpness: AtomicU32::new(0.5f32.to_bits()),
             surface: Mutex::new(None),
         }));
@@ -269,6 +276,25 @@ impl Presentation {
         self.0.frame_rate.store(fps, Ordering::Relaxed);
     }
 
+    /// The process is in the background (a phone locked or the app switched
+    /// away). Frames drop to a few a second until this is cleared.
+    pub fn set_background(&self, on: bool) {
+        self.0.background.store(on, Ordering::Relaxed);
+    }
+
+    /// Apple's thermal state, sampled by the app about once a second.
+    pub fn set_thermal(&self, state: u8) {
+        self.0.thermal.store(state.min(3), Ordering::Relaxed);
+    }
+
+    pub(crate) fn thermal(&self) -> u8 {
+        self.0.thermal.load(Ordering::Relaxed)
+    }
+
+    fn background(&self) -> bool {
+        self.0.background.load(Ordering::Relaxed)
+    }
+
     /// Records a smoothed frame interval for the application. A short
     /// moving average prevents one shader compile or drawable hiccup from
     /// immediately changing the resolution.
@@ -306,6 +332,25 @@ static UPSCALING: Mutex<(f64, u32)> = Mutex::new((0.0, 0));
 pub(crate) fn take_upscaling() -> Option<f64> {
     let (seconds, frames) = std::mem::take(&mut *UPSCALING.lock().unwrap());
     (frames > 0 && seconds > 0.0).then(|| seconds * 1000.0 / frames as f64)
+}
+
+/// Extra Metal command buffers around the upscaler, only while GPU profiling
+/// is on. They exist to time the pass; Metal charges for each one, so normal
+/// play does not submit them.
+fn profile_gpu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GLUE5_GPU_PROFILE").is_some())
+}
+
+/// While the app is in the background the engine is held to a few frames a
+/// second. `0` with the app visible still means "as fast as the present".
+pub(crate) const BACKGROUND_FPS: u32 = 4;
+
+pub(crate) fn paced_fps(requested: u32, background: bool) -> u32 {
+    if !background {
+        return requested;
+    }
+    if requested == 0 { BACKGROUND_FPS } else { requested.min(BACKGROUND_FPS) }
 }
 
 /// One frame's upscaling `commands` between two empty command buffers whose
@@ -463,20 +508,17 @@ impl Display {
         };
         // (Waits for the GPU to finish what it has: a window being resized
         // pays it once per frame.)
-        self.surface.configure(
-            device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                format,
-                color_space: Default::default(),
-                width: w,
-                height: h,
-                present_mode,
-                desired_maximum_frame_latency: 2,
-                alpha_mode: wgpu::CompositeAlphaMode::Auto,
-                view_formats: if linear != format { vec![linear] } else { vec![] },
-            },
-        );
+        self.surface.configure(device, &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            color_space: Default::default(),
+            width: w,
+            height: h,
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: if linear != format { vec![linear] } else { vec![] },
+        });
         self.surface_format = Some(format);
         self.format = Some(linear);
         self.configured = Some((w, h, vsync));
@@ -799,19 +841,26 @@ struct Offscreen {
 impl Output {
     /// Limit real engine submissions, not the generated intermediate images.
     /// Waiting before queue submission also keeps engine fences paced on iOS.
-    pub(crate) fn pace(&mut self) {
-        let fps = self.presentation.0.frame_rate.load(Ordering::Relaxed);
+    pub(crate) fn pace(&mut self) -> Duration {
+        let fps = paced_fps(self.presentation.0.frame_rate.load(Ordering::Relaxed), self.presentation.background());
         if fps == 0 {
             self.last_frame_start = None;
-            return;
+            return Duration::ZERO;
         }
         let budget = Duration::from_secs_f64(1.0 / fps as f64);
-        if let Some(last) = self.last_frame_start {
+        let slept = if let Some(last) = self.last_frame_start {
             if let Some(left) = budget.checked_sub(last.elapsed()) {
+                let started = Instant::now();
                 std::thread::sleep(left);
+                started.elapsed()
+            } else {
+                Duration::ZERO
             }
-        }
+        } else {
+            Duration::ZERO
+        };
         self.last_frame_start = Some(Instant::now());
+        slept
     }
 
     pub(crate) fn note_frame_interval(&self, interval: Duration) {
@@ -884,8 +933,9 @@ impl Output {
     }
 
     /// How long a frame may take: at the frame rate set, or 60 a second.
+    /// Background playback uses the same cap as [`Output::pace`].
     pub fn frame_budget(&self) -> Duration {
-        let fps = self.presentation.0.frame_rate.load(Ordering::Relaxed);
+        let fps = paced_fps(self.presentation.0.frame_rate.load(Ordering::Relaxed), self.presentation.background());
         Duration::from_secs_f64(1.0 / if fps > 0 { fps } else { 60 } as f64)
     }
 
@@ -1045,7 +1095,9 @@ impl Output {
             size = temporal_size((src.width, src.height), size);
         }
         let mut up = self.upscale_into(device, src, size)?;
-        up.commands = timed(device, std::mem::take(&mut up.commands));
+        if profile_gpu() {
+            up.commands = timed(device, std::mem::take(&mut up.commands));
+        }
         Some(up)
     }
 
@@ -1313,6 +1365,15 @@ mod tests {
         assert_eq!(super::temporal_size((1280, 720), (2560, 1440)), (2560, 1440));
         assert_eq!(super::temporal_size((640, 360), (2560, 1440)), (1920, 1080));
         assert_eq!(super::temporal_size((1280, 720), (1280, 720)), (1280, 720));
+    }
+
+    #[test]
+    fn background_holds_the_engine_to_a_few_frames() {
+        assert_eq!(super::paced_fps(0, false), 0);
+        assert_eq!(super::paced_fps(60, false), 60);
+        assert_eq!(super::paced_fps(0, true), super::BACKGROUND_FPS);
+        assert_eq!(super::paced_fps(30, true), super::BACKGROUND_FPS);
+        assert_eq!(super::paced_fps(2, true), 2);
     }
 
     #[test]

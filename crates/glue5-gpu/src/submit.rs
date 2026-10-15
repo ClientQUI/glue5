@@ -179,10 +179,13 @@ fn run(
     while let Ok((batch, encoded)) = rx.recv() {
         glue5_runtime::diagnostics::gpu_submit_stage(1);
         let Ok(mut buffers) = encoded.recv() else { return };
+        // Sleeping to hit the frame cap is not CPU work. Android's performance
+        // hint would otherwise see a full budget used and keep the clocks up.
+        let mut slept = Duration::ZERO;
         if batch.frame {
             if let Some(out) = output.as_mut() {
                 glue5_runtime::diagnostics::gpu_submit_stage(6);
-                out.pace();
+                slept = out.pace();
             }
         }
         // The window's frames: with frame generation, one made between the
@@ -238,7 +241,7 @@ fn run(
             if let Some(last) = last_shown.replace(now) {
                 let interval = now - last;
                 out.note_frame_interval(interval);
-                glue5_runtime::qos::frame(interval, out.frame_budget());
+                glue5_runtime::qos::frame(interval.saturating_sub(slept), out.frame_budget());
             }
         }
         // Destroying takes wgpu's device-wide resource lock for writing: it

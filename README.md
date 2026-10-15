@@ -171,7 +171,9 @@ intent's extras).
 | `GLUE5_ENGINE_LOG=stdout` | The engine's log on the terminal too. On iOS it is also saved as `Glue5 Diagnostics/engine.log` in the app's Documents folder. |
 | `GLUE5_ENGINE_ARGS` | More engine switches, e.g. `-FrameQueueLimit=2`. |
 | `GLUE5_DISABLE_SCENARIO_WORKAROUND=1` | Diagnostic only: disables the workaround for the engine's full scenario-ped overlap list, to A/B-test a mission-specific crash. |
-| `GLUE5_GPU_PROFILE=1` | GPU time per pass in the statistics. |
+| `GLUE5_GPU_PROFILE=1` | GPU time per pass in the statistics, including the upscaler. The timing markers are extra command buffers, so they are not submitted unless this is set. |
+| `GLUE5_DISTANT_DETAIL` | `0` keeps full texture detail at every distance. `2` starts coarsening closer. Unset (or `1`): placed objects past a near band sample coarser mips, and their shadow draws stop past the shadow distance. The player, nearby buildings and the HUD stay as the engine drew them. |
+| `GLUE5_SHADOW_DISTANCE` | Metres past which distant shadow casters are skipped. `0` disables that culling. Unset uses 120 m on phones and 250 m on desktop, shorter while the device is hot. |
 | `GLUE5_PLAY=1` | Start the game without the start page (as `--play`; on a phone too). |
 | `GLUE5_NO_BC=1`, `GLUE5_NO_FLOAT32_FILTER=1` | Mobile GPU fallbacks on a desktop GPU: BC textures decoded on the CPU (and re-encoded as ETC2 where the GPU has it), 32-bit float textures unfiltered. |
 | `GLUE5_NO_ETC2=1` | Decoded BC textures stay RGBA8 instead of ETC2. |

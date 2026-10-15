@@ -277,7 +277,8 @@ impl Vfs {
         };
         // The save is closed here. Sync before the descriptor is gone, or a
         // kill on the way to the background keeps the write in the cache.
-        self.sync_open(&open);
+        // Utility for the sync, then this thread's class comes back.
+        crate::qos::lower(crate::qos::Qos::Utility, || self.sync_open(&open));
         Ok(())
     }
 
@@ -298,9 +299,13 @@ impl Vfs {
             }
             files
         };
-        for file in files {
-            let _ = file.sync_all();
-        }
+        // Utility, not background: iOS can suspend the process as soon as this
+        // returns, and background QoS may not be scheduled again before that.
+        crate::qos::lower(crate::qos::Qos::Utility, || {
+            for file in files {
+                let _ = file.sync_all();
+            }
+        });
     }
 
     fn sync_open(&self, open: &Open) {
@@ -594,6 +599,10 @@ fn writable_flags(flags: u32) -> bool {
 /// Writes `bytes` and flushes the file and its directory, so a kill after
 /// the write still finds it.
 pub(crate) fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::qos::lower(crate::qos::Qos::Utility, || durable_write_at(path, bytes))
+}
+
+fn durable_write_at(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -611,6 +620,10 @@ pub(crate) fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Flushes files under `dir`, skipping the renderer's caches. Opening a
 /// file and syncing it pushes pages the engine already wrote and closed.
 pub(crate) fn sync_tree(dir: &Path) {
+    crate::qos::lower(crate::qos::Qos::Utility, || sync_tree_at(dir));
+}
+
+fn sync_tree_at(dir: &Path) {
     fn walk(dir: &Path, depth: u32) {
         if depth > 8 {
             return;

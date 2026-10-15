@@ -957,9 +957,15 @@ impl Gpu {
             let (tx, rx) = std::sync::mpsc::channel();
             let bpr = bpr as usize;
             self.decoder.get_or_insert_with(|| Pool::new("gpu decode", 2)).urgent(move || {
-                let Some(src) = job_source.lock().unwrap().take() else { return };
-                let texels = crate::bc::decode(bc, &src, bpr, src_rows, cols as usize, block_rows as usize, d as usize);
-                let _ = tx.send(if etc2 { crate::bc::etc2_rgba(texels, cols * 4, block_rows * 4 * d) } else { texels });
+                // The GPU thread stays user-interactive and only waits at a
+                // flush. Decompression prefers efficiency cores, then this
+                // worker returns to the class the pool gave it.
+                glue5_runtime::qos::lower(glue5_runtime::qos::Qos::Utility, || {
+                    let Some(src) = job_source.lock().unwrap().take() else { return };
+                    let texels =
+                        crate::bc::decode(bc, &src, bpr, src_rows, cols as usize, block_rows as usize, d as usize);
+                    let _ = tx.send(if etc2 { crate::bc::etc2_rgba(texels, cols * 4, block_rows * 4 * d) } else { texels });
+                });
             });
             self.decodes.push(Decode {
                 data: rx,

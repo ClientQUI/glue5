@@ -166,23 +166,16 @@ fn engine_name(mem: crate::memory::Mem, arg: u64) -> Option<String> {
     (name.len() >= 3 && name.len() < 48).then(|| String::from_utf8_lossy(&name).into_owned())
 }
 
-/// Mixer and audio engine threads. The render thread stays with the other
-/// workers: putting both above them stretched a load from 1-2 s to 6-10 s.
-fn is_audio_thread(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.contains("audio") || name.contains("mix") || name.contains("sound")
-}
-
 fn run_pthread(pthread: u64, start: u64, arg: u64, name: Option<String>) {
-    // Loading waits on the engine's workers and streaming threads: the render
-    // thread and the mixer above them (interactive) made a black screen after
-    // a cutscene take 6-10 s instead of 1-2 on an iPhone 13 Pro. Only the
-    // mixer's own thread is raised, so a frame cannot be scheduled ahead of it.
-    if name.as_deref().is_some_and(is_audio_thread) {
-        crate::qos::set_audio();
-    } else {
-        crate::qos::set(crate::qos::Qos::Initiated);
-    }
+    // Main, game and render stay user-interactive. The mixer, streaming and
+    // save threads drop a class when efficiency placement is on. Loading
+    // waits on streaming: that used to stretch a post-cutscene load from
+    // 1-2 s to 6-10 s on an iPhone 13 Pro when render and the mixer were
+    // both above the workers. Streaming now shares the utility class with
+    // the mixer (the mixer keeps the higher priority inside it) and render
+    // stays interactive, so a busy frame can still make a load longer.
+    // Threads already running keep this class until the game starts again.
+    crate::qos::apply_engine_thread(name.as_deref());
     let env = new_env();
     let mem = rt().memory.mem();
     let result = (|| -> Result<(), Trap> {
@@ -225,18 +218,4 @@ fn run_pthread(pthread: u64, start: u64, arg: u64, name: Option<String>) {
 pub(crate) unsafe fn cleanup(env: *mut Env, pthread: u64) {
     rt().threads.inner.lock().unwrap().cleanup.push(pthread);
     rt().threads.reap(env);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_audio_thread;
-
-    #[test]
-    fn only_sound_threads_are_raised() {
-        assert!(is_audio_thread("Audio Mixer"));
-        assert!(is_audio_thread("MixThread"));
-        assert!(is_audio_thread("SoundEngine"));
-        assert!(!is_audio_thread("Render"));
-        assert!(!is_audio_thread("Streaming"));
-    }
 }

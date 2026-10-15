@@ -32,7 +32,12 @@ requests can still grow it to avoid failed streaming reads.
 - Binding-only shader variants share their immutable WGSL text instead of
   copying it. Textual rewrites keep their own source.
 - Background shader-module cleanup and the frame watchdog run at Utility
-  QoS. Frame-critical work is not forced onto efficiency cores.
+  QoS. The graphics menu can also place the audio pump, mixer, asset
+  streaming and texture decompression at utility QoS, and a dedicated save
+  thread at background QoS, which prefer efficiency cores. The audio
+  callback and the main, game, render and GPU threads stay user-interactive.
+  Frame-critical work is not forced onto efficiency cores, and the Neural
+  Engine is not used.
 - Video settings now offer 20 FPS as a lower, live frame cap. The renderer
   paces before submit/completion, reducing engine frame progress too.
 

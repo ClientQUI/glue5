@@ -276,6 +276,23 @@ fn settings_items(
             setting(ui, "Thermal protection", Control::Toggle, Some(&subtitle), |ui| {
                 toggle(ui, &mut settings.thermal_protection)
             });
+            let cores = if crate::settings::efficiency_cores_killed() {
+                "Forced off by GLUE5_EFFICIENCY_CORES=0".to_string()
+            } else if settings.efficiency_cores {
+                "Audio, streaming and saves prefer efficiency cores".to_string()
+            } else {
+                "Off".to_string()
+            };
+            setting(ui, "Efficiency cores", Control::Toggle, Some(&cores), |ui| {
+                toggle(ui, &mut settings.efficiency_cores)
+            });
+            ui.label(
+                RichText::new(
+                    "The audio callback stays immediate, with 100 ms buffered. Engine threads already running pick this up when the game starts again.",
+                )
+                .small()
+                .color(theme::MUTED),
+            );
             let unlimited = if settings.vsync { "Display" } else { "Unlimited" };
             let mut rates = vec![(0, unlimited), (60, "60")];
             if status.refresh_rate >= 119.0 {
@@ -501,7 +518,7 @@ fn distance_options(ui: &mut egui::Ui, settings: &mut Settings, status: &Status)
         .small()
         .color(theme::MUTED),
     );
-    setting(ui, "Defaults", Control::Action, Some("Fog, distances, scale, boost, thermal"), |ui| {
+    setting(ui, "Defaults", Control::Action, Some("Fog, distances, scale, boost, thermal, cores"), |ui| {
         if action_button(ui, "Reset").clicked() {
             settings.reset_distance_options(status.window.1);
         }

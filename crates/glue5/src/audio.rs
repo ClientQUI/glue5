@@ -2,12 +2,15 @@
 //!
 //! The device callback used to read the game's ring directly. That ring holds
 //! about 64 ms, and a late callback turned the gap into silence. Playback now
-//! has its own thread, at interactive priority. Every few milliseconds it
-//! pulls whatever the mixer has written into a local buffer and keeps the
-//! mixer's heartbeat alive, so a stalled frame or a background present does
-//! not look like a device that went away. The callback only copies that
-//! buffer. It starts once 100 ms is buffered, and waits for that again after
-//! a real underrun instead of playing the gaps.
+//! has its own thread. Every few milliseconds it pulls whatever the mixer has
+//! written into a local buffer and keeps the mixer's heartbeat alive, so a
+//! stalled frame or a background present does not look like a device that
+//! went away. With efficiency placement on, that pump and the game's mixer
+//! run at utility QoS (efficiency cores). The callback only copies the
+//! buffer and stays user-interactive, which is the deadline. Playback starts
+//! once 100 ms is buffered, and waits for that again after a real underrun
+//! instead of playing the gaps. A pump stall inside that cushion does not
+//! reach the speakers (`glue5_runtime`'s playback measure).
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -71,7 +74,16 @@ pub fn start(subsystem: &sdl3::AudioSubsystem, out: AudioOut) -> Result<Audio> {
             .spawn(move || pump(out, shared, stop))
             .map_err(|e| anyhow!("audio pump: {e}"))?
     };
-    let pull = Pull { shared, buf: Vec::new(), frames: 0, mixed: 0, calls: 0, peak: 0.0, last_log: Instant::now() };
+    let pull = Pull {
+        shared,
+        buf: Vec::new(),
+        frames: 0,
+        mixed: 0,
+        calls: 0,
+        peak: 0.0,
+        last_log: Instant::now(),
+        gap: false,
+    };
     let stream = subsystem.open_playback_stream(&spec, pull).map_err(|e| anyhow!("SDL audio: {e}"))?;
     stream.resume().map_err(|e| anyhow!("SDL audio: {e}"))?;
     log::info!(
@@ -83,9 +95,14 @@ pub fn start(subsystem: &sdl3::AudioSubsystem, out: AudioOut) -> Result<Audio> {
 }
 
 fn pump(out: AudioOut, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
-    qos::set_audio();
+    let mut placed = None;
     let mut scratch = vec![0f32; PULL_FRAMES * CHANNELS];
     while !stop.load(Ordering::Acquire) {
+        let on = qos::efficiency_cores();
+        if placed != Some(on) {
+            qos::set_audio();
+            placed = Some(on);
+        }
         let free = shared.playback.free();
         if free == 0 {
             // The device is behind. Leave the game's 64 ms where it is and
@@ -202,10 +219,14 @@ struct Pull {
     calls: u64,
     peak: f32,
     last_log: Instant,
+    /// A real underrun is in progress (priming is not one).
+    gap: bool,
 }
 
 impl AudioCallback<f32> for Pull {
     fn callback(&mut self, stream: &mut AudioStream, requested: i32) {
+        // The deadline. The pump may be on an efficiency core; this copy is not.
+        qos::set_audio_callback();
         let samples = (requested.max(0) as usize).next_multiple_of(CHANNELS);
         self.buf.resize(samples, 0.0);
         let frames = samples / CHANNELS;
@@ -215,6 +236,13 @@ impl AudioCallback<f32> for Pull {
             let got = self.shared.playback.read(&mut self.buf);
             if got == 0 {
                 self.shared.live.store(false, Ordering::Release);
+                if !self.gap {
+                    self.gap = true;
+                    log::warn!("audio: device underrun; holding until the cushion is back");
+                }
+            } else if self.gap {
+                self.gap = false;
+                log::info!("audio: cushion restored");
             }
             got
         } else {

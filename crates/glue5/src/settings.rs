@@ -67,6 +67,10 @@ pub struct Settings {
     pub shadow_distance: f32,
     /// Extra render scale while the device is cool. 1 keeps the chosen scale.
     pub render_boost: f32,
+    /// Audio, streaming and save threads prefer efficiency cores. The audio
+    /// callback, and the main, game, render and GPU threads, stay
+    /// user-interactive. `GLUE5_EFFICIENCY_CORES=0` forces this off.
+    pub efficiency_cores: bool,
     pub touch: TouchMode,
     pub touch_opacity: f32,
     pub touch_size: f32,
@@ -259,7 +263,16 @@ fn distance_override(value: f32, builtin: f32) -> Option<f32> {
     }
 }
 
+/// `GLUE5_EFFICIENCY_CORES=0` keeps audio, streaming and saves with the game threads.
+pub fn efficiency_cores_killed() -> bool {
+    std::env::var("GLUE5_EFFICIENCY_CORES").ok().as_deref() == Some("0")
+}
+
 fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    glue5_runtime::qos::lower(glue5_runtime::qos::Qos::Utility, || durable_write_at(path, bytes))
+}
+
+fn durable_write_at(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -318,6 +331,7 @@ impl Default for Settings {
             tree_distance: default_tree_distance(),
             shadow_distance: default_shadow_distance(),
             render_boost: 1.0,
+            efficiency_cores: true,
             touch: TouchMode::Auto,
             touch_opacity: 0.6,
             touch_size: 1.0,
@@ -421,11 +435,17 @@ impl Settings {
         self.shadow_distance = fresh.shadow_distance;
         self.render_boost = fresh.render_boost;
         self.thermal_protection = fresh.thermal_protection;
+        self.efficiency_cores = fresh.efficiency_cores;
         self.adaptive_graphics = fresh.adaptive_graphics;
         let lines = if MOBILE { 720.0 } else { 1080.0 };
         self.render_scale = Some(round_scale(lines / window_height.max(1) as f32));
         self.render_lines = None;
         self.scaling_custom = false;
+    }
+
+    /// Efficiency-core placement, after the env kill switch.
+    pub fn efficiency_cores_on(&self) -> bool {
+        if efficiency_cores_killed() { false } else { self.efficiency_cores }
     }
 
     /// Policy for the renderer. Built-in distances still shorten while the
@@ -583,6 +603,7 @@ mod tests {
         assert_eq!(migrated.texture_detail.max_dimension(), 256);
         assert_eq!(migrated.world_preset, WorldPreset::Eco);
         assert!(migrated.fog);
+        assert!(migrated.efficiency_cores);
         assert_eq!(migrated.render_boost, 1.0);
         assert_eq!(migrated.distance_policy().render_boost, 1.0);
         assert_eq!(migrated.input_size((2868, 1320)), (1042, 480));

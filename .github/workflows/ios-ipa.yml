@@ -1,0 +1,100 @@
+# Unsigned iOS app, then a fake-signed IPA (ldid), same packaging shape as
+# ClientQUI/GetMoreRam/.github/workflows/build.yml.
+#
+# The compile needs game.wasm. This repository does not contain it. Set the
+# repository secret GLUE5_GAME_URL to a tarball or zip of the game directory
+# (b/<build>/game.wasm, b/<build>/shaders, data/). Optional GLUE5_GAME_TOKEN
+# is sent as a bearer token. Without that URL the job fails in "Game files"
+# and explains what to add. See README, "CI IPA".
+
+name: iOS IPA
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    name: Unsigned app, fake-signed IPA
+    runs-on: macos-latest
+    timeout-minutes: 180
+    env:
+      GLUE5_GAME_URL: ${{ secrets.GLUE5_GAME_URL }}
+      GLUE5_GAME_TOKEN: ${{ secrets.GLUE5_GAME_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Game files
+        id: game
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/ios-game-dir.sh
+          root=$(.github/scripts/ios-game-dir.sh "$RUNNER_TEMP/game")
+          echo "dir=$root" >> "$GITHUB_OUTPUT"
+          echo "Using game directory $root"
+          find "$root/b" -name game.wasm -print
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.4'
+
+      - name: Toolchain
+        uses: jdx/mise-action@v2
+
+      - name: Prepare wasm2c and patched wgpu
+        run: mise run setup
+
+      - name: Build the unsigned app
+        env:
+          GLUE5_GAME_DIR: ${{ steps.game.outputs.dir }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          . .mise/tasks/ios/lib.sh
+          ios_project
+          xcodebuild_app generic/platform=iOS \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM=""
+          test -d "$app"
+          {
+            echo "APP_PATH<<EOF"
+            echo "$app"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Fake-sign and pack the IPA
+        run: |
+          set -euo pipefail
+          app="${APP_PATH}"
+          entitlements="$GITHUB_WORKSPACE/platform/ios/Glue5.entitlements"
+          # Nested frameworks first, then the bundle, as GetMoreRam does.
+          find "$app" -type d -path '*/Frameworks/*.framework' -exec ldid -S {} \;
+          ldid -S"$entitlements" "$app"
+          stage=$(mktemp -d)
+          mkdir -p "$stage/Payload"
+          cp -R "$app" "$stage/Payload/"
+          (cd "$stage" && zip -r "$GITHUB_WORKSPACE/Glue5.ipa" Payload -x "._*" -x ".DS_Store" -x "__MACOSX")
+          ls -lh "$GITHUB_WORKSPACE/Glue5.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Glue5.ipa
+          path: Glue5.ipa
+          if-no-files-found: error

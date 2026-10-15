@@ -117,6 +117,7 @@ Rendering is wgpu on Vulkan: the GPU driver provides it.
 | iOS: build, sign, install, launch on the connected device | `mise run ios [device]` |
 | iOS: only check that the app builds | `mise run ios:build` |
 | iOS: build and export a signed IPA | `mise run ios:ipa` (`target/ios/export/Glue 5.ipa`) |
+| iOS: CI IPA (unsigned, then ldid) | GitHub Actions workflow `iOS IPA`, artifact `Glue5.ipa` |
 | iOS: launch the installed app again, with its console | `mise run ios:run [device]` |
 | iOS: copy the game into the app's Documents/game | `mise run ios:game [device]` |
 | Android: build, install, launch on the connected device with its log | `mise run android [device]` |
@@ -128,6 +129,29 @@ Rendering is wgpu on Vulkan: the GPU driver provides it.
 put it in `.mise/config.local.toml` (ignored by git) under `[env]`. With several
 phones connected, pass the device (name, identifier or UDID); for Android,
 its serial number (`adb devices`).
+
+### CI IPA
+
+The `iOS IPA` workflow (`.github/workflows/ios-ipa.yml`) runs on every push
+and from Actions → Run workflow. It builds the unsigned app on `macos-latest`
+(`CODE_SIGNING_ALLOWED=NO`, the same shape as `mise run ios:build`), fake-signs
+the bundle with `ldid` and `platform/ios/Glue5.entitlements`, and uploads the
+artifact `Glue5.ipa`. That archive is for sideloading. A Developer-signed IPA
+is still the local task `mise run ios:ipa`.
+
+This repository does not contain GTA V, so CI has no `game.wasm` unless you
+give it one:
+
+1. Pack the game directory (the folder that contains `b/<build>/game.wasm`,
+   `b/<build>/shaders` and `data/`). The archive root may be that folder, or
+   one directory above it. `.tar`, `.tar.gz` and `.zip` URLs are accepted.
+2. Set the repository secret `GLUE5_GAME_URL` to an https URL for that archive.
+   For a private URL, also set `GLUE5_GAME_TOKEN`. It is sent as a bearer token.
+3. Re-run `iOS IPA`.
+
+The supported `game.wasm` is build `8b0b5899ed`. A different build is refused.
+Until `GLUE5_GAME_URL` is set, the **Game files** step fails and explains this,
+before the toolchain or Xcode is installed.
 
 ### macOS packaging
 

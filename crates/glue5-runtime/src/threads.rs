@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
-use glue5_game::{Env, Trap, exports};
+use glue5_game::{exports, Env, Trap};
 
 use crate::rt;
 
@@ -134,10 +134,11 @@ unsafe fn init_tls(env: *mut Env) -> Result<(), Trap> {
 pub(crate) unsafe fn create(env: *mut Env, pthread: u64, start: u64, arg: u64) -> u32 {
     rt().threads.reap(env);
     let name = engine_name(rt().memory.mem(), arg);
+    let thread_name = name.clone();
     let spawned = thread::Builder::new()
         .name(name.unwrap_or_else(|| format!("pthread {pthread:#x}")))
         .stack_size(PTHREAD_STACK)
-        .spawn(move || run_pthread(pthread, start, arg));
+        .spawn(move || run_pthread(pthread, start, arg, thread_name));
     match spawned {
         Ok(_) => 0,
         Err(e) => {
@@ -165,11 +166,23 @@ fn engine_name(mem: crate::memory::Mem, arg: u64) -> Option<String> {
     (name.len() >= 3 && name.len() < 48).then(|| String::from_utf8_lossy(&name).into_owned())
 }
 
-fn run_pthread(pthread: u64, start: u64, arg: u64) {
+/// Mixer and audio engine threads. The render thread stays with the other
+/// workers: putting both above them stretched a load from 1-2 s to 6-10 s.
+fn is_audio_thread(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("audio") || name.contains("mix") || name.contains("sound")
+}
+
+fn run_pthread(pthread: u64, start: u64, arg: u64, name: Option<String>) {
     // Loading waits on the engine's workers and streaming threads: the render
     // thread and the mixer above them (interactive) made a black screen after
-    // a cutscene take 6-10 s instead of 1-2 on an iPhone 13 Pro.
-    crate::qos::set(crate::qos::Qos::Initiated);
+    // a cutscene take 6-10 s instead of 1-2 on an iPhone 13 Pro. Only the
+    // mixer's own thread is raised, so a frame cannot be scheduled ahead of it.
+    if name.as_deref().is_some_and(is_audio_thread) {
+        crate::qos::set_audio();
+    } else {
+        crate::qos::set(crate::qos::Qos::Initiated);
+    }
     let env = new_env();
     let mem = rt().memory.mem();
     let result = (|| -> Result<(), Trap> {
@@ -212,4 +225,18 @@ fn run_pthread(pthread: u64, start: u64, arg: u64) {
 pub(crate) unsafe fn cleanup(env: *mut Env, pthread: u64) {
     rt().threads.inner.lock().unwrap().cleanup.push(pthread);
     rt().threads.reap(env);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_audio_thread;
+
+    #[test]
+    fn only_sound_threads_are_raised() {
+        assert!(is_audio_thread("Audio Mixer"));
+        assert!(is_audio_thread("MixThread"));
+        assert!(is_audio_thread("SoundEngine"));
+        assert!(!is_audio_thread("Render"));
+        assert!(!is_audio_thread("Streaming"));
+    }
 }

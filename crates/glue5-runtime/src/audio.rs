@@ -41,6 +41,14 @@ impl AudioOut {
         mem.atomic_u32(at + HEARTBEAT).fetch_add(1, Ordering::Release);
         taken
     }
+
+    /// The consumer is still here, without taking samples. The mixer drops
+    /// its output after 250 ms with no heartbeat; a full playback buffer
+    /// must not look like a dead device.
+    pub fn heartbeat(&self) {
+        let Some(at) = nonzero(rt().audio_ring.load(Ordering::Acquire)) else { return };
+        rt().memory.mem().atomic_u32(at + HEARTBEAT).fetch_add(1, Ordering::Release);
+    }
 }
 
 fn read_ring(mem: Mem, at: u64, out: &mut [f32]) -> usize {

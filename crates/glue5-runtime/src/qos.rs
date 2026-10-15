@@ -15,6 +15,21 @@ pub enum Qos {
     Utility,
 }
 
+/// The playback pump and the game's mixer: interactive, and a lower niceness
+/// where the OS allows it. A long frame must not be scheduled ahead of them.
+pub fn set_audio() {
+    set(Qos::Interactive);
+    // `setpriority` on a thread id is that thread, not the process. It fails
+    // without permission; playback still has the interactive class.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid);
+        if tid > 0 {
+            let _ = libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, -10);
+        }
+    }
+}
+
 /// Sets the calling thread's class.
 pub fn set(qos: Qos) {
     #[cfg(target_vendor = "apple")]
@@ -48,7 +63,7 @@ pub fn frame(took: std::time::Duration, target: std::time::Duration) {
 /// game that never fully loads one thread, as the engine's pipeline does.
 #[cfg(target_os = "android")]
 mod hint {
-    use std::ffi::{CStr, c_void};
+    use std::ffi::{c_void, CStr};
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 

@@ -27,7 +27,7 @@ mod p2p;
 pub mod qos;
 mod readback;
 mod scenario;
-mod sched;
+pub mod sched;
 mod script_assets;
 mod shader_settings;
 mod shadow_reveal;

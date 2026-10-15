@@ -479,14 +479,7 @@ mod realtime {
         denom: u32,
     }
 
-    #[repr(C)]
-    struct TimeConstraint {
-        period: u32,
-        computation: u32,
-        constraint: u32,
-        preemptible: u32,
-    }
-
+    // libc only binds this on macOS. The symbol is in libSystem on iOS too.
     unsafe extern "C" {
         fn mach_timebase_info(info: *mut Timebase) -> c_int;
     }
@@ -505,13 +498,17 @@ mod realtime {
                 ns.saturating_mul(info.denom as u64).saturating_div(info.numer as u64).min(u32::MAX as u64) as u32
             };
             let period = ticks(5_333_333);
-            let mut policy =
-                TimeConstraint { period, computation: ticks(1_000_000), constraint: period, preemptible: 1 };
+            let mut policy = libc::thread_time_constraint_policy {
+                period,
+                computation: ticks(1_000_000),
+                constraint: period,
+                preemptible: 1,
+            };
             let _ = libc::thread_policy_set(
                 libc::pthread_mach_thread_np(libc::pthread_self()),
-                2 as libc::thread_policy_flavor_t,
-                &mut policy as *mut TimeConstraint as libc::thread_policy_t,
-                4 as libc::mach_msg_type_number_t,
+                libc::THREAD_TIME_CONSTRAINT_POLICY as libc::thread_policy_flavor_t,
+                &mut policy as *mut libc::thread_time_constraint_policy as libc::thread_policy_t,
+                libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT,
             );
             join_workgroup();
         }

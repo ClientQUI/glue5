@@ -1204,7 +1204,7 @@ impl Gpu {
         }
         self.flush_with("present", present, true);
         let jobs = self.decodes.len() as u32;
-        let bytes = self.decodes.iter().map(|d| d.bytes).sum();
+        let bytes = self.decodes.iter().map(|d| d.bytes).sum::<u64>();
         glue5_runtime::qos::note_stream(bytes, jobs);
         let now = Instant::now();
         if let Some(last) = self.last_present.replace(now) {

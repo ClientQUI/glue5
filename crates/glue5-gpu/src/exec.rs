@@ -279,7 +279,8 @@ pub struct Decode {
     /// Queued jobs release their compressed copy immediately on cancellation;
     /// an already-running job owns it until that decode finishes.
     source: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-    bytes: u64,
+    /// Compressed plus decoded size, for the streaming-backlog signal.
+    pub(crate) bytes: u64,
     /// The texture's object, and the texture it was when the data came.
     id: u32,
     texture: wgpu::Texture,

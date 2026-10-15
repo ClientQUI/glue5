@@ -150,14 +150,21 @@ pub fn run() -> Result<()> {
     // the application's lifecycle only to watches too, from the call that
     // learns of it (not through the queue): the loop follows it from there.
     let watched = presentation.clone();
-    let lifecycle = Arc::new(Lifecycle::default());
+    let lifecycle = Arc::new(Lifecycle::new(user_dir.clone(), &settings));
     let life = lifecycle.clone();
     let _watch =
         sdl.event().map_err(|e| anyhow!("SDL events: {e}"))?.add_event_watch(move |event: Event| match event {
             Event::Window { win_event: WindowEvent::PixelSizeChanged(w, h), .. } => {
                 watched.set_size(w.max(0) as u32, h.max(0) as u32)
             }
-            Event::AppWillEnterBackground { .. } => life.background.store(true, Ordering::Relaxed),
+            // iOS: applicationWillResignActive, applicationDidEnterBackground,
+            // applicationWillTerminate. SDL delivers the first as will-enter-background.
+            // The process can be killed as soon as this returns, so the save is
+            // flushed here rather than on the next turn of the loop.
+            Event::AppWillEnterBackground { .. } | Event::AppDidEnterBackground { .. } | Event::AppTerminating { .. } => {
+                life.background.store(true, Ordering::Relaxed);
+                life.flush();
+            }
             Event::AppDidEnterForeground { .. } => {
                 life.background.store(false, Ordering::Relaxed);
                 life.came_back.store(true, Ordering::Relaxed);
@@ -253,12 +260,39 @@ impl Args {
 }
 
 /// The application's lifecycle, as SDL tells the event watch.
-#[derive(Default)]
 struct Lifecycle {
     /// In the background (phones: no GPU work there).
     background: AtomicBool,
     /// Back in the foreground since the loop last looked.
     came_back: AtomicBool,
+    user_dir: PathBuf,
+    /// Latest settings, so the watch can flush them without borrowing `App`.
+    settings_json: Mutex<Vec<u8>>,
+}
+
+impl Lifecycle {
+    fn new(user_dir: PathBuf, settings: &Settings) -> Self {
+        Self {
+            background: AtomicBool::new(false),
+            came_back: AtomicBool::new(false),
+            user_dir,
+            settings_json: Mutex::new(settings.snapshot()),
+        }
+    }
+
+    fn remember(&self, settings: &Settings) {
+        if let Ok(mut json) = self.settings_json.lock() {
+            *json = settings.snapshot();
+        }
+    }
+
+    /// Settings, then the engine's stats and save files. Bounded, so a stuck
+    /// engine cannot hold the process past the point iOS suspends it.
+    fn flush(&self) {
+        let json = self.settings_json.lock().map(|json| json.clone()).unwrap_or_default();
+        Settings::save_snapshot(&self.user_dir, &json);
+        glue5_runtime::flush_on_suspend();
+    }
 }
 
 struct App {
@@ -340,8 +374,9 @@ struct Running {
 impl App {
     fn run(mut self) -> Result<()> {
         loop {
+            self.lifecycle.remember(&self.settings);
             if let Some(exit) = glue5_runtime::exit::requested() {
-                self.settings.save(&self.user_dir);
+                self.lifecycle.flush();
                 if exit == Exit::Restart {
                     if MOBILE {
                         // A phone app cannot start itself again: says so before it ends.
@@ -356,6 +391,7 @@ impl App {
                 return Ok(());
             }
             if let Some(why) = glue5_runtime::exit::failed() {
+                self.lifecycle.flush();
                 self.stopped(why);
                 return Ok(());
             }
@@ -392,7 +428,8 @@ impl App {
             let events: Vec<Event> = first.into_iter().chain(self.events.poll_iter()).collect();
             for event in events {
                 if self.event(event) {
-                    self.settings.save(&self.user_dir);
+                    self.lifecycle.remember(&self.settings);
+                    self.lifecycle.flush();
                     return Ok(());
                 }
             }
@@ -400,7 +437,8 @@ impl App {
                 self.came_back();
             }
             if self.update(page)? {
-                self.settings.save(&self.user_dir);
+                self.lifecycle.remember(&self.settings);
+                self.lifecycle.flush();
                 return Ok(());
             }
         }
@@ -514,6 +552,7 @@ impl App {
             0
         });
         glue5_runtime::diagnostics::set_verbose_logs(self.settings.verbose_logs);
+        glue5_gpu::set_distance_policy(self.settings.distance_policy());
         self.adapt_graphics();
         self.resize_game();
 

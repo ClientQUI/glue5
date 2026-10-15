@@ -361,9 +361,11 @@ impl Gpu {
             return;
         }
         self.scene.fogged = true;
+        let policy = crate::detail::policy();
         let thermal = self.presentation.as_ref().map(crate::present::Presentation::thermal).unwrap_or(0);
-        let view_m = crate::detail::distances(crate::detail::policy(), thermal).view;
-        if !view_m.is_finite() {
+        let view_m = crate::detail::distances(policy, thermal).view;
+        let fog_end = policy.fog_override.filter(|m| m.is_finite() && *m > 0.0).unwrap_or(view_m);
+        if !fog_end.is_finite() || fog_end <= 0.0 {
             return;
         }
         let Some(size) = self.scene.size else { return };
@@ -411,14 +413,18 @@ impl Gpu {
         data[16] = camera[0] as f32;
         data[17] = camera[1] as f32;
         data[18] = camera[2] as f32;
-        data[19] = view_m * 0.42;
+        // Fog starts after the near-detail radius, so a surface next to the
+        // camera is never mixed toward the haze colour.
+        data[19] = (fog_end * 0.42).max(crate::detail::NEAR_FULL_DETAIL_M).min(fog_end);
         // A light haze. Linear, because an sRGB target encodes it on write.
         data[20] = 0.64;
         data[21] = 0.68;
         data[22] = 0.72;
-        data[23] = view_m;
+        data[23] = fog_end;
         data[24] = size.0 as f32;
         data[25] = size.1 as f32;
+        let near = self.scene.view.as_ref().map(|v| v.camera.near).unwrap_or(0.15);
+        data[26] = if near.is_finite() && near > 0.01 { near } else { 0.15 };
         self.uploads.buffer(&uniforms, 0, bytemuck::cast_slice(&data));
         let device = self.device.clone();
         let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor {
@@ -530,6 +536,9 @@ impl FogPass {
     }
 }
 
+/// Matches [`crate::detail::fog_amount`]. A depth of 0 used to take the
+/// horizon branch for every lower-frame pixel and paint the road, wall and
+/// ramp the flat fog colour while the skyline still showed the buildings.
 const FOG_WGSL: &str = "
 struct U {
   inv_view_proj: mat4x4f,
@@ -538,7 +547,8 @@ struct U {
   fog_color: vec3f,
   fog_end: f32,
   size: vec2f,
-  pad: vec2f,
+  near: f32,
+  pad: f32,
 }
 @group(0) @binding(0) var color: texture_2d<f32>;
 @group(0) @binding(1) var depth: texture_depth_2d;
@@ -551,6 +561,14 @@ struct U {
   let src = textureLoad(color, vec2i(p.xy), 0);
   let d = textureLoad(depth, vec2i(p.xy), 0);
   let uv = p.xy / u.size;
+  // Far clear (or a depth target that does not hold the scene). Haze only
+  // the top of the sky. The ground must keep the colour that was drawn.
+  if d <= 0.002 {
+    let above = 1.0 - uv.y;
+    let t = clamp((above - 0.62) / 0.26, 0.0, 1.0);
+    let amount = t * t * (3.0 - 2.0 * t) * 0.35;
+    return vec4f(mix(src.rgb, u.fog_color, amount), src.a);
+  }
   let clip = vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
   let world = u.inv_view_proj * clip;
   if world.w <= 0.0 {
@@ -559,11 +577,20 @@ struct U {
   let pos = world.xyz / world.w;
   let delta = pos - u.camera;
   let dist = length(delta);
+  if dist != dist || dist > 1e7 {
+    return src;
+  }
+  // A world distance that disagrees with the depth is a bad unprojection.
+  let linear = u.near / max(d, 1e-4);
+  if dist > linear * 8.0 + 80.0 {
+    return src;
+  }
+  if dist < 48.0 {
+    return src;
+  }
+  let ground = smoothstep(u.fog_start, u.fog_end, dist) * 0.72;
   let up = delta.z / max(dist, 1e-3);
-  // Drawn world fades out by the view distance. Past that (the sky, and the
-  // hole a culled draw leaves) only the horizon hazes, so the zenith stays.
-  let ground = smoothstep(u.fog_start, u.fog_end, dist) * 0.90;
-  let horizon = smoothstep(0.42, 0.02, up) * 0.82;
+  let horizon = smoothstep(0.42, 0.02, up) * 0.45;
   let amount = select(ground, horizon, dist > u.fog_end);
   return vec4f(mix(src.rgb, u.fog_color, amount), src.a);
 }
@@ -721,6 +748,9 @@ mod tests {
 
     #[test]
     fn fog_shader_validates() {
+        assert!(FOG_WGSL.contains("d <= 0.002"), "a cleared depth must not fog the ground");
+        assert!(FOG_WGSL.contains("dist < 48.0"), "near surfaces stay unfogged");
+        assert!(FOG_WGSL.contains("linear * 8.0"));
         let module = naga::front::wgsl::parse_str(FOG_WGSL).unwrap();
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module)

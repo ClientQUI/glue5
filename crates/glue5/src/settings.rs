@@ -53,6 +53,20 @@ pub struct Settings {
     pub frame_generation: bool,
     /// Apple's driver-level performance overlay.
     pub metal_hud: bool,
+    /// Distance fog over the world. Near surfaces are never tinted.
+    pub fog: bool,
+    /// Where fog is fully mixed, in metres. 0 uses the view distance.
+    pub fog_distance: f32,
+    /// Placed LOD stand-ins and trees stop at this distance. 0 disables the cutoff.
+    pub view_distance: f32,
+    /// Decals, debris and bushes stop at this distance. 0 disables that culling.
+    pub detail_distance: f32,
+    /// Tree and bush cards stop at this distance. 0 keeps the cards.
+    pub tree_distance: f32,
+    /// Shadow casters stop at this distance. 0 disables that culling.
+    pub shadow_distance: f32,
+    /// Extra render scale while the device is cool. 1 keeps the chosen scale.
+    pub render_boost: f32,
     pub touch: TouchMode,
     pub touch_opacity: f32,
     pub touch_size: f32,
@@ -219,6 +233,48 @@ fn finite_unit(value: f32) -> f32 {
     if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 }
 }
 
+/// Built-in distances, in metres. The same numbers as the renderer's defaults.
+pub fn default_view_distance() -> f32 {
+    if MOBILE { 260.0 } else { 420.0 }
+}
+pub fn default_detail_distance() -> f32 {
+    if MOBILE { 50.0 } else { 80.0 }
+}
+pub fn default_tree_distance() -> f32 {
+    if MOBILE { 130.0 } else { 200.0 }
+}
+pub fn default_shadow_distance() -> f32 {
+    if MOBILE { 120.0 } else { 250.0 }
+}
+
+/// `0` disables the cutoff. A value on the built-in default stays `None`,
+/// so heat can still shorten it. Anything else is used as written.
+fn distance_override(value: f32, builtin: f32) -> Option<f32> {
+    if !value.is_finite() || value <= 0.0 {
+        Some(0.0)
+    } else if (value - builtin).abs() < 0.5 {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 /// Heights, not fixed 16:9 widths: phone aspect ratios are preserved.
 pub const SCALE_PAIRS: &[(u32, Option<u32>, &str)] = &[
     (360, Some(720), "360p → 720p"),
@@ -255,6 +311,13 @@ impl Default for Settings {
             sharpness: 0.5,
             frame_generation: false,
             metal_hud: false,
+            fog: true,
+            fog_distance: 0.0,
+            view_distance: default_view_distance(),
+            detail_distance: default_detail_distance(),
+            tree_distance: default_tree_distance(),
+            shadow_distance: default_shadow_distance(),
+            render_boost: 1.0,
             touch: TouchMode::Auto,
             touch_opacity: 0.6,
             touch_size: 1.0,
@@ -328,9 +391,61 @@ impl Settings {
     }
 
     pub fn save(&self, user_dir: &Path) {
-        let json = serde_json::to_vec_pretty(self).expect("settings serialise");
-        if let Err(e) = std::fs::write(Self::file(user_dir), json) {
+        Self::save_snapshot(user_dir, &self.snapshot());
+    }
+
+    /// JSON for the lifecycle watch, which cannot borrow `Settings`.
+    pub fn snapshot(&self) -> Vec<u8> {
+        serde_json::to_vec_pretty(self).unwrap_or_default()
+    }
+
+    /// Writes and flushes settings. Used when the app backgrounds, where a
+    /// later `save` would not run.
+    pub fn save_snapshot(user_dir: &Path, json: &[u8]) {
+        if json.is_empty() {
+            return;
+        }
+        if let Err(e) = durable_write(&Self::file(user_dir), json) {
             log::warn!("cannot save settings: {e}");
+        }
+    }
+
+    /// The distance, fog, resolution and thermal options the graphics menu owns.
+    pub fn reset_distance_options(&mut self, window_height: u32) {
+        let fresh = Settings::default();
+        self.fog = fresh.fog;
+        self.fog_distance = fresh.fog_distance;
+        self.view_distance = fresh.view_distance;
+        self.detail_distance = fresh.detail_distance;
+        self.tree_distance = fresh.tree_distance;
+        self.shadow_distance = fresh.shadow_distance;
+        self.render_boost = fresh.render_boost;
+        self.thermal_protection = fresh.thermal_protection;
+        self.adaptive_graphics = fresh.adaptive_graphics;
+        let lines = if MOBILE { 720.0 } else { 1080.0 };
+        self.render_scale = Some(round_scale(lines / window_height.max(1) as f32));
+        self.render_lines = None;
+        self.scaling_custom = false;
+    }
+
+    /// Policy for the renderer. Built-in distances still shorten while the
+    /// device is hot; a number chosen in the menu is used as written. 0
+    /// turns that cutoff off.
+    pub fn distance_policy(&self) -> glue5_gpu::Policy {
+        let mode = std::env::var("GLUE5_DISTANT_DETAIL").ok();
+        let kill = mode.as_deref() == Some("0");
+        let boost = if self.render_boost.is_finite() && self.render_boost >= 1.0 { self.render_boost } else { 1.0 };
+        glue5_gpu::Policy {
+            enabled: !kill,
+            mobile: MOBILE,
+            aggressive: mode.as_deref() == Some("2"),
+            shadow_override: distance_override(self.shadow_distance, default_shadow_distance()),
+            detail_override: distance_override(self.detail_distance, default_detail_distance()),
+            tree_override: distance_override(self.tree_distance, default_tree_distance()),
+            view_override: distance_override(self.view_distance, default_view_distance()),
+            fog: self.fog && !kill,
+            fog_override: (self.fog_distance.is_finite() && self.fog_distance > 0.0).then_some(self.fog_distance),
+            render_boost: boost,
         }
     }
 
@@ -467,6 +582,9 @@ mod tests {
         assert_eq!(migrated.resource_budget.mb(), 1280);
         assert_eq!(migrated.texture_detail.max_dimension(), 256);
         assert_eq!(migrated.world_preset, WorldPreset::Eco);
+        assert!(migrated.fog);
+        assert_eq!(migrated.render_boost, 1.0);
+        assert_eq!(migrated.distance_policy().render_boost, 1.0);
         assert_eq!(migrated.input_size((2868, 1320)), (1042, 480));
         assert_eq!(migrated.output_size((2868, 1320)), (1564, 720));
         std::fs::remove_dir_all(&dir).unwrap();

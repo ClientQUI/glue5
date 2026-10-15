@@ -267,15 +267,15 @@ fn settings_items(
                 setting(ui, "Adaptive quality", Control::Toggle, None, |ui| {
                     toggle(ui, &mut settings.adaptive_graphics)
                 });
-                let state = ["Nominal", "Fair", "Serious", "Critical"][status.thermal_state.min(3) as usize];
-                let subtitle = format!(
-                    "{state} · active limit {} FPS",
-                    if status.effective_fps > 0 { status.effective_fps } else { 60 }
-                );
-                setting(ui, "Thermal protection", Control::Toggle, Some(&subtitle), |ui| {
-                    toggle(ui, &mut settings.thermal_protection)
-                });
             }
+            let state = ["Nominal", "Fair", "Serious", "Critical"][status.thermal_state.min(3) as usize];
+            let subtitle = format!(
+                "{state} · active limit {} FPS",
+                if status.effective_fps > 0 { status.effective_fps } else { 60 }
+            );
+            setting(ui, "Thermal protection", Control::Toggle, Some(&subtitle), |ui| {
+                toggle(ui, &mut settings.thermal_protection)
+            });
             let unlimited = if settings.vsync { "Display" } else { "Unlimited" };
             let mut rates = vec![(0, unlimited), (60, "60")];
             if status.refresh_rate >= 119.0 {
@@ -293,6 +293,7 @@ fn settings_items(
                 |ui| choice(ui, &mut settings.max_fps, &rates),
             );
             setting(ui, "VSync", Control::Toggle, None, |ui| toggle(ui, &mut settings.vsync));
+            distance_options(ui, settings, status);
             #[cfg(target_vendor = "apple")]
             setting(
                 ui,
@@ -467,6 +468,49 @@ fn settings_items(
             });
         }
     }
+}
+
+fn distance_options(ui: &mut egui::Ui, settings: &mut Settings, status: &Status) {
+    ui.label(
+        RichText::new("Distance · applies immediately. Near the camera, surfaces stay fully textured.")
+            .small()
+            .color(theme::MUTED),
+    );
+    setting(ui, "Fog", Control::Toggle, Some("Never tints the road in front of you"), |ui| {
+        toggle(ui, &mut settings.fog)
+    });
+    let fog_note = if settings.fog_distance <= 0.0 {
+        "Same as view distance".to_string()
+    } else {
+        format!("{:.0} m", settings.fog_distance)
+    };
+    setting(ui, "Fog distance", Control::Slider, Some(&fog_note), |ui| {
+        slider(ui, &mut settings.fog_distance, 0.0..=1200.0, 10.0, "m", 0)
+    });
+    metres(ui, "View distance", &mut settings.view_distance, 0.0..=1200.0, "Off");
+    metres(ui, "Detail distance", &mut settings.detail_distance, 0.0..=400.0, "Off");
+    metres(ui, "Tree distance", &mut settings.tree_distance, 0.0..=800.0, "Off");
+    metres(ui, "Shadow distance", &mut settings.shadow_distance, 0.0..=600.0, "Off");
+    setting(ui, "Render boost", Control::Slider, Some("While cool. 1 keeps your resolution"), |ui| {
+        slider(ui, &mut settings.render_boost, 1.0..=1.5, 0.05, "×", 2)
+    });
+    ui.label(
+        RichText::new(
+            "0 turns a distance off. Detail is clutter, decals and bushes. Tree distance is cards, not the trees next to you. Boost above 1 uses more memory and can stop near textures loading.",
+        )
+        .small()
+        .color(theme::MUTED),
+    );
+    setting(ui, "Defaults", Control::Action, Some("Fog, distances, scale, boost, thermal"), |ui| {
+        if action_button(ui, "Reset").clicked() {
+            settings.reset_distance_options(status.window.1);
+        }
+    });
+}
+
+fn metres(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, off: &str) {
+    let note = if *value <= 0.0 { off.to_string() } else { format!("{:.0} m", *value) };
+    setting(ui, label, Control::Slider, Some(&note), |ui| slider(ui, value, range, 10.0, "m", 0));
 }
 
 fn next_start(differs: bool) -> Option<&'static str> {

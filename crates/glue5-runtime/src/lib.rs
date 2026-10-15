@@ -44,6 +44,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -208,6 +209,39 @@ static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 pub(crate) fn rt() -> &'static Runtime {
     RUNTIME.get().expect("runtime not started")
+}
+
+/// Asks the engine to queue a stats save, waits briefly for that update to
+/// finish it, then flushes save files. iOS can kill the process as soon as
+/// the background notification returns, so this runs on that call.
+///
+/// Does nothing before the game has started. Does not wait forever: a stuck
+/// engine still gets the files that are already written pushed to disk.
+pub fn flush_on_suspend() {
+    let Some(runtime) = RUNTIME.get() else { return };
+    // Resign-active and did-enter-background arrive as a pair. Once the
+    // first has seen the stats update finish, the second only flushes files.
+    static LAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+    let skip_wait = {
+        let last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        last.as_ref().is_some_and(|(when, generation)| {
+            when.elapsed() < Duration::from_secs(2) && cloud::stats_save_done(*generation)
+        })
+    };
+    if !skip_wait {
+        let generation = cloud::request_stats_save();
+        let started = Instant::now();
+        while !cloud::stats_save_done(generation) && started.elapsed() < Duration::from_millis(1200) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !cloud::stats_save_done(generation) {
+            log::warn!("stats: the save did not finish before the app was suspended; flushing files anyway");
+        }
+        *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), generation));
+    }
+    runtime.vfs.sync_writable();
+    vfs::sync_tree(&runtime.config.user_dir);
+    stats::save();
 }
 
 /// A running game.

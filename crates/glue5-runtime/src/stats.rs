@@ -70,7 +70,7 @@ pub(crate) fn save() {
         }
         let text: String = s.values.iter().map(|(k, v)| format!("{k} {v}\n")).collect();
         let path = file();
-        let saved = std::fs::create_dir_all(path.parent().unwrap()).and_then(|()| std::fs::write(&path, text));
+        let saved = crate::vfs::durable_write(&path, text.as_bytes());
         match saved {
             Ok(()) => s.dirty = false,
             Err(e) => log::error!("stats: saving {}: {e}", path.display()),

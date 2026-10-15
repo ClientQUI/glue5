@@ -1222,9 +1222,9 @@ impl Gpu {
         crate::detail::lod_quanta(crate::detail::lod_add(vs, ps, distance, bands, thermal))
     }
 
-    /// Drops clutter, grass, distant tree cards and anything past the view
-    /// distance. Occlusion queries and the HUD are left alone: a skipped
-    /// query would look like an empty scene, and the HUD has no world position.
+    /// Drops distant grass, named clutter and LOD stand-ins. A road, wall or
+    /// ramp is not one of those: its origin is not the surface. Occlusion
+    /// queries and the HUD are left alone.
     fn cull_for_distance(
         &self,
         distance: Option<f32>,

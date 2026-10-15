@@ -3,20 +3,29 @@
 //! The command stream has no mesh bounds and no impostor assets, so a far
 //! building cannot be swapped for a billboard here. What the renderer can
 //! see is the object's world position (`rage_matrices` slot 1, the same
-//! constants the camera comes from), the shader's effect name, and how many
-//! triangles the draw has. Past a near band that position selects a coarser
-//! mip floor. Trees and grass ramp that floor smoothly. Small clutter is
-//! not drawn past a shorter distance, and nothing placed is drawn past the
-//! view distance. Depth-only shadow draws stop past their own cutoff.
+//! constants the camera comes from) and the shader's effect name. That
+//! position is the drawable's origin, not the triangle in front of the
+//! camera, so a road, wall or ramp is never mip-biased or culled from it.
+//! Named vegetation blurs as it recedes, past a near radius that stays
+//! sharp. Small named clutter, grass and LOD stand-ins stop at their own
+//! distances. Depth-only shadow draws stop past their own cutoff.
 //!
 //! Anything near the camera, attached to it, or without a world position
 //! (the HUD, full-screen passes, weapons) keeps the samplers and shadows
-//! the engine asked for.
+//! the engine asked for. A placed draw's origin is not its surface: a road,
+//! wall or ramp can sit next to the camera while its matrix is a sector
+//! away. Those materials are never mip-biased or culled. Only a shader
+//! whose name says it is vegetation, clutter or an LOD stand-in is.
 
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// Quarter-mip steps in a sampler's coarseness cache (4 mips).
 pub const LOD_QUANTA: u32 = 16;
+
+/// Inside this radius a draw keeps every mip and is never distance-culled.
+/// The origin can still be further away than the triangles; generic
+/// materials are also left alone past this radius (see [`lod_add`]).
+pub const NEAR_FULL_DETAIL_M: f32 = 48.0;
 
 /// Tunables read once. `GLUE5_DISTANT_DETAIL=0` disables the mip floor, the
 /// shadow cutoff, clutter and view culling, and distance fog. `2` starts
@@ -32,25 +41,41 @@ pub struct Policy {
     pub tree_override: Option<f32>,
     pub view_override: Option<f32>,
     pub fog: bool,
+    /// Metres at which fog is fully mixed. `None` uses the view distance.
+    pub fog_override: Option<f32>,
     /// Multiplier on the user's render scale while the device is cool.
+    /// Defaults to 1: a larger back buffer was keeping the high mips near
+    /// surfaces need from streaming in.
     pub render_boost: f32,
 }
 
+fn policy_slot() -> &'static RwLock<Policy> {
+    static POLICY: OnceLock<RwLock<Policy>> = OnceLock::new();
+    POLICY.get_or_init(|| RwLock::new(env_policy()))
+}
+
+fn env_policy() -> Policy {
+    let var = |k| std::env::var(k).ok();
+    policy_from(
+        var("GLUE5_DISTANT_DETAIL").as_deref(),
+        var("GLUE5_SHADOW_DISTANCE").as_deref(),
+        var("GLUE5_DETAIL_DISTANCE").as_deref(),
+        var("GLUE5_TREE_DISTANCE").as_deref(),
+        var("GLUE5_VIEW_DISTANCE").as_deref(),
+        var("GLUE5_FOG").as_deref(),
+        var("GLUE5_RENDER_BOOST").as_deref(),
+        cfg!(any(target_os = "ios", target_os = "android")),
+    )
+}
+
 pub fn policy() -> Policy {
-    static POLICY: OnceLock<Policy> = OnceLock::new();
-    *POLICY.get_or_init(|| {
-        let var = |k| std::env::var(k).ok();
-        policy_from(
-            var("GLUE5_DISTANT_DETAIL").as_deref(),
-            var("GLUE5_SHADOW_DISTANCE").as_deref(),
-            var("GLUE5_DETAIL_DISTANCE").as_deref(),
-            var("GLUE5_TREE_DISTANCE").as_deref(),
-            var("GLUE5_VIEW_DISTANCE").as_deref(),
-            var("GLUE5_FOG").as_deref(),
-            var("GLUE5_RENDER_BOOST").as_deref(),
-            cfg!(any(target_os = "ios", target_os = "android")),
-        )
-    })
+    *policy_slot().read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Replaces the policy. The in-game graphics menu calls this every frame;
+/// the GPU thread copies it when it next decides a draw.
+pub fn set_policy(next: Policy) {
+    *policy_slot().write().unwrap_or_else(|e| e.into_inner()) = next;
 }
 
 pub fn policy_from(
@@ -73,22 +98,18 @@ pub fn policy_from(
         tree_override: tree_distance.and_then(|v| v.parse().ok()),
         view_override: view_distance.and_then(|v| v.parse().ok()),
         fog: enabled && fog != Some("0"),
-        render_boost: render_boost_from(render_boost, mobile, enabled),
+        fog_override: None,
+        render_boost: render_boost_from(render_boost),
     }
 }
 
-fn render_boost_from(value: Option<&str>, mobile: bool, detail_on: bool) -> f32 {
+/// Unset, `0` and `1` keep the user's render scale. A larger value is opt-in
+/// (`GLUE5_RENDER_BOOST` or the graphics menu). `mobile` and `detail_on` used
+/// to imply 1.25 / 1.15; that extra resolution starved near-texture streaming.
+fn render_boost_from(value: Option<&str>) -> f32 {
     match value {
-        Some("0") | Some("1") | Some("1.0") => 1.0,
+        Some("0") | Some("1") | Some("1.0") | None => 1.0,
         Some(v) => v.parse::<f32>().ok().filter(|b| b.is_finite() && *b >= 1.0).unwrap_or(1.0),
-        None if detail_on => {
-            if mobile {
-                1.25
-            } else {
-                1.15
-            }
-        }
-        None => 1.0,
     }
 }
 
@@ -195,45 +216,54 @@ pub struct DrawInfo<'a> {
 }
 
 /// Why a placed draw is not issued, or `None` to draw it.
+///
+/// Triangle count is not a reason to drop a draw. A wall, ramp or road
+/// chunk is often a few dozen triangles whose origin is nowhere near the
+/// surface, and culling it leaves a flat hole next to the camera.
 pub fn skip_reason(distance: f32, draw: &DrawInfo<'_>, dist: Distances) -> Option<&'static str> {
+    if !distance.is_finite() || distance < NEAR_FULL_DETAIL_M {
+        return None;
+    }
     let (vs, ps) = (effect(draw.vs), effect(draw.ps));
     if vegetation(vs, ps) {
         if grass(vs, ps) {
             return (distance > dist.grass).then_some("distant grass");
         }
-        // Bushes and ground cover are small. A full tree stays, but its card
-        // (an LOD shader, or a handful of triangles) does not.
         if undergrowth(vs, ps) {
             return (distance > dist.clutter).then_some("distant clutter");
         }
-        let card = tree_lod(draw.vs, draw.ps) || (!draw.instanced && draw.triangles > 0 && draw.triangles <= 48);
-        if card && distance > dist.tree_lod {
+        // A card is a shader that says so. A short triangle list is not:
+        // that was dropping pieces of nearby buildings.
+        if tree_lod(draw.vs, draw.ps) && distance > dist.tree_lod {
             return Some("distant tree");
         }
-    } else if clutter(vs, ps) {
-        if distance > dist.clutter {
-            return Some("distant clutter");
-        }
-    } else if let Some(cut) = small_prop_cutoff(vs, ps, draw.triangles, draw.instanced, dist.clutter) {
-        if distance > cut {
-            return Some("distant detail");
-        }
+    } else if clutter(vs, ps) && !protected_surface(vs, ps) && small_piece(draw) && distance > dist.clutter {
+        return Some("distant clutter");
     }
-    if distance > dist.view && !sky(vs) && !sky(ps) {
+    // View distance only drops LOD stand-ins and full trees. A high-detail
+    // road or wall whose origin is past the cutoff still covers the camera.
+    let far_stand_in = distant_lod_shader(draw.vs, draw.ps) || (vegetation(vs, ps) && !grass(vs, ps) && !undergrowth(vs, ps));
+    if distance > dist.view && far_stand_in && !sky(vs) && !sky(ps) {
         return Some("beyond view");
     }
     None
 }
 
-/// Extra mips for this draw. Vegetation rises smoothly; everything else
-/// keeps the stepped bands.
+/// Extra mips for this draw. Vegetation and named LOD shaders rise with
+/// distance. Every other material stays on the mips the engine requested,
+/// including right next to the camera.
 pub fn lod_add(vs: &str, ps: &str, distance_m: f32, bands: Bands, thermal: u8) -> f32 {
+    if !distance_m.is_finite() || distance_m < NEAR_FULL_DETAIL_M {
+        return 0.0;
+    }
     let (vs_e, ps_e) = (effect(vs), effect(ps));
     if vegetation(vs_e, ps_e) {
         return vegetation_lod(distance_m, bands, thermal);
     }
-    let base = mip_floor(distance_m, bands, thermal) as f32;
-    if clutter(vs_e, ps_e) && distance_m >= bands.near * 0.5 { (base + 1.0).min(4.0) } else { base }
+    if distant_lod_shader(vs, ps) && distance_m >= bands.near {
+        return mip_floor(distance_m, bands, thermal) as f32;
+    }
+    0.0
 }
 
 /// 0 at a quarter mip, 16 at four mips.
@@ -268,14 +298,30 @@ fn program(label: &str) -> &str {
     label.split_once("::").map(|(_, p)| p).unwrap_or("")
 }
 
-fn contains(hay: &str, needle: &str) -> bool {
+/// `needle` at the start of a word. "tree" matches "trees" and "tree_lod",
+/// not "street" (the letters are in the middle of the word).
+fn has_token(hay: &str, needle: &str) -> bool {
+    let h = hay.as_bytes();
     let n = needle.as_bytes();
-    hay.len() >= n.len()
-        && hay.as_bytes().windows(n.len()).any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
+    if n.is_empty() || h.len() < n.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + n.len() <= h.len() {
+        if i > 0 && h[i - 1].is_ascii_alphanumeric() {
+            i += 1;
+            continue;
+        }
+        if h[i..i + n.len()].iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b) {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn any(effect: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|n| contains(effect, n))
+    needles.iter().any(|n| has_token(effect, n))
 }
 
 const VEGETATION: &[&str] = &["tree", "grass", "foliage", "bush", "plant", "shrub", "palm", "leaf", "fern", "hedge", "ivy"];
@@ -283,8 +329,9 @@ const CLUTTER: &[&str] = &["decal", "debris", "litter", "rubbish", "garbage", "t
 const SKY: &[&str] = &["sky", "cloud", "star", "sun", "moon", "atmos"];
 /// Effects whose small draws are still a building, a person or a vehicle.
 const STRUCTURAL: &[&str] = &[
-    "ped", "veh", "water", "terrain", "weapon", "glass", "sky", "cloud", "radar", "hair", "mirror", "road", "light",
-    "shadow", "defer", "post", "slod", "lod", "map", "city", "building", "im",
+    "ped", "veh", "water", "terrain", "weapon", "glass", "sky", "cloud", "radar", "hair", "mirror", "road", "street",
+    "wall", "ramp", "ground", "curb", "sidewalk", "pavement", "asphalt", "concrete", "barrier", "fence", "bridge",
+    "tunnel", "light", "shadow", "defer", "post", "map", "city", "building", "im",
 ];
 
 fn vegetation(vs: &str, ps: &str) -> bool {
@@ -292,7 +339,7 @@ fn vegetation(vs: &str, ps: &str) -> bool {
 }
 
 fn grass(vs: &str, ps: &str) -> bool {
-    contains(vs, "grass") || contains(ps, "grass")
+    has_token(vs, "grass") || has_token(ps, "grass")
 }
 
 fn undergrowth(vs: &str, ps: &str) -> bool {
@@ -309,25 +356,26 @@ fn sky(effect: &str) -> bool {
 }
 
 fn tree_lod(vs: &str, ps: &str) -> bool {
-    let tree = contains(effect(vs), "tree") || contains(effect(ps), "tree");
-    tree && (contains(effect(vs), "lod") || contains(effect(ps), "lod") || contains(program(vs), "lod") || contains(program(ps), "lod"))
+    let tree = has_token(effect(vs), "tree") || has_token(effect(ps), "tree");
+    tree && distant_lod_shader(vs, ps)
 }
 
-/// A handful of triangles of an ordinary material is litter or a small prop.
-/// Building LODs and anything instanced (a grass batch, a row of lamps) are
-/// not: the triangle count is one piece, not the object's size.
-fn small_prop_cutoff(vs: &str, ps: &str, triangles: u32, instanced: bool, clutter_m: f32) -> Option<f32> {
-    if instanced || triangles == 0 || triangles > 180 || !clutter_m.is_finite() {
-        return None;
-    }
-    if is_hex(vs) || is_hex(ps) || any(vs, STRUCTURAL) || any(ps, STRUCTURAL) {
-        return None;
-    }
-    Some(if triangles <= 48 { clutter_m } else { clutter_m * 2.0 })
+fn distant_lod_shader(vs: &str, ps: &str) -> bool {
+    has_token(vs, "lod")
+        || has_token(ps, "lod")
+        || has_token(vs, "slod")
+        || has_token(ps, "slod")
+        || has_token(program(vs), "lod")
+        || has_token(program(ps), "lod")
 }
 
-fn is_hex(effect: &str) -> bool {
-    !effect.is_empty() && effect.bytes().all(|b| b.is_ascii_hexdigit())
+fn protected_surface(vs: &str, ps: &str) -> bool {
+    any(vs, STRUCTURAL) || any(ps, STRUCTURAL)
+}
+
+/// Litter is a small draw. A large decal is often the road itself.
+fn small_piece(draw: &DrawInfo<'_>) -> bool {
+    !draw.instanced && draw.triangles > 0 && draw.triangles <= 180
 }
 
 /// World translation of a placed object, or `None` when the matrix is not
@@ -349,6 +397,44 @@ pub fn placed_distance(translation: [f32; 3], camera: [f64; 3]) -> Option<f32> {
         return None;
     }
     Some(dist as f32)
+}
+
+/// How much of a pixel to replace with fog, 0 to 1.
+///
+/// `depth` is reversed-Z (1 near, 0 far). `screen_v` is 0 at the top of the
+/// frame and 1 at the bottom. A reconstructed distance that disagrees with
+/// the depth, a far-clear depth on the ground, or anything inside
+/// [`NEAR_FULL_DETAIL_M`] contributes nothing: that is what painted the road
+/// and the wall flat grey.
+pub fn fog_amount(dist: f32, depth: f32, near: f32, up: f32, screen_v: f32, fog_start: f32, fog_end: f32) -> f32 {
+    if !fog_end.is_finite() || fog_end <= 0.0 {
+        return 0.0;
+    }
+    if !(0.0..=1.0).contains(&depth) || depth <= 0.002 {
+        let above = (1.0 - screen_v).clamp(0.0, 1.0);
+        return smoothstep(0.62, 0.88, above) * 0.35;
+    }
+    if !dist.is_finite() || dist > 1.0e7 {
+        return 0.0;
+    }
+    let linear = if near.is_finite() && near > 0.0 { near / depth.max(1.0e-4) } else { dist };
+    if linear.is_finite() && dist > linear * 8.0 + 80.0 {
+        return 0.0;
+    }
+    if dist < NEAR_FULL_DETAIL_M {
+        return 0.0;
+    }
+    let ground = smoothstep(fog_start, fog_end, dist) * 0.72;
+    if dist > fog_end {
+        return smoothstep(0.42, 0.02, up) * 0.45;
+    }
+    ground
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let span = edge1 - edge0;
+    let t = if span.abs() < 1.0e-6 { 0.0 } else { ((x - edge0) / span).clamp(0.0, 1.0) };
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[cfg(test)]
@@ -411,8 +497,9 @@ mod tests {
         let on = policy_from(None, None, None, None, None, None, None, true);
         assert!(on.enabled);
         assert!(on.fog);
-        assert!((on.render_boost - 1.25).abs() < 1e-4);
-        assert!((policy_from(None, None, None, None, None, None, None, false).render_boost - 1.15).abs() < 1e-4);
+        assert_eq!(on.fog_override, None);
+        assert_eq!(on.render_boost, 1.0, "extra resolution is opt-in; it was starving near mips");
+        assert_eq!(policy_from(None, None, None, None, None, None, Some("1.25"), false).render_boost, 1.25);
         let aggressive = policy_from(Some("2"), None, None, None, None, Some("0"), Some("1"), false);
         assert!(aggressive.aggressive);
         assert!(!aggressive.fog);
@@ -435,7 +522,8 @@ mod tests {
         assert!((dist.view - 260.0).abs() < 1e-3);
         let grass = DrawInfo { vs: "grass_batch::VS_Main", ps: "grass_batch::PS_Main", triangles: 2000, instanced: true };
         assert_eq!(skip_reason(39.0, &grass, dist), None);
-        assert_eq!(skip_reason(41.0, &grass, dist), Some("distant grass"));
+        assert_eq!(skip_reason(47.0, &grass, dist), None, "inside the near radius grass stays, even past its cutoff");
+        assert_eq!(skip_reason(49.0, &grass, dist), Some("distant grass"));
         let card = DrawInfo { vs: "trees_lod::VS_Main", ps: "trees_lod::PS_Main", triangles: 2, instanced: false };
         assert_eq!(skip_reason(120.0, &card, dist), None);
         assert_eq!(skip_reason(140.0, &card, dist), Some("distant tree"));
@@ -444,6 +532,10 @@ mod tests {
         assert_eq!(skip_reason(270.0, &tree, dist), Some("beyond view"));
         let decal = DrawInfo { vs: "decal::VS_Main", ps: "decal::PS_Main", triangles: 2, instanced: false };
         assert_eq!(skip_reason(60.0, &decal, dist), Some("distant clutter"));
+        let road_decal = DrawInfo { vs: "road_decal::VS_Main", ps: "road_decal::PS_Main", triangles: 2, instanced: false };
+        assert_eq!(skip_reason(400.0, &road_decal, dist), None, "a road decal is the surface, not litter");
+        let big_decal = DrawInfo { vs: "decal::VS_Main", ps: "decal::PS_Main", triangles: 900, instanced: false };
+        assert_eq!(skip_reason(80.0, &big_decal, dist), None, "a large decal can be the road itself");
         let bush = DrawInfo { vs: "bush::VS_Main", ps: "bush::PS_Main", triangles: 80, instanced: false };
         assert_eq!(skip_reason(40.0, &bush, dist), None);
         assert_eq!(skip_reason(60.0, &bush, dist), Some("distant clutter"));
@@ -458,19 +550,25 @@ mod tests {
     #[test]
     fn small_props_go_and_structural_draws_stay() {
         let (_, dist) = base();
-        let litter = DrawInfo { vs: "normal_spec::VS_Main", ps: "normal_spec::PS_Main", triangles: 24, instanced: false };
-        assert_eq!(skip_reason(30.0, &litter, dist), None);
-        assert_eq!(skip_reason(60.0, &litter, dist), Some("distant detail"));
-        let bench = DrawInfo { vs: "normal::VS_Main", ps: "normal::PS_Main", triangles: 120, instanced: false };
-        assert_eq!(skip_reason(60.0, &bench, dist), None, "a medium prop lasts past the litter distance");
-        assert_eq!(skip_reason(110.0, &bench, dist), Some("distant detail"));
-        let wall = DrawInfo { vs: "normal_spec::VS_Main", ps: "normal_spec::PS_Main", triangles: 400, instanced: false };
-        assert_eq!(skip_reason(100.0, &wall, dist), None);
-        assert_eq!(skip_reason(300.0, &wall, dist), Some("beyond view"));
+        // A short triangle list is not litter. That heuristic was removing
+        // wall and ramp chunks whose origin sat further away than the surface.
+        let chunk = DrawInfo { vs: "normal_spec::VS_Main", ps: "normal_spec::PS_Main", triangles: 24, instanced: false };
+        assert_eq!(skip_reason(30.0, &chunk, dist), None);
+        assert_eq!(skip_reason(80.0, &chunk, dist), None);
+        assert_eq!(skip_reason(400.0, &chunk, dist), None, "a generic material is not view-culled by its origin");
+        let wall = DrawInfo { vs: "wall::VS_Main", ps: "wall::PS_Main", triangles: 40, instanced: false };
+        assert_eq!(skip_reason(12.0, &wall, dist), None);
+        assert_eq!(skip_reason(300.0, &wall, dist), None);
+        let ramp = DrawInfo { vs: "ramp::VS_Main", ps: "ramp::PS_Main", triangles: 18, instanced: false };
+        assert_eq!(skip_reason(500.0, &ramp, dist), None);
+        let street = DrawInfo { vs: "street::VS_Main", ps: "street::PS_Main", triangles: 60, instanced: false };
+        assert_eq!(skip_reason(90.0, &street, dist), None, "street is not a tree");
         let door = DrawInfo { vs: "building_lod::VS_Main", ps: "building_lod::PS_Main", triangles: 20, instanced: false };
         assert_eq!(skip_reason(80.0, &door, dist), None, "a building LOD is not litter");
+        assert_eq!(skip_reason(300.0, &door, dist), Some("beyond view"));
         let ped = DrawInfo { vs: "ped::VS_Main", ps: "ped::PS_Main", triangles: 20, instanced: false };
         assert_eq!(skip_reason(80.0, &ped, dist), None);
+        assert_eq!(skip_reason(900.0, &ped, dist), None, "a ped is not dropped because its origin is far");
         let car = DrawInfo { vs: "vehicle_mesh::VS_Main", ps: "vehicle_mesh::PS_Main", triangles: 12, instanced: false };
         assert_eq!(skip_reason(90.0, &car, dist), None);
         let lamps = DrawInfo { vs: "normal_spec::VS_Main", ps: "normal_spec::PS_Main", triangles: 12, instanced: true };
@@ -497,7 +595,16 @@ mod tests {
         assert_eq!(lod_quanta(close), 0);
         let blurred = lod_add("trees::VS", "trees::PS", 250.0, mobile, 0);
         let building = lod_add("normal_spec::VS", "normal_spec::PS", 250.0, mobile, 0);
+        assert_eq!(building, 0.0, "a generic material is never mip-biased; its origin is not the surface");
         assert!(blurred > building, "trees blur ahead of a building at the same distance");
+        let street = lod_add("street::VS", "street::PS", 8.0, mobile, 0);
+        assert_eq!(lod_quanta(street), 0);
+        assert_eq!(lod_add("street::VS", "street::PS", 400.0, mobile, 0), 0.0, "street does not contain the word tree");
+        let wall = lod_add("wall::VS", "wall::PS", 6.0, mobile, 0);
+        assert_eq!(lod_quanta(wall), 0);
+        let lod = lod_add("building_lod::VS", "building_lod::PS", 400.0, mobile, 0);
+        assert!(lod >= 2.0, "a named LOD stand-in still coarsens when it is far");
+        assert_eq!(lod_add("building_lod::VS", "building_lod::PS", 20.0, mobile, 0), 0.0);
         assert_eq!(lod_quanta(1.0), 4);
         assert_eq!(lod_quanta(0.24), 1);
         assert_eq!(lod_quanta(4.0), 16);
@@ -512,5 +619,33 @@ mod tests {
         assert!((resolution_factor(3, 1.25) - 0.6).abs() < 1e-4);
         assert_eq!(resolution_factor(0, 1.0), 1.0);
         assert_eq!(resolution_factor(0, 0.5), 1.0);
+    }
+
+    #[test]
+    fn near_pixels_are_not_fogged_and_a_bad_depth_does_not_paint_the_ground() {
+        let (start, end) = (109.0, 260.0);
+        assert_eq!(fog_amount(5.0, 0.8, 0.15, 0.0, 0.7, start, end), 0.0, "a few metres in front of the car");
+        assert_eq!(fog_amount(21.8, 0.4, 0.15, 0.01, 0.6, start, end), 0.0, "the sandbox fixture");
+        assert_eq!(fog_amount(40.0, 0.2, 0.15, 0.0, 0.75, start, end), 0.0);
+        // Depth stuck at the far clear: the lower frame (road, wall, ramp) stays
+        // the colour that was drawn. Only the top of the sky hazes.
+        assert_eq!(fog_amount(100_000.0, 0.0, 0.15, 0.0, 0.8, start, end), 0.0);
+        assert!(fog_amount(100_000.0, 0.0, 0.15, 0.2, 0.05, start, end) > 0.0);
+        // Unprojection that disagrees with a near depth sample is ignored.
+        assert_eq!(fog_amount(36_000.0, 0.8, 0.15, 0.0, 0.7, start, end), 0.0);
+        let far = fog_amount(200.0, 0.01, 0.15, 0.05, 0.55, start, end);
+        assert!(far > 0.0 && far < 0.72, "{far}");
+        assert_eq!(fog_amount(200.0, 0.5, 0.15, 0.0, 0.6, start, end), 0.0, "depth says this pixel is close");
+    }
+
+    #[test]
+    fn shader_names_match_words_not_letters_in_the_middle() {
+        assert!(super::has_token("trees_lod", "tree"));
+        assert!(super::has_token("tree_lod", "lod"));
+        assert!(!super::has_token("street", "tree"));
+        assert!(!super::has_token("highlight", "light"));
+        assert!(!super::has_token("load", "lod"));
+        assert!(super::has_token("slod_a", "slod"));
+        assert!(!super::has_token("slod_a", "lod"));
     }
 }

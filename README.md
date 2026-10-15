@@ -168,6 +168,9 @@ Game data and shaders are **not bundled**. Choose the external game directory
 on the start page, or put a `game` directory beside `Glue 5.app`. The executable
 still contains the game code compiled from the build-time `game.wasm`.
 Saves and settings remain in the user's Application Support directory.
+Closing or backgrounding the app (iOS: resigning active, entering the
+background, or terminating) queues a stats save and flushes it to disk, so
+the money stat is still there on the next launch.
 
 `mise run macos` builds and opens the bundle through Launch Services; an
 already running instance is brought forward. For a fresh launch, quit it
@@ -196,12 +199,12 @@ intent's extras).
 | `GLUE5_ENGINE_ARGS` | More engine switches, e.g. `-FrameQueueLimit=2`. |
 | `GLUE5_DISABLE_SCENARIO_WORKAROUND=1` | Diagnostic only: disables the workaround for the engine's full scenario-ped overlap list, to A/B-test a mission-specific crash. |
 | `GLUE5_GPU_PROFILE=1` | GPU time per pass in the statistics, including the upscaler. The timing markers are extra command buffers, so they are not submitted unless this is set. |
-| `GLUE5_DISTANT_DETAIL` | `0` keeps every draw, at the engine's own detail, and turns distance fog off. `2` starts the cuts closer. Unset (or `1`): distant objects sample coarser mips, small clutter and grass are dropped, tree cards stop early, and geometry past the view distance is not drawn. The player, nearby buildings and the HUD stay as the engine drew them. |
-| `GLUE5_DETAIL_DISTANCE` | Metres past which decals, debris, billboards, particles and very small props are not drawn. Grass uses the same number when this is set. `0` disables that culling. Unset: 50 m / 40 m grass on phones, 80 m / 70 m on desktop, shorter while the device is hot. |
-| `GLUE5_TREE_DISTANCE` | Metres past which a tree or bush **card** (a shader whose name says it is a LOD) is not drawn. Full trees stay until the view distance, and blur smoothly as they recede. `0` keeps the cards. Unset: 130 m on phones, 200 m on desktop. |
-| `GLUE5_VIEW_DISTANCE` | Metres past which a placed object is not drawn. The last part of that range is distance fog, so the cutoff sits in haze; the sky's zenith is left alone. `0` disables the cutoff and the fog. Unset: 260 m on phones, 420 m on desktop, shorter while hot. |
-| `GLUE5_FOG` | `0` skips the fog pass. The view-distance cutoff still applies. Unset: fog is on with the distant-detail policy. |
-| `GLUE5_RENDER_BOOST` | Multiplier on the chosen render scale while thermals are nominal, never past 100%. `1` (or `0`) keeps the scale the settings chose. Unset: 1.25 on phones and 1.15 on desktop, and 1 when distant detail is off. Fair heat returns to the chosen scale; Serious and Critical go below it (×0.75, then ×0.6) when thermal protection is on. |
+| `GLUE5_DISTANT_DETAIL` | `0` keeps every draw, at the engine's own detail, and turns distance fog off. `2` starts the built-in cuts closer. The in-game graphics menu (the gear button) overrides distances, fog and render boost and saves them in `glue5.json`. Roads, walls and ramps are never mip-biased or culled: a drawable's origin is not the surface in front of the camera. Named vegetation, clutter and LOD shaders still thin out with distance. Anything inside 48 m stays fully textured. |
+| `GLUE5_DETAIL_DISTANCE` | Metres past which small decals, debris and bushes are not drawn. Grass uses the same number when this is set. `0` disables that culling. Unset: 50 m / 40 m grass on phones, 80 m / 70 m on desktop, shorter while the device is hot. The graphics menu's detail distance replaces this while the app is running. |
+| `GLUE5_TREE_DISTANCE` | Metres past which a tree **card** (a shader whose name says it is a LOD) is not drawn. Full trees stay until the view distance, and blur only past 48 m. `0` keeps the cards. Unset: 130 m on phones, 200 m on desktop. |
+| `GLUE5_VIEW_DISTANCE` | Metres past which an LOD stand-in or a full tree is not drawn. High-detail materials are not dropped by this, because their origin can be a sector away from the camera. `0` disables the cutoff. Unset: 260 m on phones, 420 m on desktop, shorter while hot. Fog, when on, ends here unless the menu sets its own distance. |
+| `GLUE5_FOG` | `0` skips the fog pass. The menu's fog switch is the control while the app is running. Fog never tints a pixel inside 48 m, a pixel whose depth says it is close, or the ground when the depth buffer is the far clear. |
+| `GLUE5_RENDER_BOOST` | Multiplier on the chosen render scale while thermals are nominal, never past 100%. Unset is 1. The previous 1.25 phone default raised the back buffer enough that near textures stopped streaming in; raise it from the graphics menu if the device has the memory. Fair heat returns to the chosen scale; Serious and Critical go below it (×0.75, then ×0.6) when thermal protection is on. |
 | `GLUE5_SHADOW_DISTANCE` | Metres past which distant shadow casters are skipped. `0` disables that culling. Unset uses 120 m on phones and 250 m on desktop, shorter while the device is hot. |
 | `GLUE5_PLAY=1` | Start the game without the start page (as `--play`; on a phone too). |
 | `GLUE5_NO_BC=1`, `GLUE5_NO_FLOAT32_FILTER=1` | Mobile GPU fallbacks on a desktop GPU: BC textures decoded on the CPU (and re-encoded as ETC2 where the GPU has it), 32-bit float textures unfiltered. |

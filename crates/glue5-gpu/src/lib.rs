@@ -47,8 +47,15 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use glue5_runtime::gpu::{GpuBackend, GpuRing, State};
 
+pub use detail::Policy;
 pub use overlay::Overlay;
 pub use present::{Presentation, Upscaler, Window};
+
+/// Installs the distance, fog and render-boost policy. The graphics menu
+/// calls this whenever the settings change; draws after it use the new values.
+pub fn set_distance_policy(policy: Policy) {
+    detail::set_policy(policy);
+}
 
 /// How far above the user's render scale the back buffer may go.
 /// `thermal` is 0 nominal through 3 critical. `boost` is the cool-device
@@ -57,7 +64,8 @@ pub fn resolution_factor(thermal: u8, boost: f32) -> f32 {
     detail::resolution_factor(thermal, boost)
 }
 
-/// The cool-device render-scale multiplier (`GLUE5_RENDER_BOOST`).
+/// The cool-device render-scale multiplier. The graphics menu sets it;
+/// unset, it is 1 (the user's render scale).
 pub fn render_boost() -> f32 {
     detail::policy().render_boost
 }
@@ -423,11 +431,12 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
     let distant = detail::policy();
     let reach = detail::distances(distant, 0);
     glue5_runtime::diagnostics::note(format_args!(
-        "distant detail: enabled={} aggressive={} mobile={} fog={} boost={:.2} clutter={:.0}m grass={:.0}m tree_lod={:.0}m view={:.0}m shadow={:?} (GLUE5_DISTANT_DETAIL, GLUE5_DETAIL_DISTANCE, GLUE5_TREE_DISTANCE, GLUE5_VIEW_DISTANCE, GLUE5_FOG, GLUE5_RENDER_BOOST, GLUE5_SHADOW_DISTANCE)",
+        "distant detail: enabled={} aggressive={} mobile={} fog={} fog_m={:?} boost={:.2} clutter={:.0}m grass={:.0}m tree_lod={:.0}m view={:.0}m shadow={:?} (near surfaces stay fully textured; GLUE5_* or the graphics menu)",
         distant.enabled,
         distant.aggressive,
         distant.mobile,
         distant.fog,
+        distant.fog_override,
         distant.render_boost,
         reach.clutter,
         reach.grass,

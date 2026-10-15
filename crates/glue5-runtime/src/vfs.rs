@@ -268,13 +268,52 @@ impl Vfs {
     }
 
     pub fn close(&self, fd: i32) -> Result<(), Errno> {
-        let mut fds = self.fds.lock().unwrap();
-        match fds.get_mut(fd as usize) {
-            Some(slot @ Some(_)) => {
-                *slot = None;
-                Ok(())
+        let open = {
+            let mut fds = self.fds.lock().unwrap();
+            match fds.get_mut(fd as usize) {
+                Some(slot @ Some(_)) => slot.take().unwrap(),
+                _ => return Err(errno::BADF),
             }
-            _ => Err(errno::BADF),
+        };
+        // The save is closed here. Sync before the descriptor is gone, or a
+        // kill on the way to the background keeps the write in the cache.
+        self.sync_open(&open);
+        Ok(())
+    }
+
+    /// Flushes every open writable file. The lock is not held across the sync.
+    pub fn sync_writable(&self) {
+        let files = {
+            let fds = self.fds.lock().unwrap();
+            let mut files = Vec::new();
+            for open in fds.iter().flatten() {
+                if !writable_flags(open.flags) {
+                    continue;
+                }
+                if let Node::File(f) = &open.node
+                    && let Ok(cloned) = f.try_clone()
+                {
+                    files.push(cloned);
+                }
+            }
+            files
+        };
+        for file in files {
+            let _ = file.sync_all();
+        }
+    }
+
+    fn sync_open(&self, open: &Open) {
+        if !writable_flags(open.flags) {
+            return;
+        }
+        let Node::File(file) = &open.node else { return };
+        let _ = file.sync_all();
+        if let Ok(host) = self.resolve(&open.path)
+            && let Some(parent) = host.path.parent()
+            && let Ok(dir) = File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
     }
 
@@ -546,6 +585,55 @@ pub fn io_errno(e: io::Error) -> Errno {
         ReadOnlyFilesystem => errno::ROFS,
         _ => errno::IO,
     }
+}
+
+fn writable_flags(flags: u32) -> bool {
+    flags & oflag::ACCMODE != 0 || flags & (oflag::CREAT | oflag::TRUNC | oflag::APPEND) != 0
+}
+
+/// Writes `bytes` and flushes the file and its directory, so a kill after
+/// the write still finds it.
+pub(crate) fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Flushes files under `dir`, skipping the renderer's caches. Opening a
+/// file and syncing it pushes pages the engine already wrote and closed.
+pub(crate) fn sync_tree(dir: &Path) {
+    fn walk(dir: &Path, depth: u32) {
+        if depth > 8 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "cache" || name == "fsroot" || name.starts_with("Glue5 Diagnostics") {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                walk(&path, depth + 1);
+            } else if let Ok(file) = File::open(&path) {
+                let _ = file.sync_all();
+            }
+        }
+        if let Ok(directory) = File::open(dir) {
+            let _ = directory.sync_all();
+        }
+    }
+    walk(dir, 0);
 }
 
 #[cfg(unix)]

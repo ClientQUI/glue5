@@ -7,7 +7,7 @@
 //! go to and come from the disk.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use glue5_game::{Env, orig};
 
@@ -24,6 +24,21 @@ const LOAD_FAILED: u64 = 25461316;
 /// Slots without a file yet: a new player's (or a new character's),
 /// loaded empty rather than failed.
 static NEW_SLOTS: AtomicU32 = AtomicU32::new(0);
+/// A suspend asked the engine thread to queue a stats save. The generation
+/// is what was asked; `SAVE_DONE` is the newest generation `stats_update`
+/// has already queued and then finished.
+static SAVE_REQUEST: AtomicU64 = AtomicU64::new(0);
+static SAVE_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Asks the engine thread to queue a stats save on its next update.
+/// The returned generation is done once [`stats_save_done`] is true.
+pub(crate) fn request_stats_save() -> u64 {
+    SAVE_REQUEST.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+pub(crate) fn stats_save_done(generation: u64) -> bool {
+    SAVE_DONE.load(Ordering::Acquire) >= generation
+}
 /// `netStatus`: its code, then a result code.
 const NET_STATUS_FAILED: u32 = 2;
 const NET_STATUS_SUCCEEDED: u32 = 3;
@@ -76,8 +91,21 @@ pub(crate) unsafe extern "C" fn stats_queue_load(env: *mut Env) -> u32 {
 }
 
 /// A slot without a file is a new one, not a failed one (`stats_load_failed`).
+///
+/// A suspend asks, from another thread, that this update queue a stats save
+/// first. Money is a stat: `QueueSave` is the save the engine already has,
+/// and this update is what finishes writing it.
 pub(crate) unsafe extern "C" fn stats_update(env: *mut Env) {
+    let pending = SAVE_REQUEST.load(Ordering::Acquire);
+    let done = SAVE_DONE.load(Ordering::Acquire);
+    if pending > done {
+        log::info!("stats: saving on suspend");
+        stats_queue_save(env);
+    }
     without_lan(env, || unsafe { orig::stats_update(env) });
+    if pending > done {
+        SAVE_DONE.fetch_max(pending, Ordering::Release);
+    }
     let new = NEW_SLOTS.load(Ordering::Relaxed);
     if new != 0 {
         let m = unsafe { Mem::of(env) };
@@ -191,8 +219,7 @@ pub(crate) unsafe extern "C" fn post_member_file(
     let m = unsafe { Mem::of(env) };
     let name = m.str(path);
     let to = file(&name);
-    let written =
-        std::fs::create_dir_all(to.parent().unwrap()).and_then(|()| std::fs::write(&to, m.bytes(data, size as usize)));
+    let written = crate::vfs::durable_write(&to, m.bytes(data, size as usize));
     match written {
         Ok(()) => {
             log::info!("cloud: saved {name} ({size} bytes)");
@@ -267,6 +294,18 @@ mod tests {
         assert_eq!(super::slot("GTA5/saves/mpstats/save_default0000.save"), Some(0));
         assert_eq!(super::slot("GTA5/saves/mpstats/save_char0002.save"), Some(2));
         assert_eq!(super::slot("GTA5/saves/mpstats/save.save"), None);
+    }
+
+    #[test]
+    fn a_suspend_save_stays_open_until_that_generation_finishes() {
+        use std::sync::atomic::Ordering;
+        let generation = super::request_stats_save();
+        assert!(!super::stats_save_done(generation));
+        super::SAVE_DONE.fetch_max(generation, Ordering::Release);
+        assert!(super::stats_save_done(generation));
+        let newer = super::request_stats_save();
+        assert!(newer > generation);
+        assert!(!super::stats_save_done(newer));
     }
 }
 

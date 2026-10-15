@@ -153,6 +153,9 @@ pub struct Scene {
     pub done: Option<SceneInputs>,
     /// This frame had its scene drawn (`done` is taken by its present).
     drawn: bool,
+    /// Distance fog already applied this frame (the scene hook can run once).
+    fogged: bool,
+    fog: Option<FogPass>,
 }
 
 impl Scene {
@@ -171,6 +174,7 @@ impl Scene {
             self.prev = None;
         }
         self.drawn = false;
+        self.fogged = false;
         self.size = size;
         self.view = None;
         self.hud = false;
@@ -241,6 +245,7 @@ impl Gpu {
         // The hook marks the scene finished even when nothing is upscaling.
         // Draws after it are HUD: maps, menus, the weapon wheel.
         self.scene.hud = true;
+        self.apply_distance_fog();
         let sc = &self.scene;
         if !sc.wanted || sc.done.is_some() {
             return;
@@ -346,7 +351,223 @@ impl Gpu {
         pass.set_bind_group(0, &bind, &[]);
         pass.draw(0..3, 0..1);
     }
+
+    /// Haze over the world, before the HUD. The colour is copied aside and
+    /// drawn back fogged, so the upscaler (when it is on) sees the same haze.
+    /// Sky at the far plane keeps its zenith and only hazes toward the horizon,
+    /// which is where draws past the view distance leave a hole.
+    fn apply_distance_fog(&mut self) {
+        if self.scene.fogged || !crate::detail::policy().fog {
+            return;
+        }
+        self.scene.fogged = true;
+        let thermal = self.presentation.as_ref().map(crate::present::Presentation::thermal).unwrap_or(0);
+        let view_m = crate::detail::distances(crate::detail::policy(), thermal).view;
+        if !view_m.is_finite() {
+            return;
+        }
+        let Some(size) = self.scene.size else { return };
+        let Some(view_proj) = self.scene.view.as_ref().map(|v| v.view_proj) else { return };
+        let Some(camera) = self.scene.view.as_ref().map(|v| v.position) else { return };
+        let Some(inv) = invert(&view_proj) else { return };
+        let (bb, depth_id) = (self.scene.back_buffer, self.scene.depth_target);
+        let Some(bb_tex) = self.objs.tex(bb).filter(|t| (t.width, t.height) == size && t.samples == 1) else {
+            return;
+        };
+        if !fog_format(bb_tex.format) {
+            let format = bb_tex.format;
+            crate::log_once("fog-format", || format!("distance fog skipped for {format:?}"));
+            return;
+        }
+        let (color_tex, format) = (bb_tex.tex.clone(), bb_tex.format);
+        let Some(depth_tex) = self
+            .objs
+            .tex(depth_id)
+            .filter(|t| (t.width, t.height) == size && t.samples == 1 && crate::format::is_depth(t.format))
+            .map(|t| t.tex.clone())
+        else {
+            return;
+        };
+        self.flush_clears();
+        self.end_pass();
+        let epoch = self.epoch;
+        for id in [bb, depth_id] {
+            if let Some(t) = self.objs.tex(id) {
+                t.used.set(epoch);
+            }
+        }
+        if self.scene.fog.as_ref().is_none_or(|f| f.size != size || f.format != format) {
+            self.scene.fog = Some(FogPass::new(&self.device, size, format));
+        }
+        let fog = self.scene.fog.as_ref().unwrap();
+        let (pipeline, uniforms, scratch, scratch_view) =
+            (fog.pipeline.clone(), fog.uniforms.clone(), fog.scratch.clone(), fog.scratch_view.clone());
+        let mut data = [0f32; 28];
+        for r in 0..4 {
+            for c in 0..4 {
+                data[r * 4 + c] = inv[r][c] as f32;
+            }
+        }
+        data[16] = camera[0] as f32;
+        data[17] = camera[1] as f32;
+        data[18] = camera[2] as f32;
+        data[19] = view_m * 0.42;
+        // A light haze. Linear, because an sRGB target encodes it on write.
+        data[20] = 0.64;
+        data[21] = 0.68;
+        data[22] = 0.72;
+        data[23] = view_m;
+        data[24] = size.0 as f32;
+        data[25] = size.1 as f32;
+        self.uploads.buffer(&uniforms, 0, bytemuck::cast_slice(&data));
+        let device = self.device.clone();
+        let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            aspect: wgpu::TextureAspect::DepthOnly,
+            mip_level_count: Some(1),
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        let color_view = color_tex.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("distance fog"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scratch_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: uniforms.as_entire_binding() },
+            ],
+        });
+        let encoder = self.encoder.get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
+        let extent = wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 };
+        encoder.copy_texture_to_texture(color_tex.as_image_copy(), scratch.as_image_copy(), extent);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("distance fog"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            ..Default::default()
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
 }
+
+/// Colour formats the fog pass can sample and draw back into.
+fn fog_format(format: wgpu::TextureFormat) -> bool {
+    matches!(
+        format,
+        wgpu::TextureFormat::Rgba8Unorm
+            | wgpu::TextureFormat::Rgba8UnormSrgb
+            | wgpu::TextureFormat::Bgra8Unorm
+            | wgpu::TextureFormat::Bgra8UnormSrgb
+            | wgpu::TextureFormat::Rgba16Float
+            | wgpu::TextureFormat::Rgba16Unorm
+            | wgpu::TextureFormat::Rg11b10Ufloat
+    )
+}
+
+struct FogPass {
+    size: (u32, u32),
+    format: wgpu::TextureFormat,
+    scratch: wgpu::Texture,
+    scratch_view: wgpu::TextureView,
+    pipeline: wgpu::RenderPipeline,
+    uniforms: wgpu::Buffer,
+}
+
+impl FogPass {
+    fn new(device: &wgpu::Device, size: (u32, u32), format: wgpu::TextureFormat) -> FogPass {
+        let scratch = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("distance fog"),
+            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let scratch_view = scratch.create_view(&Default::default());
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("distance fog"),
+            source: wgpu::ShaderSource::Wgsl(FOG_WGSL.into()),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("distance fog"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(format.into())],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("distance fog"),
+            size: 112,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        FogPass { size, format, scratch, scratch_view, pipeline, uniforms }
+    }
+}
+
+const FOG_WGSL: &str = "
+struct U {
+  inv_view_proj: mat4x4f,
+  camera: vec3f,
+  fog_start: f32,
+  fog_color: vec3f,
+  fog_end: f32,
+  size: vec2f,
+  pad: vec2f,
+}
+@group(0) @binding(0) var color: texture_2d<f32>;
+@group(0) @binding(1) var depth: texture_depth_2d;
+@group(0) @binding(2) var<uniform> u: U;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  var p = array<vec2f, 3>(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+  return vec4f(p[i], 0, 1);
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let src = textureLoad(color, vec2i(p.xy), 0);
+  let d = textureLoad(depth, vec2i(p.xy), 0);
+  let uv = p.xy / u.size;
+  let clip = vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+  let world = u.inv_view_proj * clip;
+  if world.w <= 0.0 {
+    return src;
+  }
+  let pos = world.xyz / world.w;
+  let delta = pos - u.camera;
+  let dist = length(delta);
+  let up = delta.z / max(dist, 1e-3);
+  // Drawn world fades out by the view distance. Past that (the sky, and the
+  // hole a culled draw leaves) only the horizon hazes, so the zenith stays.
+  let ground = smoothstep(u.fog_start, u.fog_end, dist) * 0.90;
+  let horizon = smoothstep(0.42, 0.02, up) * 0.82;
+  let amount = select(ground, horizon, dist > u.fog_end);
+  return vec4f(mix(src.rgb, u.fog_color, amount), src.a);
+}
+";
 
 impl Targets {
     fn new(device: &wgpu::Device, size: (u32, u32), format: wgpu::TextureFormat) -> Targets {
@@ -497,6 +718,14 @@ fn invert(m: &Mat) -> Option<Mat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fog_shader_validates() {
+        let module = naga::front::wgsl::parse_str(FOG_WGSL).unwrap();
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module)
+            .unwrap();
+    }
 
     #[test]
     fn motion_shader_validates() {

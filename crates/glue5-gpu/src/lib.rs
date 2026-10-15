@@ -50,6 +50,18 @@ use glue5_runtime::gpu::{GpuBackend, GpuRing, State};
 pub use overlay::Overlay;
 pub use present::{Presentation, Upscaler, Window};
 
+/// How far above the user's render scale the back buffer may go.
+/// `thermal` is 0 nominal through 3 critical. `boost` is the cool-device
+/// multiplier (`detail::policy().render_boost`).
+pub fn resolution_factor(thermal: u8, boost: f32) -> f32 {
+    detail::resolution_factor(thermal, boost)
+}
+
+/// The cool-device render-scale multiplier (`GLUE5_RENDER_BOOST`).
+pub fn render_boost() -> f32 {
+    detail::policy().render_boost
+}
+
 /// Apple's reported thermal state: 0 nominal, 1 fair, 2 serious, 3 critical.
 /// Platforms without this API return nominal. Sample infrequently in the app.
 pub fn thermal_state() -> u8 {
@@ -409,9 +421,19 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         settings.max_texture_dimension,
     ));
     let distant = detail::policy();
+    let reach = detail::distances(distant, 0);
     glue5_runtime::diagnostics::note(format_args!(
-        "distant detail: enabled={} aggressive={} mobile={} shadow_override={:?} (close draws unchanged; GLUE5_DISTANT_DETAIL=0/2, GLUE5_SHADOW_DISTANCE)",
-        distant.enabled, distant.aggressive, distant.mobile, distant.shadow_override,
+        "distant detail: enabled={} aggressive={} mobile={} fog={} boost={:.2} clutter={:.0}m grass={:.0}m tree_lod={:.0}m view={:.0}m shadow={:?} (GLUE5_DISTANT_DETAIL, GLUE5_DETAIL_DISTANCE, GLUE5_TREE_DISTANCE, GLUE5_VIEW_DISTANCE, GLUE5_FOG, GLUE5_RENDER_BOOST, GLUE5_SHADOW_DISTANCE)",
+        distant.enabled,
+        distant.aggressive,
+        distant.mobile,
+        distant.fog,
+        distant.render_boost,
+        reach.clutter,
+        reach.grass,
+        reach.tree_lod,
+        reach.view,
+        distant.shadow_override,
     ));
     let saved_compiled = compiler.compiled.load(Ordering::Relaxed);
     // On iOS, compiling several Metal pipelines at once creates large CPU

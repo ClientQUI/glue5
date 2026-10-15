@@ -649,7 +649,7 @@ impl Gpu {
     /// A sampler state's sampler (`nearest`: its non-filtering twin).
     /// Comparison samplers and a floor of 0 are the engine's own.
     fn sampler(&mut self, id: u32, comparison: bool, nearest: bool) -> Option<wgpu::Sampler> {
-        let floor = if comparison { 0 } else { self.mip_floor.min(4) };
+        let floor = if comparison { 0 } else { self.mip_floor.min(crate::detail::LOD_QUANTA) };
         let words = {
             let state = self.objs.state(id).filter(|s| s.comparison == comparison && s.sampler.is_some())?;
             if floor == 0 {
@@ -667,7 +667,7 @@ impl Gpu {
             }
             state.words.clone()
         };
-        let sampler = self.make_sampler_at(&words, nearest, floor as f32);
+        let sampler = self.make_sampler_at(&words, nearest, floor as f32 * 0.25);
         let state = self.objs.state_mut(id)?;
         if floor == 0 {
             state.nearest = Some(sampler.clone());
@@ -955,9 +955,13 @@ impl Gpu {
         if self.cull_distant_shadow(distance) {
             return self.skip("distant shadow");
         }
+        let ps_label = ps.as_ref().map(|p| p.label.as_str()).unwrap_or("");
+        if let Some(why) = self.cull_for_distance(distance, &vs.label, ps_label, kind, count, instances) {
+            return self.skip(why);
+        }
         // Shadow maps sample alpha-tested cutouts. A coarser mip would change
         // which pixels cast, so those draws are culled by distance instead.
-        self.mip_floor = if self.shadow_map_pass() { 0 } else { self.detail_mip_floor(distance) };
+        self.mip_floor = if self.shadow_map_pass() { 0 } else { self.detail_lod(distance, &vs.label, ps_label) };
         let Some(cell) = self.pipeline(&vs, ps.as_ref(), [vs_float32, ps_float32]) else {
             return self.skip("no pipeline");
         };
@@ -1207,14 +1211,43 @@ impl Gpu {
         crate::detail::placed_distance([f(12), f(13), f(14)], cam)
     }
 
-    fn detail_mip_floor(&self, distance: Option<f32>) -> u32 {
+    fn detail_lod(&self, distance: Option<f32>, vs: &str, ps: &str) -> u32 {
         let Some(distance) = distance else { return 0 };
         let policy = crate::detail::policy();
         if !policy.enabled {
             return 0;
         }
         let thermal = self.presentation.as_ref().map(crate::present::Presentation::thermal).unwrap_or(0);
-        crate::detail::mip_floor(distance, crate::detail::bands(policy.mobile, policy.aggressive, thermal), thermal)
+        let bands = crate::detail::bands(policy.mobile, policy.aggressive, thermal);
+        crate::detail::lod_quanta(crate::detail::lod_add(vs, ps, distance, bands, thermal))
+    }
+
+    /// Drops clutter, grass, distant tree cards and anything past the view
+    /// distance. Occlusion queries and the HUD are left alone: a skipped
+    /// query would look like an empty scene, and the HUD has no world position.
+    fn cull_for_distance(
+        &self,
+        distance: Option<f32>,
+        vs: &str,
+        ps: &str,
+        kind: u32,
+        count: u32,
+        instances: u32,
+    ) -> Option<&'static str> {
+        let policy = crate::detail::policy();
+        if !policy.enabled || self.scene.hud || self.occlusion.running() {
+            return None;
+        }
+        let distance = distance?;
+        let thermal = self.presentation.as_ref().map(crate::present::Presentation::thermal).unwrap_or(0);
+        let indirect = kind >= 4;
+        let triangles = if indirect { u32::MAX } else { count / 3 };
+        let instanced = instances > 1 || kind == 2 || kind == 3 || kind == 5;
+        crate::detail::skip_reason(
+            distance,
+            &crate::detail::DrawInfo { vs, ps, triangles, instanced },
+            crate::detail::distances(policy, thermal),
+        )
     }
 
     /// A depth-only square target smaller than the scene is a shadow map.

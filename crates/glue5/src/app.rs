@@ -642,19 +642,10 @@ impl App {
     fn adapt_graphics(&mut self) {
         let pixels = self.window.size_in_pixels();
         let wanted = self.settings.input_size(pixels).1 as f32 / pixels.1.max(1) as f32;
-        let hot = MOBILE && self.settings.thermal_protection && self.thermal_cap.is_some();
-        let ceiling = wanted
-            * if hot {
-                if self.thermal_state >= 3 {
-                    0.6
-                } else if self.thermal_state == 1 {
-                    0.9
-                } else {
-                    0.75
-                }
-            } else {
-                1.0
-            };
+        // Nominal spends the distant-draw savings on pixels. Heat gives them back.
+        let thermal = if self.settings.thermal_protection { self.thermal_state } else { 0 };
+        let factor = glue5_gpu::resolution_factor(thermal, glue5_gpu::render_boost());
+        let ceiling = settings::round_scale((wanted * factor).min(1.0));
         if !MOBILE || !self.settings.adaptive_graphics || self.game.is_none() {
             self.adaptive_slow_since = None;
             self.adaptive_fast_since = None;
@@ -667,7 +658,7 @@ impl App {
         let target_ms = 1000.0 / if fps > 0 { fps } else { 60 } as f32;
         let now = Instant::now();
         let overloaded = interval_ms > target_ms * 1.18;
-        let headroom = !hot && self.thermal_state < 2 && interval_ms <= target_ms * 1.04;
+        let headroom = thermal < 2 && self.thermal_state < 2 && interval_ms <= target_ms * 1.04;
         if overloaded {
             self.adaptive_slow_since.get_or_insert(now);
             self.adaptive_fast_since = None;

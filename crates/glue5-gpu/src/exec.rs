@@ -207,7 +207,8 @@ pub struct Gpu {
     /// destroyed; and the variant last picked for that count.
     pub formats_seen: [u64; 3],
     pub bound_formats: [Option<(u32, u64, Arc<Program>, u128)>; 3],
-    /// Extra mips the current draw's samplers must skip (0: the engine's).
+    /// Sampler coarseness of the current draw, in quarter-mip steps
+    /// (0: the engine's, 16: four mips down). See `detail::lod_quanta`.
     pub mip_floor: u32,
     /// Render passes recorded since the last submit.
     pub chunk_passes: u32,

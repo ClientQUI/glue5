@@ -32,14 +32,15 @@ requests can still grow it to avoid failed streaming reads.
 - Binding-only shader variants share their immutable WGSL text instead of
   copying it. Textual rewrites keep their own source.
 - Background shader-module cleanup and the frame watchdog run at Utility
-  QoS. The graphics menu can also place the audio pump, mixer, asset
-  streaming and texture decompression at utility QoS, and a dedicated save
-  thread at background QoS, which prefer efficiency cores. The audio
-  callback and the main, game, render and GPU threads stay user-interactive.
-  Frame-critical work is not forced onto efficiency cores, and the Neural
-  Engine is not used. The experimental Video toggle "Efficiency mode
-  (E-cores)" (off unless chosen, or `GLUE5_EFFICIENCY_MODE=1`) does put the
-  game, render and GPU threads at utility QoS for a power test, and FPS drops.
+  QoS. Shader compilation and BC decompression run on their own pools, not
+  the game thread. The Video choice **Efficiency** defaults to Hybrid:
+  startup, loading, teleports and a streaming backlog stay user-interactive,
+  and steady play drops the game, render and GPU threads to utility while
+  pacing at 24 FPS. A missed frame raises the game and render threads, then
+  eases them back. Full-E keeps that low class and paces at 20 FPS. The
+  mixer, audio pump and device callback stay user-interactive, with 250 ms
+  buffered in those modes. Saves stay at background in Hybrid. Nothing here
+  uses the Neural Engine.
 - Video settings now offer 20 FPS as a lower, live frame cap. The renderer
   paces before submit/completion, reducing engine frame progress too.
 

@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
-use glue5_game::{exports, Env, Trap};
+use glue5_game::{Env, Trap, exports};
 
 use crate::rt;
 
@@ -167,14 +167,12 @@ fn engine_name(mem: crate::memory::Mem, arg: u64) -> Option<String> {
 }
 
 fn run_pthread(pthread: u64, start: u64, arg: u64, name: Option<String>) {
-    // Main, game and render stay user-interactive. The mixer, streaming and
-    // save threads drop a class when efficiency placement is on. Loading
-    // waits on streaming: that used to stretch a post-cutscene load from
-    // 1-2 s to 6-10 s on an iPhone 13 Pro when render and the mixer were
-    // both above the workers. Streaming now shares the utility class with
-    // the mixer (the mixer keeps the higher priority inside it) and render
-    // stays interactive, so a busy frame can still make a load longer.
-    // Threads already running keep this class until the game starts again.
+    // Hybrid starts this thread at user-interactive (a load) and drops it
+    // once play is steady, unless it is the mixer, which stays interactive.
+    // A load that left streaming below the frame used to stretch a
+    // post-cutscene load from 1-2 s to 6-10 s on an iPhone 13 Pro.
+    // Streaming is user-interactive during that boost and utility after.
+    // The class is read again every frame on the game and render threads.
     crate::qos::apply_engine_thread(name.as_deref());
     let env = new_env();
     let mem = rt().memory.mem();

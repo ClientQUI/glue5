@@ -10,8 +10,7 @@
 pub enum Role {
     /// Main, game, and render. A frame waits on these.
     Frame,
-    /// Mixer. Utility while efficiency placement is on; the device callback
-    /// stays user-interactive.
+    /// Mixer. Always user-interactive, with the pump and the device callback.
     Audio,
     /// Asset streaming and decompression.
     Stream,
@@ -95,37 +94,205 @@ fn words(name: &str) -> Vec<String> {
     out
 }
 
-/// Class for `role`. `e_mode` is the experimental all-threads test: every
-/// engine role, including the frame, runs at utility. Unknown workers stay
-/// user-initiated when that test is off.
-pub fn class_for(role: Role, efficiency: bool, e_mode: bool) -> Class {
-    if e_mode {
-        return Class::Utility;
+/// How far efficiency placement goes. Hybrid is the one to leave on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Every frame thread stays user-interactive.
+    Off,
+    /// Performance cores while loading or hitching, efficiency cores once
+    /// play is steady. Audio stays user-interactive either way.
+    Hybrid,
+    /// Frame threads stay at utility the whole time. Audio does not.
+    FullE,
+}
+
+/// Why a hybrid frame is or is not on efficiency cores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Demand {
+    /// Startup, a load, a teleport, or a streaming backlog.
+    Boost,
+    /// The frame budget was missed. Game and render step up.
+    Hitch,
+    /// The hitch is over. One step down before cruise.
+    Ease,
+    /// Steady play.
+    Cruise,
+}
+
+/// One observation of the frame the hybrid policy is pacing.
+#[derive(Clone, Copy, Debug)]
+pub struct PaceSample {
+    pub frame_ms: f32,
+    pub budget_ms: f32,
+    /// Bytes of texture decode still waiting.
+    pub stream_bytes: u64,
+    /// Decode jobs still waiting.
+    pub stream_jobs: u32,
+    /// A teleport, or the game just started.
+    pub warp: bool,
+}
+
+/// Hybrid's memory: stay boosted through a load, then cruise, and step up
+/// for a hitch. Full-E and Off do not use it.
+pub struct Pace {
+    mode: Mode,
+    settled: bool,
+    steady: u32,
+    boost_left: u32,
+    hitch_left: u32,
+    ease_left: u32,
+    miss_run: u32,
+    demand: Demand,
+}
+
+impl Pace {
+    /// Good frames before cruise, at a 24 fps cap (about three seconds).
+    pub const STEADY_FRAMES: u32 = 72;
+    /// Minimum boosted frames after a load or a teleport (about two seconds).
+    pub const BOOST_HOLD: u32 = 48;
+    pub const HITCH_HOLD: u32 = 6;
+    pub const EASE_HOLD: u32 = 6;
+    /// This many missed budgets in a row is a load, not a hitch.
+    pub const MISS_RUN: u32 = 6;
+    /// Pending decode bytes that count as a streaming backlog.
+    pub const STREAM_BYTES: u64 = 24 << 20;
+    /// Pending decode jobs that count as a backlog. One large texture does not,
+    /// and ordinary driving stays under this. The hard cap that stalls a frame
+    /// is 64 jobs.
+    pub const STREAM_JOBS: u32 = 24;
+
+    pub const fn new() -> Self {
+        Self {
+            mode: Mode::Hybrid,
+            settled: false,
+            steady: 0,
+            boost_left: 0,
+            hitch_left: 0,
+            ease_left: 0,
+            miss_run: 0,
+            demand: Demand::Boost,
+        }
     }
-    match role {
-        Role::Frame => Class::Interactive,
-        Role::Audio => {
-            if efficiency {
-                Class::Utility
-            } else {
-                Class::Interactive
-            }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn demand(&self) -> Demand {
+        self.demand
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.begin_boost();
         }
-        Role::Stream => {
-            if efficiency {
-                Class::Utility
-            } else {
-                Class::Initiated
-            }
+    }
+
+    /// The game is starting, or the player just teleported.
+    pub fn note_load(&mut self) {
+        self.begin_boost();
+    }
+
+    fn begin_boost(&mut self) {
+        self.settled = false;
+        self.steady = 0;
+        self.boost_left = Self::BOOST_HOLD;
+        self.hitch_left = 0;
+        self.ease_left = 0;
+        self.miss_run = 0;
+        self.demand = Demand::Boost;
+    }
+
+    pub fn observe(&mut self, sample: PaceSample) -> Demand {
+        if self.mode != Mode::Hybrid {
+            self.demand = Demand::Cruise;
+            return self.demand;
         }
-        Role::Save => {
-            if efficiency {
-                Class::Background
-            } else {
-                Class::Initiated
-            }
+        let backlog = sample.stream_bytes >= Self::STREAM_BYTES || sample.stream_jobs >= Self::STREAM_JOBS;
+        if sample.warp || backlog {
+            self.begin_boost();
+            return self.demand;
         }
-        Role::Worker => Class::Initiated,
+        let over = sample.budget_ms > 0.0 && sample.frame_ms > sample.budget_ms * 1.35;
+        let ok = sample.budget_ms > 0.0 && sample.frame_ms <= sample.budget_ms * 1.15;
+        if !self.settled {
+            if ok {
+                self.steady = self.steady.saturating_add(1);
+            } else {
+                self.steady = 0;
+            }
+            if self.boost_left > 0 {
+                self.boost_left -= 1;
+            }
+            if self.steady >= Self::STEADY_FRAMES && self.boost_left == 0 {
+                self.settled = true;
+                self.demand = Demand::Cruise;
+            } else {
+                self.demand = Demand::Boost;
+            }
+            return self.demand;
+        }
+        if over {
+            self.miss_run = self.miss_run.saturating_add(1);
+            self.steady = 0;
+            if self.miss_run >= Self::MISS_RUN {
+                self.begin_boost();
+                return self.demand;
+            }
+            self.hitch_left = Self::HITCH_HOLD;
+            self.ease_left = 0;
+            self.demand = Demand::Hitch;
+            return self.demand;
+        }
+        self.miss_run = 0;
+        if self.hitch_left > 0 {
+            self.hitch_left -= 1;
+            if self.hitch_left == 0 {
+                self.ease_left = Self::EASE_HOLD;
+                self.demand = Demand::Ease;
+            } else {
+                self.demand = Demand::Hitch;
+            }
+            return self.demand;
+        }
+        if self.ease_left > 0 {
+            self.ease_left -= 1;
+            self.demand = if self.ease_left == 0 { Demand::Cruise } else { Demand::Ease };
+            return self.demand;
+        }
+        self.demand = Demand::Cruise;
+        self.demand
+    }
+}
+
+/// Class for `role`. Audio is user-interactive in every mode: the mixer and
+/// the pump fill a buffer the device callback plays, and a utility class
+/// there is what let a stalled game empty the speakers. Full-E holds every
+/// other role at utility. Hybrid uses [`Demand`].
+pub fn class_for(role: Role, mode: Mode, demand: Demand) -> Class {
+    if role == Role::Audio {
+        return Class::Interactive;
+    }
+    match mode {
+        Mode::Off => match role {
+            Role::Frame => Class::Interactive,
+            Role::Stream | Role::Save | Role::Worker => Class::Initiated,
+            Role::Audio => Class::Interactive,
+        },
+        Mode::FullE => Class::Utility,
+        Mode::Hybrid => match (role, demand) {
+            (Role::Save, _) => Class::Background,
+            (Role::Frame, Demand::Cruise) => Class::Utility,
+            (Role::Frame, Demand::Ease) => Class::Initiated,
+            (Role::Frame, Demand::Hitch | Demand::Boost) => Class::Interactive,
+            (Role::Worker, Demand::Cruise) => Class::Utility,
+            (Role::Worker, Demand::Ease | Demand::Hitch) => Class::Initiated,
+            (Role::Worker, Demand::Boost) => Class::Interactive,
+            (Role::Stream, Demand::Boost) => Class::Interactive,
+            (Role::Stream, _) => Class::Utility,
+            (Role::Audio, _) => Class::Interactive,
+        },
     }
 }
 
@@ -157,12 +324,17 @@ pub struct PlaybackMeasure {
 }
 
 /// The app's device quantum and cushion, in microseconds.
+/// `prime_ms` is 100 with efficiency off and 250 in hybrid and full-E.
 pub fn app_playback(pump_delay_us: u64, until_us: u64) -> PlaybackSpec {
+    playback_with_prime(100, pump_delay_us, until_us)
+}
+
+pub fn playback_with_prime(prime_ms: u64, pump_delay_us: u64, until_us: u64) -> PlaybackSpec {
     const RATE: u64 = 48_000;
     const QUANTUM: usize = 256;
     PlaybackSpec {
-        prime: (RATE as usize) * 100 / 1000,
-        cap: 16384,
+        prime: (RATE as usize) * prime_ms as usize / 1000,
+        cap: 32768,
         device_frames: QUANTUM,
         device_every_us: QUANTUM as u64 * 1_000_000 / RATE,
         pump_frames: QUANTUM,
@@ -237,18 +409,87 @@ mod tests {
         assert_eq!(role("street"), Role::Worker);
         assert_eq!(role("AsyncBink"), Role::Worker);
 
-        assert_eq!(class_for(Role::Frame, true, false), Class::Interactive);
-        assert_eq!(class_for(Role::Audio, true, false), Class::Utility);
-        assert_eq!(class_for(Role::Stream, true, false), Class::Utility);
-        assert_eq!(class_for(Role::Save, true, false), Class::Background);
-        assert_eq!(class_for(Role::Worker, true, false), Class::Initiated);
-        assert_eq!(class_for(Role::Audio, false, false), Class::Interactive);
-        assert_eq!(class_for(Role::Stream, false, false), Class::Initiated);
-        assert_ne!(class_for(Role::Audio, true, false), Class::Background);
-        assert_eq!(class_for(Role::Frame, false, true), Class::Utility);
-        assert_eq!(class_for(Role::Worker, false, true), Class::Utility);
-        assert_eq!(class_for(Role::Save, true, true), Class::Utility);
-        assert_eq!(class_for(Role::Audio, false, true), Class::Utility);
+        let cruise = Demand::Cruise;
+        assert_eq!(class_for(Role::Frame, Mode::Off, cruise), Class::Interactive);
+        assert_eq!(class_for(Role::Audio, Mode::Off, cruise), Class::Interactive);
+        assert_eq!(class_for(Role::Stream, Mode::Off, cruise), Class::Initiated);
+        assert_eq!(class_for(Role::Audio, Mode::Hybrid, cruise), Class::Interactive);
+        assert_eq!(class_for(Role::Audio, Mode::FullE, Demand::Boost), Class::Interactive);
+        assert_eq!(class_for(Role::Frame, Mode::Hybrid, cruise), Class::Utility);
+        assert_eq!(class_for(Role::Stream, Mode::Hybrid, cruise), Class::Utility);
+        assert_eq!(class_for(Role::Save, Mode::Hybrid, cruise), Class::Background);
+        assert_eq!(class_for(Role::Frame, Mode::Hybrid, Demand::Boost), Class::Interactive);
+        assert_eq!(class_for(Role::Stream, Mode::Hybrid, Demand::Boost), Class::Interactive);
+        assert_eq!(class_for(Role::Frame, Mode::Hybrid, Demand::Hitch), Class::Interactive);
+        assert_eq!(class_for(Role::Frame, Mode::Hybrid, Demand::Ease), Class::Initiated);
+        assert_eq!(class_for(Role::Frame, Mode::FullE, cruise), Class::Utility);
+        assert_eq!(class_for(Role::Worker, Mode::FullE, cruise), Class::Utility);
+        assert_eq!(class_for(Role::Save, Mode::FullE, cruise), Class::Utility);
+        assert_ne!(class_for(Role::Audio, Mode::FullE, cruise), Class::Utility);
+    }
+
+    fn good(pace: &mut Pace, n: u32) {
+        let sample =
+            PaceSample { frame_ms: 40.0, budget_ms: 1000.0 / 24.0, stream_bytes: 0, stream_jobs: 0, warp: false };
+        for _ in 0..n {
+            pace.observe(sample);
+        }
+    }
+
+    #[test]
+    fn hybrid_stays_boosted_until_play_is_steady() {
+        let mut pace = Pace::new();
+        pace.note_load();
+        good(&mut pace, Pace::BOOST_HOLD);
+        assert_eq!(pace.demand(), Demand::Boost, "the hold is not cruise");
+        good(&mut pace, Pace::STEADY_FRAMES - Pace::BOOST_HOLD - 1);
+        assert_eq!(pace.demand(), Demand::Boost);
+        good(&mut pace, 1);
+        assert_eq!(pace.demand(), Demand::Cruise);
+    }
+
+    #[test]
+    fn a_warp_or_a_backlog_returns_to_performance_cores() {
+        let mut pace = Pace::new();
+        good(&mut pace, Pace::STEADY_FRAMES);
+        assert_eq!(pace.demand(), Demand::Cruise);
+        pace.observe(PaceSample {
+            frame_ms: 40.0,
+            budget_ms: 1000.0 / 24.0,
+            stream_bytes: 0,
+            stream_jobs: 0,
+            warp: true,
+        });
+        assert_eq!(pace.demand(), Demand::Boost);
+        good(&mut pace, Pace::STEADY_FRAMES);
+        assert_eq!(pace.demand(), Demand::Cruise);
+        pace.observe(PaceSample {
+            frame_ms: 40.0,
+            budget_ms: 1000.0 / 24.0,
+            stream_bytes: 0,
+            stream_jobs: Pace::STREAM_JOBS,
+            warp: false,
+        });
+        assert_eq!(pace.demand(), Demand::Boost);
+    }
+
+    #[test]
+    fn a_spike_steps_up_and_then_back_and_a_run_of_them_reloads() {
+        let mut pace = Pace::new();
+        good(&mut pace, Pace::STEADY_FRAMES);
+        let slow =
+            PaceSample { frame_ms: 80.0, budget_ms: 1000.0 / 24.0, stream_bytes: 0, stream_jobs: 0, warp: false };
+        assert_eq!(pace.observe(slow), Demand::Hitch);
+        good(&mut pace, Pace::HITCH_HOLD - 1);
+        assert_eq!(pace.demand(), Demand::Hitch);
+        good(&mut pace, 1);
+        assert_eq!(pace.demand(), Demand::Ease);
+        good(&mut pace, Pace::EASE_HOLD);
+        assert_eq!(pace.demand(), Demand::Cruise);
+        for _ in 0..Pace::MISS_RUN - 1 {
+            assert_eq!(pace.observe(slow), Demand::Hitch);
+        }
+        assert_eq!(pace.observe(slow), Demand::Boost);
     }
 
     #[test]
@@ -277,5 +518,14 @@ mod tests {
         let early = measure_playback(app_playback(200_000, 96_000));
         assert_eq!(early.silent, 0, "{early:?}");
         assert_eq!(early.short, 0, "{early:?}");
+    }
+
+    #[test]
+    fn the_efficiency_cushion_covers_a_stall_the_short_one_does_not() {
+        let m = measure_playback(playback_with_prime(250, 200_000, 800_000));
+        assert_eq!(m.silent, 0, "{m:?}");
+        assert_eq!(m.short, 0, "{m:?}");
+        let past = measure_playback(playback_with_prime(250, 400_000, 900_000));
+        assert!(past.silent > 0, "{past:?}");
     }
 }

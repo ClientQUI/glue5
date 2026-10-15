@@ -5,8 +5,8 @@ use super::widgets::{
 use super::{Action, Page, SettingsTab, Status, WARN, theme};
 use crate::paths::MOBILE;
 use crate::settings::{
-    self, Corner, OverlayDetail, PerfOverlay, RENDER_SCALES, ResourceBudget, Settings, TextureDetail, TouchMode,
-    Upscaling, WorldDetail, WorldPreset,
+    self, Corner, Efficiency, OverlayDetail, PerfOverlay, RENDER_SCALES, ResourceBudget, Settings, TextureDetail,
+    TouchMode, Upscaling, WorldDetail, WorldPreset,
 };
 use egui::{Align, Align2, Id, Layout, RichText, vec2};
 
@@ -277,35 +277,27 @@ fn settings_items(
             setting(ui, "Thermal protection", Control::Toggle, Some(&subtitle), |ui| {
                 toggle(ui, &mut settings.thermal_protection)
             });
-            let cores = if crate::settings::efficiency_cores_killed() {
-                "Forced off by GLUE5_EFFICIENCY_CORES=0".to_string()
-            } else if settings.efficiency_cores {
-                "Audio, streaming and saves prefer efficiency cores".to_string()
-            } else {
-                "Off".to_string()
+            let efficiency = settings.efficiency_now();
+            let efficiency_note = match crate::settings::efficiency_forced() {
+                Some(Efficiency::Off) => "Forced off",
+                Some(Efficiency::Hybrid) => "Forced to Hybrid",
+                Some(Efficiency::FullE) => "Forced to Full-E",
+                None => match efficiency {
+                    Efficiency::Off => "Performance cores",
+                    Efficiency::Hybrid => "Recommended. E-cores in play, P-cores while loading",
+                    Efficiency::FullE => "E-cores the whole time. About 20 FPS",
+                },
             };
-            setting(ui, "Efficiency cores", Control::Toggle, Some(&cores), |ui| {
-                toggle(ui, &mut settings.efficiency_cores)
-            });
-            ui.label(
-                RichText::new(
-                    "The audio callback stays immediate, with 100 ms buffered. Engine threads already running pick this up when the game starts again.",
+            setting(ui, "Efficiency", Control::Choice, Some(efficiency_note), |ui| {
+                choice(
+                    ui,
+                    &mut settings.efficiency,
+                    &[(Efficiency::Off, "Off"), (Efficiency::Hybrid, "Hybrid"), (Efficiency::FullE, "Full-E")],
                 )
-                .small()
-                .color(theme::MUTED),
-            );
-            let mode = match crate::settings::efficiency_mode_forced() {
-                Some(true) => "Forced on by GLUE5_EFFICIENCY_MODE=1. Experimental. Lowers FPS.",
-                Some(false) => "Forced off by GLUE5_EFFICIENCY_MODE=0",
-                None if settings.efficiency_mode => "Experimental. Lowers FPS.",
-                None => "Off",
-            };
-            setting(ui, "Efficiency mode (E-cores)", Control::Toggle, Some(mode), |ui| {
-                toggle(ui, &mut settings.efficiency_mode)
             });
             ui.label(
                 RichText::new(
-                    "Experimental power test. Game, render and GPU threads run at utility QoS so the system prefers efficiency cores, and FPS will drop. The audio callback stays immediate. Other engine threads follow when the game starts again.",
+                    "Hybrid is recommended. Loading, teleports and a streaming backlog use performance cores, then play prefers efficiency cores and paces at 24 FPS. A missed frame briefly raises the game and render threads. Audio stays immediate, with 250 ms buffered, on its own thread. Full-E stays on efficiency cores and paces at 20 FPS. Off leaves the frame threads interactive.",
                 )
                 .small()
                 .color(theme::MUTED),
@@ -564,7 +556,7 @@ fn distance_options(ui: &mut egui::Ui, settings: &mut Settings, status: &Status)
         .small()
         .color(theme::MUTED),
     );
-    setting(ui, "Defaults", Control::Action, Some("Fog, distances, scale, boost, thermal, both core modes"), |ui| {
+    setting(ui, "Defaults", Control::Action, Some("Fog, distances, scale, boost, thermal, efficiency"), |ui| {
         if action_button(ui, "Reset").clicked() {
             settings.reset_distance_options(status.window.1);
         }

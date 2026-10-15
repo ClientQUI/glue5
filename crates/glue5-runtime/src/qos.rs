@@ -3,20 +3,20 @@
 //! utility and background prefer efficiency cores. This process does not pin
 //! cores and does not use the Neural Engine.
 //!
-//! The main, game, render and GPU threads stay user-interactive. With
-//! efficiency placement on, the mixer and asset streaming run at utility
-//! (the mixer at the top of that class) and a thread that only saves runs
-//! at background. The experimental efficiency mode instead runs every engine
-//! thread, and the GPU threads, at utility so a power test can prefer
-//! efficiency cores. The audio device callback stays user-interactive and
-//! plays a buffer the pump already filled. On Android only user-interactive
+//! Hybrid (the recommended mode) runs startup, loading, teleports and a
+//! streaming backlog at user-interactive, then drops the game, render and
+//! GPU threads to utility once play is steady. A missed frame steps those
+//! threads back up, then down again. Full-E leaves them at utility. The
+//! mixer, the playback pump and the device callback stay user-interactive
+//! in every mode, and on Apple the callback also takes a time-constraint
+//! schedule and joins an audio workgroup. On Android only user-interactive
 //! threads join the performance hint session ([`frame`]).
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-use crate::sched::{self, Class, Role};
+use crate::sched::{self, Class, Demand, Mode, Pace, PaceSample, Role};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Qos {
@@ -31,51 +31,160 @@ pub enum Qos {
     Background,
 }
 
-static EFFICIENCY: AtomicBool = AtomicBool::new(true);
-static KILL: OnceLock<bool> = OnceLock::new();
-/// Experimental: every engine thread at utility. Default off.
-static E_MODE: AtomicBool = AtomicBool::new(false);
-static E_MODE_ENV: OnceLock<Option<bool>> = OnceLock::new();
-/// Bumped when a menu flag changes, so a thread can re-apply without a syscall
-/// on the frames in between.
+static MODE: AtomicU8 = AtomicU8::new(Mode::Hybrid as u8);
+static DEMAND: AtomicU8 = AtomicU8::new(Demand::Boost as u8);
+static FORCED: OnceLock<Option<Mode>> = OnceLock::new();
+static PACE: Mutex<Pace> = Mutex::new(Pace::new());
+static WARP: AtomicBool = AtomicBool::new(false);
+static STREAM_BYTES: AtomicU64 = AtomicU64::new(0);
+static STREAM_JOBS: AtomicU32 = AtomicU32::new(0);
+/// Bumped when the class a thread should hold changes, so it can re-apply
+/// without a syscall on the frames in between.
 static PLACEMENT: AtomicU64 = AtomicU64::new(1);
 
-/// `GLUE5_EFFICIENCY_CORES=0` forces placement off. Anything else follows
-/// [`set_efficiency_cores`], which the graphics menu updates.
-pub fn set_efficiency_cores(on: bool) {
-    if EFFICIENCY.swap(on, Ordering::Relaxed) != on {
-        PLACEMENT.fetch_add(1, Ordering::Relaxed);
+fn mode_from(byte: u8) -> Mode {
+    match byte {
+        0 => Mode::Off,
+        2 => Mode::FullE,
+        _ => Mode::Hybrid,
     }
 }
 
-pub fn efficiency_cores() -> bool {
-    if *KILL.get_or_init(|| std::env::var("GLUE5_EFFICIENCY_CORES").ok().as_deref() == Some("0")) {
-        return false;
-    }
-    EFFICIENCY.load(Ordering::Relaxed)
-}
-
-/// `GLUE5_EFFICIENCY_MODE=1` forces the experimental test on, `=0` forces it
-/// off. Unset follows [`set_efficiency_mode`] (the menu, default off).
-pub fn set_efficiency_mode(on: bool) {
-    if E_MODE.swap(on, Ordering::Relaxed) != on {
-        PLACEMENT.fetch_add(1, Ordering::Relaxed);
+fn demand_from(byte: u8) -> Demand {
+    match byte {
+        1 => Demand::Hitch,
+        2 => Demand::Ease,
+        3 => Demand::Cruise,
+        _ => Demand::Boost,
     }
 }
 
-pub fn efficiency_mode() -> bool {
-    match *E_MODE_ENV.get_or_init(|| match std::env::var("GLUE5_EFFICIENCY_MODE").ok().as_deref() {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
+/// `GLUE5_EFFICIENCY` is `off`, `hybrid`, or `full` / `full-e`. Otherwise
+/// `GLUE5_EFFICIENCY_MODE=1` is full-E and `=0` is off, and
+/// `GLUE5_EFFICIENCY_CORES=0` is off. Unset follows the menu.
+pub fn forced_mode() -> Option<Mode> {
+    *FORCED.get_or_init(|| {
+        if let Some(mode) = std::env::var("GLUE5_EFFICIENCY").ok().as_deref().and_then(parse_mode) {
+            return Some(mode);
+        }
+        match std::env::var("GLUE5_EFFICIENCY_MODE").ok().as_deref() {
+            Some("1") => return Some(Mode::FullE),
+            Some("0") => return Some(Mode::Off),
+            _ => {}
+        }
+        if std::env::var("GLUE5_EFFICIENCY_CORES").ok().as_deref() == Some("0") {
+            return Some(Mode::Off);
+        }
+        None
+    })
+}
+
+fn parse_mode(text: &str) -> Option<Mode> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "0" | "off" => Some(Mode::Off),
+        "hybrid" => Some(Mode::Hybrid),
+        "1" | "full" | "full-e" | "fulle" => Some(Mode::FullE),
         _ => None,
-    }) {
-        Some(forced) => forced,
-        None => E_MODE.load(Ordering::Relaxed),
+    }
+}
+
+/// The menu's choice. An environment force still wins in [`mode`].
+pub fn set_mode(mode: Mode) {
+    let prev = MODE.swap(mode as u8, Ordering::Relaxed);
+    let effective = forced_mode().unwrap_or(mode);
+    if let Ok(mut pace) = PACE.lock() {
+        pace.set_mode(effective);
+        publish(pace.demand());
+    }
+    if prev != mode as u8 {
+        PLACEMENT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn mode() -> Mode {
+    forced_mode().unwrap_or_else(|| mode_from(MODE.load(Ordering::Relaxed)))
+}
+
+pub fn demand() -> Demand {
+    demand_from(DEMAND.load(Ordering::Relaxed))
+}
+
+/// Frames per second this mode paces at. The menu's own cap can only go lower.
+pub fn pace_fps() -> Option<u32> {
+    match mode() {
+        Mode::Off => None,
+        Mode::Hybrid => Some(24),
+        Mode::FullE => Some(20),
+    }
+}
+
+/// Playback does not start, and does not restart after an underrun, until
+/// this many frames are buffered. Hybrid and full-E keep 250 ms so a stall
+/// on the game thread does not reach the speakers. Off keeps 100 ms.
+pub fn audio_prime_frames(rate: u32) -> usize {
+    let ms = match mode() {
+        Mode::Off => 100,
+        Mode::Hybrid | Mode::FullE => 250,
+    };
+    rate as usize * ms / 1000
+}
+
+/// The game is starting. Threads already running pick the boost up on their
+/// next refresh, which the game and render threads do every frame.
+pub fn note_load() {
+    WARP.store(true, Ordering::Relaxed);
+    if let Ok(mut pace) = PACE.lock() {
+        pace.note_load();
+        publish(pace.demand());
+    }
+}
+
+/// `CWarpManager::SetWarp`, or a camera that jumped further than a frame of
+/// driving can explain.
+pub fn note_warp() {
+    note_load();
+}
+
+/// Texture decodes still waiting. A backlog boosts immediately.
+pub fn note_stream(bytes: u64, jobs: u32) {
+    STREAM_BYTES.store(bytes, Ordering::Relaxed);
+    STREAM_JOBS.store(jobs, Ordering::Relaxed);
+    if bytes >= Pace::STREAM_BYTES || jobs >= Pace::STREAM_JOBS {
+        observe(PaceSample { frame_ms: 0.0, budget_ms: 1.0, stream_bytes: bytes, stream_jobs: jobs, warp: false });
+    }
+}
+
+/// A presented frame, `took_ms` after the one before, against `budget_ms`.
+pub fn note_frame(took_ms: f32, budget_ms: f32) {
+    let warp = WARP.swap(false, Ordering::Relaxed);
+    observe(PaceSample {
+        frame_ms: took_ms,
+        budget_ms,
+        stream_bytes: STREAM_BYTES.load(Ordering::Relaxed),
+        stream_jobs: STREAM_JOBS.load(Ordering::Relaxed),
+        warp,
+    });
+}
+
+fn observe(sample: PaceSample) {
+    let Ok(mut pace) = PACE.lock() else { return };
+    if pace.mode() != mode() {
+        pace.set_mode(mode());
+    }
+    let demand = pace.observe(sample);
+    publish(demand);
+}
+
+fn publish(demand: Demand) {
+    if DEMAND.swap(demand as u8, Ordering::Relaxed) != demand as u8 {
+        PLACEMENT.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// The device callback. It only copies a filled buffer, and it is the
-/// deadline, so it stays user-interactive even when the mixer does not.
+/// deadline, so it stays user-interactive in every mode. On Apple it also
+/// takes a time-constraint schedule and joins an audio workgroup, so a
+/// utility game thread cannot push it off the core.
 pub fn set_audio_callback() {
     use std::cell::Cell;
     thread_local! {
@@ -87,25 +196,17 @@ pub fn set_audio_callback() {
         }
         set_rel(Qos::Interactive, 0);
         renice(-10);
+        #[cfg(target_vendor = "apple")]
+        realtime::promote();
     });
 }
 
-/// The playback pump and the game's mixer. Utility (highest priority inside
-/// that class) when efficiency placement is on, so they prefer efficiency
-/// cores without being deferred as background. The 100 ms cushion covers a
-/// late wake. When placement is off they stay interactive, which is the
-/// previous behaviour: a frame is not scheduled ahead of the mix.
+/// The playback pump and the game's mixer. They stay user-interactive in
+/// every mode. The cushion is what covers a late mix; dropping them to
+/// utility is what emptied it while the game was on efficiency cores.
 pub fn set_audio() {
-    if efficiency_mode() || efficiency_cores() {
-        // Top of the utility class. Streaming uses a lower relative priority
-        // and a higher nice, so a decompress does not sit ahead of the mix.
-        // The device callback is nicer still (user-interactive, nice -10).
-        set_rel(Qos::Utility, 0);
-        renice(1);
-    } else {
-        set_rel(Qos::Interactive, 0);
-        renice(-10);
-    }
+    set_rel(Qos::Interactive, 0);
+    renice(-10);
 }
 
 #[derive(Clone, Copy)]
@@ -130,7 +231,7 @@ pub fn apply_engine_thread(name: Option<&str>) {
 }
 
 /// A host thread whose normal class is `normal` (the GPU command, submit,
-/// encode and completion threads). Experimental mode uses utility instead.
+/// encode and completion threads). Hybrid cruise and full-E use utility.
 pub fn bind_host(normal: Qos) {
     BIND.with(|bind| bind.set(Bind::Host(normal)));
     APPLIED.with(|applied| applied.set(0));
@@ -155,26 +256,62 @@ pub fn refresh() {
     match BIND.with(|bind| bind.get()) {
         Bind::Unset => {}
         Bind::Engine(role) => install_engine(role),
-        Bind::Host(normal) => {
-            if efficiency_mode() {
-                set(Qos::Utility);
-            } else {
-                set(normal);
-            }
-        }
+        Bind::Host(normal) => set(host_qos(normal)),
+    }
+}
+
+/// Where a GPU thread sits. `normal` is its class with efficiency off.
+pub fn host_qos(normal: Qos) -> Qos {
+    match mode() {
+        Mode::Off => normal,
+        Mode::FullE => Qos::Utility,
+        Mode::Hybrid => match demand() {
+            Demand::Cruise => Qos::Utility,
+            Demand::Ease => Qos::Initiated,
+            Demand::Boost | Demand::Hitch => normal,
+        },
+    }
+}
+
+/// Shader compiles stay on the compile pool, never the game thread.
+/// User-initiated during a load (still performance cores, below the frame),
+/// utility once play is steady.
+pub fn compile_qos() -> Qos {
+    match mode() {
+        Mode::Off => Qos::Initiated,
+        Mode::FullE => Qos::Utility,
+        Mode::Hybrid => match demand() {
+            Demand::Boost | Demand::Hitch => Qos::Initiated,
+            Demand::Ease | Demand::Cruise => Qos::Utility,
+        },
+    }
+}
+
+/// BC decompression stays on the decode pool. A streaming burst wants it
+/// on performance cores; steady play wants efficiency cores.
+pub fn decompress_qos() -> Qos {
+    match mode() {
+        Mode::Off => Qos::Initiated,
+        Mode::FullE => Qos::Utility,
+        Mode::Hybrid => match demand() {
+            Demand::Boost => Qos::Interactive,
+            Demand::Hitch | Demand::Ease | Demand::Cruise => Qos::Utility,
+        },
     }
 }
 
 fn placement_stamp() -> u64 {
-    PLACEMENT.load(Ordering::Relaxed) << 2 | u64::from(efficiency_mode()) << 1 | u64::from(efficiency_cores())
+    let mode = mode() as u64;
+    let demand = demand() as u64;
+    PLACEMENT.load(Ordering::Relaxed) << 8 | mode << 4 | demand
 }
 
 fn install_engine(role: Role) {
-    if role == Role::Audio && !efficiency_mode() {
+    if role == Role::Audio {
         set_audio();
         return;
     }
-    match sched::class_for(role, efficiency_cores(), efficiency_mode()) {
+    match sched::class_for(role, mode(), demand()) {
         Class::Interactive => set(Qos::Interactive),
         Class::Initiated => set(Qos::Initiated),
         Class::Utility => set(Qos::Utility),
@@ -183,10 +320,10 @@ fn install_engine(role: Role) {
 }
 
 /// Runs `body` at `qos`, then puts the previous class back. No change when
-/// efficiency placement is off, or when the current class cannot be read
-/// (the calling thread must not be left in the lower class).
+/// efficiency is off, or when the current class cannot be read (the calling
+/// thread must not be left in the lower class).
 pub fn lower<R>(qos: Qos, body: impl FnOnce() -> R) -> R {
-    let _guard = if efficiency_cores() { push(qos) } else { None };
+    let _guard = if mode() != Mode::Off { push(qos) } else { None };
     body()
 }
 
@@ -328,6 +465,90 @@ fn current_nice() -> Option<i32> {
     }
 }
 
+/// Apple: the audio callback is a real-time thread. QoS alone still loses
+/// to a user-interactive game thread; a time-constraint policy does not, and
+/// an audio workgroup tells the scheduler this thread feeds the device.
+#[cfg(target_vendor = "apple")]
+mod realtime {
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::sync::OnceLock;
+
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+
+    #[repr(C)]
+    struct TimeConstraint {
+        period: u32,
+        computation: u32,
+        constraint: u32,
+        preemptible: u32,
+    }
+
+    unsafe extern "C" {
+        fn mach_timebase_info(info: *mut Timebase) -> c_int;
+    }
+
+    type Create = unsafe extern "C" fn(*const c_char, *mut c_void) -> *mut c_void;
+    type Join = unsafe extern "C" fn(*mut c_void, *mut u64) -> c_int;
+
+    pub fn promote() {
+        unsafe {
+            let mut info = Timebase { numer: 0, denom: 0 };
+            if mach_timebase_info(&mut info) != 0 || info.numer == 0 || info.denom == 0 {
+                return;
+            }
+            // 256 frames at 48 kHz. The callback only copies that quantum.
+            let ticks = |ns: u64| -> u32 {
+                ns.saturating_mul(info.denom as u64).saturating_div(info.numer as u64).min(u32::MAX as u64) as u32
+            };
+            let period = ticks(5_333_333);
+            let mut policy =
+                TimeConstraint { period, computation: ticks(1_000_000), constraint: period, preemptible: 1 };
+            let _ = libc::thread_policy_set(
+                libc::pthread_mach_thread_np(libc::pthread_self()),
+                2 as libc::thread_policy_flavor_t,
+                &mut policy as *mut TimeConstraint as libc::thread_policy_t,
+                4 as libc::mach_msg_type_number_t,
+            );
+            join_workgroup();
+        }
+    }
+
+    fn join_workgroup() {
+        static GROUP: OnceLock<usize> = OnceLock::new();
+        let group = *GROUP.get_or_init(|| unsafe {
+            let name = c"os_workgroup_create".as_ptr();
+            let create = libc::dlsym(libc::RTLD_DEFAULT, name);
+            if create.is_null() {
+                return 0;
+            }
+            let create: Create = std::mem::transmute(create);
+            create(c"glue5.audio".as_ptr(), std::ptr::null_mut()) as usize
+        });
+        if group == 0 {
+            return;
+        }
+        unsafe {
+            let join = libc::dlsym(libc::RTLD_DEFAULT, c"os_workgroup_join".as_ptr());
+            if join.is_null() {
+                return;
+            }
+            let join: Join = std::mem::transmute(join);
+            // The token has to outlive the join. 16 u64s is larger than the
+            // 64-byte token the header publishes.
+            thread_local! {
+                static TOKEN: std::cell::UnsafeCell<[u64; 16]> = const { std::cell::UnsafeCell::new([0; 16]) };
+            }
+            TOKEN.with(|token| {
+                let _ = join(group as *mut c_void, token.get().cast());
+            });
+        }
+    }
+}
+
 /// A frame was shown `took` after the one before, for `target`.
 pub fn frame(took: std::time::Duration, target: std::time::Duration) {
     #[cfg(target_os = "android")]
@@ -341,7 +562,7 @@ pub fn frame(took: std::time::Duration, target: std::time::Duration) {
 /// game that never fully loads one thread, as the engine's pipeline does.
 #[cfg(target_os = "android")]
 mod hint {
-    use std::ffi::{c_void, CStr};
+    use std::ffi::{CStr, c_void};
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 

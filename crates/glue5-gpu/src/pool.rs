@@ -32,12 +32,7 @@ impl Pool {
                             let mut queues = lock.lock().unwrap();
                             loop {
                                 if let Some(job) = queues.urgent.pop_front() {
-                                    let class = if glue5_runtime::qos::efficiency_mode() {
-                                        glue5_runtime::qos::Qos::Utility
-                                    } else {
-                                        glue5_runtime::qos::Qos::Initiated
-                                    };
-                                    break (job, class);
+                                    break (job, glue5_runtime::qos::compile_qos());
                                 }
                                 if let Some(job) = queues.background.pop_front() {
                                     break (job, glue5_runtime::qos::Qos::Utility);

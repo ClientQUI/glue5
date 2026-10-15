@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use glue5_gpu::{Presentation, Screen, Upscaler};
 use glue5_runtime::exit::Exit;
-use glue5_runtime::input::{mouse, Gamepad, InputBlock};
+use glue5_runtime::input::{Gamepad, InputBlock, mouse};
 use glue5_runtime::layout::is_game_dir;
 use sdl3::event::{Event, WindowEvent};
 use sdl3::keyboard::Scancode;
@@ -106,8 +106,7 @@ pub fn run() -> Result<()> {
         Err(e) => log::warn!("diagnostics: cannot start in {}: {e}", diagnostics_dir.display()),
     }
     let mut settings = Settings::load(&user_dir);
-    glue5_runtime::qos::set_efficiency_cores(settings.efficiency_cores_on());
-    glue5_runtime::qos::set_efficiency_mode(settings.efficiency_mode_on());
+    glue5_runtime::qos::set_mode(settings.runtime_mode());
     // Before the GPU opens; turned on later, it shows from the next launch.
     let metal_hud = cfg!(target_vendor = "apple") && settings.overlay == PerfOverlay::MetalHud;
     if metal_hud {
@@ -163,7 +162,9 @@ pub fn run() -> Result<()> {
             // applicationWillTerminate. SDL delivers the first as will-enter-background.
             // The process can be killed as soon as this returns, so the save is
             // flushed here rather than on the next turn of the loop.
-            Event::AppWillEnterBackground { .. } | Event::AppDidEnterBackground { .. } | Event::AppTerminating { .. } => {
+            Event::AppWillEnterBackground { .. }
+            | Event::AppDidEnterBackground { .. }
+            | Event::AppTerminating { .. } => {
                 life.background.store(true, Ordering::Relaxed);
                 life.flush();
             }
@@ -555,8 +556,13 @@ impl App {
             0
         });
         glue5_runtime::diagnostics::set_verbose_logs(self.settings.verbose_logs);
-        glue5_runtime::qos::set_efficiency_cores(self.settings.efficiency_cores_on());
-        glue5_runtime::qos::set_efficiency_mode(self.settings.efficiency_mode_on());
+        glue5_runtime::qos::set_mode(self.settings.runtime_mode());
+        if self.game.is_some()
+            && let Some(ms) = self.presentation.frame_interval_ms()
+        {
+            let budget = 1000.0 / self.effective_fps().max(1) as f32;
+            glue5_runtime::qos::note_frame(ms, budget);
+        }
         glue5_gpu::set_distance_policy(self.settings.distance_policy());
         self.adapt_graphics();
         self.resize_game();
@@ -748,7 +754,8 @@ impl App {
     fn effective_fps(&self) -> u32 {
         let engine_cap = self.game.as_ref().and_then(|g| (g.started.max_fps > 0).then_some(g.started.max_fps));
         let requested = limited_fps(self.settings.max_fps, engine_cap);
-        limited_fps(requested, self.thermal_cap.filter(|_| self.settings.thermal_protection))
+        let thermal = limited_fps(requested, self.thermal_cap.filter(|_| self.settings.thermal_protection));
+        limited_fps(thermal, glue5_runtime::qos::pace_fps())
     }
 
     fn update_thermal(&mut self) {
@@ -870,6 +877,7 @@ impl App {
             resource_budget: s.resource_budget,
         };
         self.game = Some(Running { game, input: None, started, back_buffer, _audio: audio });
+        glue5_runtime::qos::note_load();
         self.ui.game_started();
         glue5_runtime::diagnostics::note(format_args!("game launch complete: waiting for engine input block"));
         Ok(())
@@ -1044,11 +1052,7 @@ fn wait_event(events: &mut sdl3::EventPump, timeout: Duration) -> Option<Event> 
 /// The refresh rate of the window's display (60 if unknown).
 fn window_refresh_rate(window: &sdl3::video::Window) -> f32 {
     let rate = window.get_display().ok().and_then(|d| d.get_mode().ok()).map_or(0.0, |m| m.refresh_rate);
-    if rate > 0.0 {
-        rate
-    } else {
-        60.0
-    }
+    if rate > 0.0 { rate } else { 60.0 }
 }
 
 /// The system's preferred language as a tag like `it-IT`, for the game

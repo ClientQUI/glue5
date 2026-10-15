@@ -491,17 +491,20 @@ impl Display {
         };
         // (Waits for the GPU to finish what it has: a window being resized
         // pays it once per frame.)
-        self.surface.configure(device, &wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            color_space: Default::default(),
-            width: w,
-            height: h,
-            present_mode,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: if linear != format { vec![linear] } else { vec![] },
-        });
+        self.surface.configure(
+            device,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                color_space: Default::default(),
+                width: w,
+                height: h,
+                present_mode,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                view_formats: if linear != format { vec![linear] } else { vec![] },
+            },
+        );
         self.surface_format = Some(format);
         self.format = Some(linear);
         self.configured = Some((w, h, vsync));
@@ -1200,6 +1203,9 @@ impl Gpu {
             self.screenshot(id, &name);
         }
         self.flush_with("present", present, true);
+        let jobs = self.decodes.len() as u32;
+        let bytes = self.decodes.iter().map(|d| d.bytes).sum();
+        glue5_runtime::qos::note_stream(bytes, jobs);
         let now = Instant::now();
         if let Some(last) = self.last_present.replace(now) {
             let ms = (now - last).as_secs_f32() * 1000.0;

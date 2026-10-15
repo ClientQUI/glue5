@@ -4,7 +4,6 @@ use std::sync::{Arc, OnceLock};
 
 use arrayvec::ArrayVec;
 use glue5_runtime::gpu::Command;
-use glue5_runtime::qos::{self, Qos};
 use rustc_hash::FxHashMap;
 use wgpu::{TextureFormat, TextureViewDimension};
 
@@ -397,17 +396,11 @@ impl Gpu {
         if self.settings.sync_pipelines {
             job();
         } else {
-            // Its draws are skipped meanwhile, nothing waits: in a lower
-            // class (efficiency cores, where there are some) it leaves the
-            // engine's threads their cores. A new pipeline takes ~200 ms
-            // of CPU on an A15, which has two performance cores.
-            self.pool.urgent(move || {
-                qos::set(Qos::Utility);
-                job();
-                if !qos::efficiency_mode() {
-                    qos::set(Qos::Initiated);
-                }
-            });
+            // Its draws are skipped meanwhile, nothing waits. The compile
+            // pool is not the game thread. It sits at user-initiated during
+            // a load and utility once play is steady (see qos::compile_qos).
+            // A new pipeline takes ~200 ms of CPU on an A15.
+            self.pool.urgent(job);
         }
         cell
     }

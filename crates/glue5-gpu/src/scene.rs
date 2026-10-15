@@ -227,6 +227,13 @@ impl Scene {
             reversed,
         };
         let position = [view_inverse[3][0], view_inverse[3][1], view_inverse[3][2]];
+        if let Some(prev) = self.lod_camera {
+            let (dx, dy, dz) = (position[0] - prev[0], position[1] - prev[1], position[2] - prev[2]);
+            // Further than a frame of driving. A warp, or the load that follows one.
+            if dx * dx + dy * dy + dz * dz > 80.0 * 80.0 {
+                glue5_runtime::qos::note_warp();
+            }
+        }
         self.lod_camera = Some(position);
         self.view = Some(View {
             view_proj: mul(&world_inv, &wvp),

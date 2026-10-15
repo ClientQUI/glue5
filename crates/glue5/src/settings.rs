@@ -70,15 +70,10 @@ pub struct Settings {
     pub shadow_distance: f32,
     /// Extra render scale while the device is cool. 1 keeps the chosen scale.
     pub render_boost: f32,
-    /// Audio, streaming and save threads prefer efficiency cores. The audio
-    /// callback, and the main, game, render and GPU threads, stay
-    /// user-interactive. `GLUE5_EFFICIENCY_CORES=0` forces this off.
-    pub efficiency_cores: bool,
-    /// Experimental. Every engine thread, including main, game and render,
-    /// and the GPU threads, run at utility QoS so iOS prefers efficiency
-    /// cores. FPS drops. Default off. `GLUE5_EFFICIENCY_MODE=1` forces it on
-    /// and `=0` forces it off.
-    pub efficiency_mode: bool,
+    /// Where threads sit. Hybrid is the recommended one: performance cores
+    /// while loading or hitching, efficiency cores once play is steady.
+    /// Audio stays immediate in every choice. `GLUE5_EFFICIENCY` forces one.
+    pub efficiency: Efficiency,
     pub touch: TouchMode,
     pub touch_opacity: f32,
     pub touch_size: f32,
@@ -105,6 +100,23 @@ pub struct Settings {
     /// Settings saved before the choice of overlays: Apple's HUD on or off.
     #[serde(skip_serializing)]
     metal_hud: Option<bool>,
+    /// Settings saved before the single Efficiency choice.
+    #[serde(skip_serializing)]
+    efficiency_cores: Option<bool>,
+    #[serde(skip_serializing)]
+    efficiency_mode: Option<bool>,
+}
+
+/// Where the engine's threads sit. Hybrid is the one to leave on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Efficiency {
+    Off,
+    /// Performance cores for loads and hitches, efficiency cores in steady play.
+    Hybrid,
+    /// Frame threads stay at utility. About 20 frames per second.
+    #[serde(rename = "full-e", alias = "full")]
+    FullE,
 }
 
 /// The performance overlay over the game.
@@ -307,18 +319,13 @@ fn distance_override(value: f32, builtin: f32) -> Option<f32> {
     }
 }
 
-/// `GLUE5_EFFICIENCY_CORES=0` keeps audio, streaming and saves with the game threads.
-pub fn efficiency_cores_killed() -> bool {
-    std::env::var("GLUE5_EFFICIENCY_CORES").ok().as_deref() == Some("0")
-}
-
-/// `Some(true)` when `GLUE5_EFFICIENCY_MODE=1`, `Some(false)` when `=0`.
-pub fn efficiency_mode_forced() -> Option<bool> {
-    match std::env::var("GLUE5_EFFICIENCY_MODE").ok().as_deref() {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
-        _ => None,
-    }
+/// The environment's efficiency choice, when one of the variables sets it.
+pub fn efficiency_forced() -> Option<Efficiency> {
+    glue5_runtime::qos::forced_mode().map(|mode| match mode {
+        glue5_runtime::sched::Mode::Off => Efficiency::Off,
+        glue5_runtime::sched::Mode::Hybrid => Efficiency::Hybrid,
+        glue5_runtime::sched::Mode::FullE => Efficiency::FullE,
+    })
 }
 
 fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -386,8 +393,7 @@ impl Default for Settings {
             tree_distance: default_tree_distance(),
             shadow_distance: default_shadow_distance(),
             render_boost: 1.0,
-            efficiency_cores: true,
-            efficiency_mode: false,
+            efficiency: Efficiency::Hybrid,
             touch: TouchMode::Auto,
             touch_opacity: 0.6,
             touch_size: 1.0,
@@ -400,6 +406,8 @@ impl Default for Settings {
             render_height: None,
             metalfx: None,
             metal_hud: None,
+            efficiency_cores: None,
+            efficiency_mode: None,
         }
     }
 }
@@ -461,6 +469,13 @@ impl Settings {
         if settings.metal_hud.take() == Some(true) {
             settings.overlay = PerfOverlay::MetalHud;
         }
+        let full = settings.efficiency_mode.take();
+        let cores = settings.efficiency_cores.take();
+        if full == Some(true) {
+            settings.efficiency = Efficiency::FullE;
+        } else if cores == Some(false) {
+            settings.efficiency = Efficiency::Off;
+        }
         settings
     }
 
@@ -495,8 +510,7 @@ impl Settings {
         self.shadow_distance = fresh.shadow_distance;
         self.render_boost = fresh.render_boost;
         self.thermal_protection = fresh.thermal_protection;
-        self.efficiency_cores = fresh.efficiency_cores;
-        self.efficiency_mode = fresh.efficiency_mode;
+        self.efficiency = fresh.efficiency;
         self.adaptive_graphics = fresh.adaptive_graphics;
         let lines = if MOBILE { 720.0 } else { 1080.0 };
         self.render_scale = Some(round_scale(lines / window_height.max(1) as f32));
@@ -504,16 +518,16 @@ impl Settings {
         self.scaling_custom = false;
     }
 
-    /// Efficiency-core placement, after the env kill switch.
-    pub fn efficiency_cores_on(&self) -> bool {
-        if efficiency_cores_killed() { false } else { self.efficiency_cores }
+    /// The efficiency choice the process should use, after the environment.
+    pub fn efficiency_now(&self) -> Efficiency {
+        efficiency_forced().unwrap_or(self.efficiency)
     }
 
-    /// Experimental all-threads utility test, after `GLUE5_EFFICIENCY_MODE`.
-    pub fn efficiency_mode_on(&self) -> bool {
-        match efficiency_mode_forced() {
-            Some(forced) => forced,
-            None => self.efficiency_mode,
+    pub fn runtime_mode(&self) -> glue5_runtime::sched::Mode {
+        match self.efficiency_now() {
+            Efficiency::Off => glue5_runtime::sched::Mode::Off,
+            Efficiency::Hybrid => glue5_runtime::sched::Mode::Hybrid,
+            Efficiency::FullE => glue5_runtime::sched::Mode::FullE,
         }
     }
 
@@ -669,6 +683,12 @@ mod tests {
         assert_eq!(Settings::load(&dir).overlay, PerfOverlay::MetalHud);
         std::fs::write(dir.join("glue5.json"), r#"{"metal_hud": false}"#).unwrap();
         assert_eq!(Settings::load(&dir).overlay, PerfOverlay::Off);
+        std::fs::write(dir.join("glue5.json"), r#"{"efficiency_mode": true}"#).unwrap();
+        assert_eq!(Settings::load(&dir).efficiency, Efficiency::FullE);
+        std::fs::write(dir.join("glue5.json"), r#"{"efficiency_cores": false}"#).unwrap();
+        assert_eq!(Settings::load(&dir).efficiency, Efficiency::Off);
+        std::fs::write(dir.join("glue5.json"), r#"{"efficiency_cores": true, "efficiency_mode": false}"#).unwrap();
+        assert_eq!(Settings::load(&dir).efficiency, Efficiency::Hybrid);
         std::fs::write(dir.join("glue5.json"), r#"{"metalfx":true,"resource_budget":"Compact","texture_detail":"Minimal","render_lines":480,"upscale_lines":720,"world_preset":"Eco","max_fps":30}"#).unwrap();
         let migrated = Settings::load(&dir);
         assert_eq!(migrated.upscaler, Upscaling::MetalFx);
@@ -676,8 +696,7 @@ mod tests {
         assert_eq!(migrated.texture_detail.max_dimension(), 256);
         assert_eq!(migrated.world_preset, WorldPreset::Eco);
         assert!(migrated.fog);
-        assert!(migrated.efficiency_cores);
-        assert!(!migrated.efficiency_mode);
+        assert_eq!(migrated.efficiency, Efficiency::Hybrid);
         assert_eq!(migrated.overlay, PerfOverlay::Off);
         assert_eq!(migrated.render_boost, 1.0);
         assert_eq!(migrated.distance_policy().render_boost, 1.0);
@@ -742,7 +761,7 @@ mod tests {
         assert_eq!(s.texture_detail, TextureDetail::Original);
         assert_eq!(s.resource_budget, ResourceBudget::Auto);
         assert!(s.render_lines.is_none());
-        assert!(!s.efficiency_mode);
+        assert_eq!(s.efficiency, Efficiency::Hybrid);
         s.performance_profile(0);
         let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
         assert_eq!(restored.render_lines, Some(480));

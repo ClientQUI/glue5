@@ -5,34 +5,35 @@
 //! has its own thread. Every few milliseconds it pulls whatever the mixer has
 //! written into a local buffer and keeps the mixer's heartbeat alive, so a
 //! stalled frame or a background present does not look like a device that
-//! went away. With efficiency placement on, that pump and the game's mixer
-//! run at utility QoS (efficiency cores). The callback only copies the
-//! buffer and stays user-interactive, which is the deadline. Playback starts
-//! once 100 ms is buffered, and waits for that again after a real underrun
-//! instead of playing the gaps. A pump stall inside that cushion does not
-//! reach the speakers (`glue5_runtime`'s playback measure).
+//! went away. The pump, the game's mixer and the callback stay
+//! user-interactive in every efficiency mode. On Apple the callback also
+//! takes a time-constraint schedule and joins an audio workgroup. Playback
+//! starts once the cushion is buffered (100 ms with efficiency off, 250 ms
+//! in hybrid and full-E) and waits for that again after a real underrun.
+//! A pump stall inside that cushion does not reach the speakers
+//! (`glue5_runtime`'s playback measure).
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use glue5_runtime::audio::{AudioOut, CHANNELS, SAMPLE_RATE};
 use glue5_runtime::qos;
 use sdl3::audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream, AudioStreamWithCallback};
 
-/// Room if the mixer gets ahead of the device. Playback does not start until
-/// [`PRIME_FRAMES`] are in, so a hitch shorter than that cushion does not
-/// reach the speakers. Capacity is the most a burst can add on top.
-const CAP_FRAMES: usize = 16384; // power of two, 341 ms at 48 kHz
-/// Play only after this much is buffered, and again after an underrun.
-const PRIME_FRAMES: usize = 48_000 * 100 / 1000;
+/// Room if the mixer gets ahead of the device. The 250 ms efficiency cushion
+/// fits, with space for a burst on top.
+const CAP_FRAMES: usize = 32768; // power of two, 682 ms at 48 kHz
 /// The pump's period. Shorter than the device quantum, so the buffer refills
 /// between callbacks.
 const PUMP_PERIOD: Duration = Duration::from_millis(4);
 const PULL_FRAMES: usize = 256;
+/// While the cushion is not full, drain the game's ring in larger pieces so
+/// a slow game thread does not leave audio sitting in the 64 ms mixer buffer.
+const CATCHUP_FRAMES: usize = 2048;
 
 /// Playing while alive.
 pub struct Audio {
@@ -88,34 +89,31 @@ pub fn start(subsystem: &sdl3::AudioSubsystem, out: AudioOut) -> Result<Audio> {
     stream.resume().map_err(|e| anyhow!("SDL audio: {e}"))?;
     log::info!(
         "audio: {SAMPLE_RATE} Hz stereo, {} ms ahead of the device, own thread ({})",
-        PRIME_FRAMES * 1000 / SAMPLE_RATE as usize,
+        qos::audio_prime_frames(SAMPLE_RATE) * 1000 / SAMPLE_RATE as usize,
         subsystem.current_audio_driver()
     );
     Ok(Audio { stream, stop, pump: Some(pump) })
 }
 
 fn pump(out: AudioOut, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
-    let mut placed = None;
-    let mut scratch = vec![0f32; PULL_FRAMES * CHANNELS];
+    qos::set_audio();
+    let mut scratch = vec![0f32; CATCHUP_FRAMES * CHANNELS];
     while !stop.load(Ordering::Acquire) {
-        let on = qos::efficiency_cores() || qos::efficiency_mode();
-        if placed != Some(on) {
-            qos::set_audio();
-            placed = Some(on);
-        }
+        let prime = qos::audio_prime_frames(SAMPLE_RATE);
         let free = shared.playback.free();
         if free == 0 {
             // The device is behind. Leave the game's 64 ms where it is and
             // only prove the consumer is still running.
             out.heartbeat();
         } else {
-            let frames = free.min(PULL_FRAMES);
+            let want = if shared.playback.filled() < prime { CATCHUP_FRAMES } else { PULL_FRAMES };
+            let frames = free.min(want);
             let samples = frames * CHANNELS;
             let mixed = out.read(&mut scratch[..samples]);
             if mixed > 0 {
                 shared.playback.write(&scratch[..mixed * CHANNELS]);
             }
-            if shared.playback.filled() >= PRIME_FRAMES {
+            if shared.playback.filled() >= prime {
                 shared.live.store(true, Ordering::Release);
             }
         }
@@ -303,8 +301,9 @@ mod tests {
     fn priming_waits_for_the_cushion() {
         let shared = Shared::new();
         assert!(!shared.live.load(Ordering::Acquire));
-        let tone: Vec<f32> = (0..PRIME_FRAMES * CHANNELS).map(|i| (i % 7) as f32).collect();
-        assert_eq!(shared.playback.write(&tone), PRIME_FRAMES);
-        assert!(shared.playback.filled() >= PRIME_FRAMES);
+        let prime = 48_000 * 250 / 1000;
+        let tone: Vec<f32> = (0..prime * CHANNELS).map(|i| (i % 7) as f32).collect();
+        assert_eq!(shared.playback.write(&tone), prime);
+        assert!(shared.playback.filled() >= prime);
     }
 }

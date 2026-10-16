@@ -572,6 +572,28 @@ mod tests {
         assert_eq!(super::resolve_cash_get(Some(0), Some(200), Some(200)), (0, None));
         assert_eq!(super::resolve_cash_get(Some(0), Some(40), Some(200)), (40, Some(40)));
     }
+
+    #[test]
+    fn a_stock_trade_changes_cash_and_share_counts_are_not_cash() {
+        // The phone spends `SPn_TOTAL_CASH`: $500, buy $120, then sell for $200.
+        let bought = super::accept_cash_set(Some(500), 380);
+        assert!(bought.forward);
+        assert_eq!(bought.keep, Some(380));
+        assert_eq!(bought.pin_against, None);
+        let sold = super::accept_cash_set(Some(380), 580);
+        assert!(sold.forward);
+        assert_eq!(sold.keep, Some(580));
+        // Shares owned are `AMU_OW0` and the rest, one stat per stock per
+        // character. They mirror the story save; a 0 written when a BAWSAQ
+        // price is missing must not be treated as spending the wallet.
+        assert_eq!(super::joaat(b"AMU_OW0"), 0x8248_4e3b);
+        assert_eq!(super::joaat(b"AMU_OW1"), 0x7109_abbe);
+        assert_eq!(super::joaat(b"AMU_OW2"), 0x1e94_06d4);
+        assert_eq!(super::joaat(b"SM_PRICE_AMU"), 0xaf1b_8cbd);
+        assert!(!super::is_cash_hash(super::joaat(b"AMU_OW0")));
+        assert!(!super::is_cash_hash(super::joaat(b"HAL_OW2")));
+        assert!(!super::is_cash_hash(super::joaat(b"SM_PRICE_AMU")));
+    }
 }
 
 /// Stat commands for story and online. Story cash never reached these when

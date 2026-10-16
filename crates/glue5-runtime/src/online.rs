@@ -158,6 +158,29 @@ pub(crate) unsafe extern "C" fn live_manager_init(env: *mut Env, mode: u32) {
     unsafe { populate_store_data(env) };
 }
 
+/// Story mode's stock page does not read `SPn_TOTAL_CASH`. It reads the
+/// script global the game copies that stat into, and only while
+/// `NETWORK_IS_SIGNED_IN` (`main` once a second, and again at the start of
+/// a buy or sell). The global is not in the story save, so after a restart
+/// it is 0: the page shows an empty wallet, a buy is capped to $0, and a
+/// sell would write the proceeds over the real balance.
+///
+/// The same profile-manager stand-in online uses makes that native true.
+/// Social Club stays uninitialized, and the commerce catalogue is not
+/// touched. Shares, the price paid and which stock are the story save's
+/// script block (Drive already syncs that profile), not these stats.
+pub(crate) unsafe extern "C" fn story_live_manager_init(env: *mut Env, mode: u32) {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| unsafe { install(env) });
+    unsafe { orig::live_manager_init(env, mode) };
+}
+
+/// Signs the story player in so stock trades see the cash stat. Online
+/// installs this itself, with the rest of its hooks.
+pub(crate) fn story_sign_in(hooks: &mut glue5_game::Hooks) {
+    hooks.live_manager_init = Some(story_live_manager_init);
+}
+
 /// Hook for `CLiveManager::Update(unsigned int)`: the device's network
 /// stays up (see `vnet::network_up`).
 pub(crate) unsafe extern "C" fn live_manager_update(env: *mut Env, mode: u32) {

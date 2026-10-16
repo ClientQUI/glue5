@@ -369,6 +369,11 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     cloud::stat_authority_hook(&mut hooks);
     if let Some(online) = &rt().config.online {
         online::start(online, &mut hooks);
+    } else {
+        // A stock buy or sell spends the script's copy of the cash stat.
+        // That copy is refreshed only while the profile manager says signed
+        // in, which online installs and story did not.
+        online::story_sign_in(&mut hooks);
     }
     glue5_game::install(glue5_game::imports_from!(imports), hooks);
     let engine = threads::spawn_main()?;

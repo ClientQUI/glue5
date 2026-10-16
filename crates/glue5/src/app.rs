@@ -25,7 +25,7 @@ use sdl3::mouse::MouseButton;
 use crate::haptics;
 use crate::paths::{self, MOBILE};
 use crate::settings::{self, PerfOverlay, Settings, TouchMode, Upscaling};
-use crate::touch::Touch;
+use crate::touch::{self, Touch};
 use crate::ui::{self, Action, Mode, Page, Started, Status, Ui};
 use crate::{audio, benchmark, keymap, pads};
 
@@ -38,6 +38,9 @@ const GEAR_ALONE: f32 = 0.35;
 const FAILURE_FILE: &str = "last-failure.txt";
 /// How long the pointer waits to be captured once it should be (`App::pointer`).
 const CAPTURE_DELAY: Duration = Duration::from_millis(150);
+
+/// Esc's Windows virtual-key code: back, in the game's menus.
+const VK_ESCAPE: u8 = 0x1B;
 
 #[cfg(test)]
 mod performance_tests {
@@ -222,6 +225,7 @@ pub fn run() -> Result<()> {
         touch: Touch::new(),
         touch_input: MOBILE,
         touch_shown: false,
+        touch_mouse: Default::default(),
         lifecycle,
         folder: None,
         game_dir: None,
@@ -347,6 +351,9 @@ struct App {
     /// not enough, phones often have a paired controller lying around).
     touch_input: bool,
     touch_shown: bool,
+    /// What the touch controls last did with the mouse and Esc (the pause
+    /// menu's).
+    touch_mouse: touch::Mouse,
     lifecycle: Arc<Lifecycle>,
     folder: Option<FolderPick>,
     /// The game's folder, once found.
@@ -551,11 +558,52 @@ impl App {
             self.touch_shown = show;
             self.touch.clear();
             glue5_runtime::input::set_gamepad(0, Gamepad::default());
+            if let Some(input) = self.game.as_ref().and_then(|g| g.input.as_ref()) {
+                if self.touch_mouse.down {
+                    input.mouse_button(mouse::LEFT, false);
+                }
+                if self.touch_mouse.back {
+                    input.key(VK_ESCAPE, false);
+                }
+            }
+            self.touch_mouse = Default::default();
         }
+        glue5_runtime::input::set_touch_play(show);
+        glue5_runtime::input::set_touch_targeting(self.settings.touch_aim.targeting());
         if show {
             self.touch.haptics = self.settings.haptics;
+            self.touch.camera_speed = self.settings.touch_camera;
+            self.touch.aim_locked = glue5_runtime::input::aim_locked();
             self.touch.layout(ui::screen_size(&self.window), ui::safe_rect(&self.window), self.settings.touch_size);
+            self.touch.set_context(glue5_runtime::input::player_context());
             glue5_runtime::input::set_gamepad(0, self.touch.gamepad());
+            let look = self.touch.take_look();
+            let mouse = self.touch.take_mouse();
+            if let Some(game) = &self.game
+                && let Some(input) = &game.input
+            {
+                // The camera, dragged: as a mouse turns it.
+                if look != (0, 0) {
+                    input.mouse_motion(look.0, look.1);
+                }
+                // The pause menu: a finger is the mouse.
+                if mouse.at != self.touch_mouse.at
+                    && let Some(at) = mouse.at
+                {
+                    let (w, h) = game.back_buffer;
+                    input.mouse_position((at.x * w as f32) as i32, (at.y * h as f32) as i32);
+                }
+                if mouse.down != self.touch_mouse.down {
+                    input.mouse_button(mouse::LEFT, mouse.down);
+                }
+                if mouse.wheel != 0 {
+                    input.mouse_wheel(mouse.wheel);
+                }
+                if mouse.back != self.touch_mouse.back {
+                    input.key(VK_ESCAPE, mouse.back);
+                }
+                self.touch_mouse = mouse;
+            }
             if self.settings.haptics {
                 haptics::rumble(glue5_runtime::input::rumble(0));
             }

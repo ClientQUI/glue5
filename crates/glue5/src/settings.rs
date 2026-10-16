@@ -77,6 +77,11 @@ pub struct Settings {
     pub touch: TouchMode,
     pub touch_opacity: f32,
     pub touch_size: f32,
+    /// How fast a finger's drag turns the camera.
+    pub touch_camera: f32,
+    /// The aim assist while playing by touch (the game's Targeting Mode,
+    /// in place of its menu's).
+    pub touch_aim: TouchAim,
     /// The Taptic Engine taps under pressed touch controls and plays the game's rumble (iPhone).
     pub haptics: bool,
     /// Copy saves and these settings through Google Drive on iPhone, iPad and
@@ -204,6 +209,34 @@ pub enum TouchMode {
     Auto,
     Always,
     Off,
+}
+
+/// The aim assist while playing by touch: one of the game's targeting modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TouchAim {
+    /// Aiming locks on to the nearest target and follows it (Assisted Aim -
+    /// Full).
+    LockOn,
+    /// Aiming snaps to the target, then the finger aims (Assisted Aim -
+    /// Partial).
+    Snap,
+    /// The camera slows down over targets (Free Aim - Assisted).
+    SlowDown,
+    /// Free Aim.
+    Off,
+}
+
+impl TouchAim {
+    pub fn targeting(self) -> glue5_runtime::input::Targeting {
+        use glue5_runtime::input::Targeting;
+        match self {
+            TouchAim::LockOn => Targeting::Full,
+            TouchAim::Snap => Targeting::Partial,
+            TouchAim::SlowDown => Targeting::FreeAssisted,
+            TouchAim::Off => Targeting::Free,
+        }
+    }
 }
 
 /// Phones and tablets with less RAM start with the low-memory profile (the
@@ -415,6 +448,8 @@ impl Default for Settings {
             touch: TouchMode::Auto,
             touch_opacity: 0.6,
             touch_size: 1.0,
+            touch_camera: 1.0,
+            touch_aim: TouchAim::LockOn,
             haptics: true,
             google_drive: false,
             google_client_id_ios: String::new(),

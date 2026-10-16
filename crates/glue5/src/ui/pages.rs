@@ -6,7 +6,7 @@ use super::{Action, Page, SettingsTab, Status, WARN, theme};
 use crate::paths::MOBILE;
 use crate::settings::{
     self, Corner, Efficiency, OverlayDetail, PerfOverlay, RENDER_SCALES, ResourceBudget, Settings, TextureDetail,
-    TouchMode, Upscaling, WorldDetail, WorldPreset,
+    TouchAim, TouchMode, Upscaling, WorldDetail, WorldPreset,
 };
 use egui::{Align, Align2, Id, Layout, RichText, vec2};
 
@@ -437,6 +437,25 @@ fn settings_items(
             setting(ui, "Opacity", Control::Slider, None, |ui| {
                 slider(ui, &mut settings.touch_opacity, 0.2..=1.0, 0.01, "%", 0)
             });
+            setting(ui, "Camera speed", Control::Slider, None, |ui| {
+                slider(ui, &mut settings.touch_camera, 0.25..=3.0, 0.05, "×", 2)
+            });
+            setting(ui, "Aim assist", Control::Choice, None, |ui| {
+                choice(
+                    ui,
+                    &mut settings.touch_aim,
+                    &[
+                        (TouchAim::LockOn, "Lock-on"),
+                        (TouchAim::Snap, "Snap"),
+                        (TouchAim::SlowDown, "Slow-down"),
+                        (TouchAim::Off, "Off"),
+                    ],
+                )
+            })
+            .on_hover_text(
+                "Lock-on: aiming locks on to the nearest target and follows it. Snap: aiming snaps to the target, \
+                 then you aim. Slow-down: the camera slows down over targets. Off: free aim",
+            );
             if crate::haptics::SUPPORTED {
                 setting(ui, "Haptics", Control::Toggle, None, |ui| toggle(ui, &mut settings.haptics));
             }

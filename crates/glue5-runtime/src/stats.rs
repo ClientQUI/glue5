@@ -10,6 +10,7 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use glue5_game::{Env, orig};
 
@@ -23,6 +24,9 @@ thread_local! {
     /// `engine_or` throw away the engine's value and answer 0.
     static WANTED: Cell<u32> = const { Cell::new(0) };
     static WANTED_ON: Cell<bool> = const { Cell::new(false) };
+    /// Inside [`apply_stored_cash`], so its own stat lookup is not logged as
+    /// the HUD's.
+    static APPLYING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Stat values by key: `h<hash>` (int, float bits, or bool), `p<slot>:<index>`
@@ -122,8 +126,13 @@ fn lookup_missing(wanted_on: bool, wanted: u32, id_hash: u32, found: u32, missin
 /// Hooks for `CStatsDataMgr::StatIterFind(StatId const&, Iterator&)` and
 /// `packed_stats::GetStatKey(StatId&, int, int)`: the engine's lookups.
 pub(crate) unsafe extern "C" fn stat_find(env: *mut Env, id: u64, iter: u64) -> u32 {
-    let found = unsafe { orig::stat_find(env, id, iter) };
     let id_hash = unsafe { Mem::of(env) }.u32(id);
+    // A cash lookup that is not the script command's own. The corner HUD
+    // reads the stat in this map; it does not call `CommandStatGetInt`.
+    if is_cash_hash(id_hash) && !APPLYING.get() && (!WANTED_ON.get() || WANTED.get() != id_hash) {
+        note_cash_lookup(id_hash, false);
+    }
+    let found = unsafe { orig::stat_find(env, id, iter) };
     MISSING.set(lookup_missing(WANTED_ON.get(), WANTED.get(), id_hash, found, MISSING.get()));
     found
 }
@@ -257,14 +266,13 @@ pub(crate) unsafe extern "C" fn get_int(env: *mut Env, hash: u32, out: u64, play
     })
 }
 
-/// Story cash. The HUD balance is `SPn_TOTAL_CASH`; the green "+$" line is
-/// only the change. A stored 0 (the value extra-stats.txt had after a story
-/// earn) must not hide the engine: that 0 is what the signed-in sync copies
-/// into the script global and then writes back. A balance this session has
-/// set still wins when the engine reads 0. The story profile under
-/// `Documents/Rockstar Games/GTA V/` is the engine's copy of this same stat,
-/// not a second wallet.
+/// Story cash for scripts (`STAT_GET_INT`). The corner HUD does not call
+/// this. It reads the int in `CStatsDataMgr`, which [`apply_stored_cash`]
+/// keeps equal to the stored balance. The green "+$" line is only the
+/// change. A stored 0 must not hide a balance the story save already loaded.
+/// A balance this session has set still wins when the engine reads 0.
 unsafe fn cash_get(env: *mut Env, hash: u32, out: u64, player: u32) -> u32 {
+    note_cash_lookup(hash, true);
     let stored_v = stored(&hash_key(hash));
     let pinned = cash_pin(hash);
     if pinned.is_none() && stored_v.is_some_and(|value| value != 0) {
@@ -417,8 +425,11 @@ const fn joaat(name: &[u8]) -> u32 {
     hash.wrapping_add(hash << 15)
 }
 
-/// Story cash (`SPn_TOTAL_CASH`) and the online wallet and bank. The HUD
-/// reads these; the "+$" / "-$" line is a separate change popup.
+/// Story cash (`SPn_TOTAL_CASH`) and the online wallet and bank. The corner
+/// HUD and the phone's cash copy both follow these ints in the stats map.
+/// The "+$" / "-$" line is a separate change popup. Share counts
+/// (`AMU_OW0` and the rest) are not here: a 0 written when a BAWSAQ price
+/// is missing must not be pinned like a wallet.
 const CASH_STATS: &[u32] = &[
     joaat(b"SP0_TOTAL_CASH"),
     joaat(b"SP1_TOTAL_CASH"),
@@ -438,6 +449,131 @@ const CASH_STATS: &[u32] = &[
 
 fn is_cash_hash(hash: u32) -> bool {
     CASH_STATS.contains(&hash)
+}
+
+fn cash_index(hash: u32) -> Option<usize> {
+    CASH_STATS.iter().position(|&candidate| candidate == hash)
+}
+
+/// First sight of a cash hash, per path. Fourteen stats, two paths, so the
+/// bit is `index` or `index + 16`.
+static CASH_SEEN: AtomicU32 = AtomicU32::new(0);
+static CASH_WAITING: AtomicU32 = AtomicU32::new(0);
+
+fn note_cash_lookup(hash: u32, script_command: bool) {
+    let Some(index) = cash_index(hash) else { return };
+    debug_assert!(index < 16);
+    let bit = 1u32 << (index + if script_command { 16 } else { 0 });
+    if CASH_SEEN.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    if script_command {
+        log::info!("stats: h{hash:08x} read by StatGetInt");
+    } else {
+        log::info!("stats: h{hash:08x} read from the stats map, outside StatGetInt");
+    }
+}
+
+fn note_cash_waiting(hash: u32) {
+    let Some(index) = cash_index(hash) else { return };
+    let bit = 1u32 << index;
+    if CASH_WAITING.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    log::info!("stats: h{hash:08x} is in extra-stats but not in the stats map yet");
+}
+
+fn log_cash_write(hash: u32, current: i64, desired: i64) {
+    static LAST: Mutex<[i64; 16]> = Mutex::new([i64::MIN; 16]);
+    let Some(index) = cash_index(hash) else { return };
+    let mut last = LAST.lock().unwrap_or_else(|err| err.into_inner());
+    if last[index] == desired {
+        return;
+    }
+    last[index] = desired;
+    log::info!("stats: h{hash:08x} engine cash is {current}; the HUD reads that stat, writing {desired}");
+}
+
+/// `seed` is an engine balance to remember. `write` is the value to put into
+/// the engine stat the HUD reads. `None` leaves that stat alone: it already
+/// matches, or it is not in the map yet (`engine` is `None`).
+fn cash_publish(stored: Option<i64>, engine: Option<i64>, pinned: Option<i64>) -> (Option<i64>, Option<i64>) {
+    let (value, seed) = resolve_cash_get(stored, engine, pinned);
+    let write = match engine {
+        Some(current) if current != value => Some(value),
+        _ => None,
+    };
+    (seed, write)
+}
+
+/// A word in the game heap for `CommandStatGetInt`'s out parameter.
+fn cash_word(env: *mut Env) -> u64 {
+    static SLOT: AtomicU64 = AtomicU64::new(0);
+    let existing = SLOT.load(Ordering::Relaxed);
+    if existing != 0 {
+        return existing;
+    }
+    let allocated = unsafe { orig::builtin_malloc(env, 4) };
+    if allocated != 0 {
+        let _ = SLOT.compare_exchange(0, allocated, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    SLOT.load(Ordering::Relaxed)
+}
+
+struct ClearApply;
+
+impl Drop for ClearApply {
+    fn drop(&mut self) {
+        APPLYING.set(false);
+    }
+}
+
+/// Writes stored cash into the stats-map ints the corner HUD reads.
+///
+/// `CommandStatGetInt` is the script wrapper. Returning the stored balance
+/// from it changes what a script receives and does not change the int the
+/// HUD already has, so a hand-edited `extra-stats.txt` stayed invisible and
+/// the file was never rewritten. The phone's cash is a script copy of this
+/// same int (`Global_61482`), refreshed from it while signed in. Shares,
+/// the price paid and which stock are the story save's script block, not a
+/// stat.
+pub(crate) unsafe fn apply_stored_cash(env: *mut Env) {
+    if APPLYING.get() {
+        return;
+    }
+    APPLYING.set(true);
+    let _guard = ClearApply;
+    let out = cash_word(env);
+    if out == 0 {
+        return;
+    }
+    let mem = unsafe { Mem::of(env) };
+    for &hash in CASH_STATS {
+        let stored_v = stored(&hash_key(hash));
+        let pinned = cash_pin(hash);
+        if stored_v.is_none() && pinned.is_none() {
+            continue;
+        }
+        let read = unsafe { orig::stat_get_int(env, hash, out, u32::MAX) };
+        let engine = (read != 0).then(|| i64::from(mem.u32(out) as i32));
+        if engine.is_none() && stored_v.is_some_and(|value| value != 0) {
+            note_cash_waiting(hash);
+        }
+        let (seed, write) = cash_publish(stored_v, engine, pinned);
+        if let Some(seed) = seed {
+            log::info!("stats: h{hash:08x} cash is {seed} from the engine (host was {stored_v:?})");
+            set(hash_key(hash), seed);
+            unpin_cash(hash);
+            save();
+        }
+        if let Some(value) = write {
+            log_cash_write(hash, engine.unwrap_or(0), value);
+            // Save flag 0: the host file is the copy that survives a restart.
+            // Setting it every frame a load resets the int would queue a save
+            // every frame. The in-memory int is what the HUD reads.
+            unsafe { orig::stat_set_int(env, hash, value as i32 as u32, 0) };
+        }
+    }
 }
 
 /// What a cash read should return, and a value to store when the engine's
@@ -593,6 +729,24 @@ mod tests {
         assert!(!super::is_cash_hash(super::joaat(b"AMU_OW0")));
         assert!(!super::is_cash_hash(super::joaat(b"HAL_OW2")));
         assert!(!super::is_cash_hash(super::joaat(b"SM_PRICE_AMU")));
+    }
+
+    #[test]
+    fn stored_cash_is_written_into_the_engine_stat_the_hud_reads() {
+        // The file from the macOS run: each SPn_TOTAL_CASH is 100000, and
+        // the HUD stayed at $0 because that file is not what it reads.
+        assert!(super::CASH_STATS.len() <= 16);
+        assert_eq!(super::cash_publish(Some(100_000), Some(0), None), (None, Some(100_000)));
+        assert_eq!(super::cash_publish(Some(100_000), Some(100_000), None), (None, None));
+        // Not in the map yet: leave it, and try again next update.
+        assert_eq!(super::cash_publish(Some(100_000), None, None), (None, None));
+        // A stored 0 still yields to a balance the story save loaded.
+        assert_eq!(super::cash_publish(Some(0), Some(200), None), (Some(200), None));
+        // Spending the last dollar has to clear the engine stat too.
+        assert_eq!(super::cash_publish(Some(0), Some(200), Some(200)), (None, Some(0)));
+        // Franklin, the character that run loaded.
+        assert_eq!(super::joaat(b"SP1_TOTAL_CASH"), 0x44bd_6982);
+        assert!(!super::is_cash_hash(super::joaat(b"AMU_OW1")));
     }
 }
 

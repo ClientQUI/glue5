@@ -100,9 +100,15 @@ pub(crate) unsafe extern "C" fn stats_update(env: *mut Env) {
     let done = SAVE_DONE.load(Ordering::Acquire);
     if pending > done {
         log::info!("stats: saving on suspend");
+        // The queued save copies the stats-map ints. Put the stored cash
+        // there first, or the save writes the $0 the HUD was showing.
+        unsafe { crate::stats::apply_stored_cash(env) };
         stats_queue_save(env);
     }
     without_lan(env, || unsafe { orig::stats_update(env) });
+    // The corner HUD reads these ints. A script `StatGetInt` is a different
+    // call, and editing extra-stats.txt does not change the ints.
+    unsafe { crate::stats::apply_stored_cash(env) };
     if pending > done {
         // Cash lives in extra-stats.txt as well as the engine's member file.
         // The member file can load back as 0; this file is what Drive syncs.

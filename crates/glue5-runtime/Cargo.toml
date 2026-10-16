@@ -19,6 +19,8 @@ serde_json.workspace = true
 # Google Drive's hidden app data (OAuth and the files REST API).
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 md-5 = "0.10"
+# Xcode writes Info.plist as a binary plist. Used when NSBundle cannot be queried.
+plist = "1.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -33,6 +35,9 @@ objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
+    "NSArray",
+    "NSBundle",
+    "NSDictionary",
     "NSString",
     "NSURL",
 ] }

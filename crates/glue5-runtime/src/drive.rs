@@ -294,15 +294,10 @@ pub fn sign_in(client_id: &str, client_secret: &str) {
             set_status(STATUS_UNAVAILABLE, "That client ID is not an iOS OAuth client (….apps.googleusercontent.com).");
             return;
         };
-        if !bundle_has_scheme(&scheme) {
-            SIGNING_IN.store(false, Ordering::Relaxed);
-            set_status(
-                STATUS_UNAVAILABLE,
-                &format!(
-                    "Rebuild the iOS app with the URL scheme {scheme} (platform/ios/project.yml, CFBundleURLSchemes)."
-                ),
-            );
-            return;
+        // A missing or unreadable scheme must not block sign-in. The session
+        // reports the real failure if this app cannot receive the redirect.
+        if bundle_has_scheme(&scheme) != Some(true) {
+            log::warn!("drive: URL scheme {scheme} was not confirmed in CFBundleURLTypes; trying sign-in anyway");
         }
         let redirect = format!("{scheme}:/oauth2redirect");
         let url = auth_url(&client_id, &redirect, &challenge, &state);
@@ -933,11 +928,42 @@ fn ios_scheme(client_id: &str) -> Option<String> {
     Some(format!("com.googleusercontent.apps.{prefix}"))
 }
 
+/// `Some(true)` when this app's `CFBundleURLTypes` lists `scheme`.
+/// `Some(false)` when the list was readable and the scheme is absent.
+/// `None` when it could not be read.
+///
+/// Xcode writes the bundle `Info.plist` as a binary plist, so this does not
+/// read that file as text. `NSBundle` has already parsed it. The file is only
+/// a fallback, through the `plist` crate, when the bundle cannot be queried.
 #[cfg(target_os = "ios")]
-fn bundle_has_scheme(scheme: &str) -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
-    let Some(plist) = exe.parent().map(|dir| dir.join("Info.plist")) else { return false };
-    fs::read_to_string(plist).is_ok_and(|text| text.contains(scheme))
+fn bundle_has_scheme(scheme: &str) -> Option<bool> {
+    if let Some(found) = ios::bundle_has_scheme(scheme) {
+        return Some(found);
+    }
+    let Ok(exe) = std::env::current_exe() else { return None };
+    let Some(path) = exe.parent().map(|dir| dir.join("Info.plist")) else { return None };
+    let Ok(bytes) = fs::read(path) else { return None };
+    plist_has_scheme(&bytes, scheme)
+}
+
+/// Whether `bytes` is an XML or binary Info.plist whose `CFBundleURLSchemes`
+/// include `scheme`.
+#[cfg(any(test, target_os = "ios"))]
+fn plist_has_scheme(bytes: &[u8], scheme: &str) -> Option<bool> {
+    let root = plist::Value::from_reader(std::io::Cursor::new(bytes)).ok()?;
+    let Some(root) = root.as_dictionary() else { return None };
+    let Some(types) = root.get("CFBundleURLTypes") else { return Some(false) };
+    let Some(types) = types.as_array() else { return None };
+    for entry in types {
+        let Some(entry) = entry.as_dictionary() else { continue };
+        let Some(schemes) = entry.get("CFBundleURLSchemes").and_then(plist::Value::as_array) else { continue };
+        for item in schemes {
+            if item.as_string().is_some_and(|text| text.eq_ignore_ascii_case(scheme)) {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
 }
 
 #[cfg(not(target_os = "ios"))]
@@ -1284,7 +1310,31 @@ mod ios {
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
     use objc2::{class, msg_send};
-    use objc2_foundation::{NSString, NSURL};
+    use objc2_foundation::{NSArray, NSBundle, NSDictionary, NSString, NSURL};
+
+    /// `CFBundleURLTypes` from the running app. `None` when the bundle cannot
+    /// be queried or the value is not the usual array of dictionaries.
+    pub fn bundle_has_scheme(scheme: &str) -> Option<bool> {
+        let types = NSBundle::mainBundle().objectForInfoDictionaryKey(&NSString::from_str("CFBundleURLTypes"))?;
+        let Ok(types) = types.downcast::<NSArray>() else { return None };
+        let key = NSString::from_str("CFBundleURLSchemes");
+        for index in 0..types.count() {
+            let entry = types.objectAtIndex(index);
+            let Some(entry) = entry.downcast_ref::<NSDictionary>() else { continue };
+            // SAFETY: Info.plist dictionary keys are strings.
+            let entry = unsafe { entry.cast_unchecked::<NSString, AnyObject>() };
+            let Some(schemes) = entry.objectForKey(&key) else { continue };
+            let Some(schemes) = schemes.downcast_ref::<NSArray>() else { continue };
+            for inner in 0..schemes.count() {
+                let item = schemes.objectAtIndex(inner);
+                let Some(text) = item.downcast_ref::<NSString>() else { continue };
+                if text.to_string().eq_ignore_ascii_case(scheme) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
 
     #[link(name = "AuthenticationServices", kind = "framework")]
     #[link(name = "UIKit", kind = "framework")]
@@ -1499,6 +1549,38 @@ mod tests {
         }
         assert!(ios_scheme("desktop-client.apps.googleusercontent.com").is_some());
         assert!(ios_scheme("not-a-google-client").is_none());
+    }
+
+    #[test]
+    fn binary_info_plist_lists_the_url_scheme() {
+        let scheme = "com.googleusercontent.apps.566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu";
+        let binary = sample_info_plist(scheme, true);
+        // This is the on-device failure: Xcode's Info.plist is not UTF-8 text.
+        assert!(std::str::from_utf8(&binary).is_err());
+        assert_eq!(plist_has_scheme(&binary, scheme), Some(true));
+        assert_eq!(plist_has_scheme(&binary, "glue5-oauth"), Some(false));
+        let xml = sample_info_plist(scheme, false);
+        assert_eq!(plist_has_scheme(&xml, scheme), Some(true));
+        assert_eq!(plist_has_scheme(b"bplist00 not really", scheme), None);
+    }
+
+    fn sample_info_plist(scheme: &str, binary: bool) -> Vec<u8> {
+        let entry = plist::Dictionary::from_iter([
+            ("CFBundleURLName".to_owned(), plist::Value::String("glue5.google".to_owned())),
+            ("CFBundleURLSchemes".to_owned(), plist::Value::Array(vec![plist::Value::String(scheme.to_owned())])),
+        ]);
+        let root = plist::Dictionary::from_iter([(
+            "CFBundleURLTypes".to_owned(),
+            plist::Value::Array(vec![plist::Value::Dictionary(entry)]),
+        )]);
+        let value = plist::Value::Dictionary(root);
+        let mut buf = Vec::new();
+        if binary {
+            value.to_writer_binary(&mut buf).unwrap();
+        } else {
+            value.to_writer_xml(&mut buf).unwrap();
+        }
+        buf
     }
 
     #[test]

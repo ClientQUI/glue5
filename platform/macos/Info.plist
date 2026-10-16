@@ -13,5 +13,17 @@
     <!-- GTA Online: players on the same network find each other there. -->
     <key>NSLocalNetworkUsageDescription</key>
     <string>Glue 5 finds GTA Online players on your network.</string>
+    <key>NSUbiquitousContainers</key>
+    <dict>
+        <key>iCloud.com.lennertwilhelm.gta5offline</key>
+        <dict>
+            <key>NSUbiquitousContainerIsDocumentScopePublic</key>
+            <true/>
+            <key>NSUbiquitousContainerName</key>
+            <string>Glue 5</string>
+            <key>NSUbiquitousContainerSupportedFolderLevels</key>
+            <string>Any</string>
+        </dict>
+    </dict>
 </dict>
 </plist>

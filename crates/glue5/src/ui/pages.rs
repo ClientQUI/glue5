@@ -289,11 +289,11 @@ fn settings_items(
                 },
             };
             setting(ui, "Efficiency", Control::Choice, Some(efficiency_note), |ui| {
-                choice(ui, &mut settings.efficiency, &[
-                    (Efficiency::Off, "Off"),
-                    (Efficiency::Hybrid, "Hybrid"),
-                    (Efficiency::FullE, "Full-E"),
-                ])
+                choice(
+                    ui,
+                    &mut settings.efficiency,
+                    &[(Efficiency::Off, "Off"), (Efficiency::Hybrid, "Hybrid"), (Efficiency::FullE, "Full-E")],
+                )
             });
             ui.label(
                 RichText::new(
@@ -334,19 +334,27 @@ fn settings_items(
             );
             if settings.overlay == PerfOverlay::Glue5 {
                 setting(ui, "Overlay detail", Control::Choice, None, |ui| {
-                    choice(ui, &mut settings.overlay_detail, &[
-                        (OverlayDetail::Minimal, "Minimal"),
-                        (OverlayDetail::Standard, "Standard"),
-                        (OverlayDetail::Full, "Full"),
-                    ])
+                    choice(
+                        ui,
+                        &mut settings.overlay_detail,
+                        &[
+                            (OverlayDetail::Minimal, "Minimal"),
+                            (OverlayDetail::Standard, "Standard"),
+                            (OverlayDetail::Full, "Full"),
+                        ],
+                    )
                 });
                 setting(ui, "Overlay position", Control::Choice, None, |ui| {
-                    choice(ui, &mut settings.overlay_corner, &[
-                        (Corner::TopLeft, "Top left"),
-                        (Corner::TopRight, "Top right"),
-                        (Corner::BottomLeft, "Bottom left"),
-                        (Corner::BottomRight, "Bottom right"),
-                    ])
+                    choice(
+                        ui,
+                        &mut settings.overlay_corner,
+                        &[
+                            (Corner::TopLeft, "Top left"),
+                            (Corner::TopRight, "Top right"),
+                            (Corner::BottomLeft, "Bottom left"),
+                            (Corner::BottomRight, "Bottom right"),
+                        ],
+                    )
                 });
             }
         }
@@ -361,12 +369,16 @@ fn settings_items(
                     "GPU memory / longest edge"
                 }),
                 |ui| {
-                    choice(ui, &mut settings.texture_detail, &[
-                        (TextureDetail::Original, "Original"),
-                        (TextureDetail::Balanced, "1024"),
-                        (TextureDetail::Compact, "512"),
-                        (TextureDetail::Minimal, "256"),
-                    ])
+                    choice(
+                        ui,
+                        &mut settings.texture_detail,
+                        &[
+                            (TextureDetail::Original, "Original"),
+                            (TextureDetail::Balanced, "1024"),
+                            (TextureDetail::Compact, "512"),
+                            (TextureDetail::Minimal, "256"),
+                        ],
+                    )
                 },
             );
             ui.label(RichText::new("Lower limits save Metal memory at the cost of sharpness. Sampled BC mipmaps only; unmipmapped UI and render targets stay intact. Next game start.").small().color(theme::MUTED));
@@ -377,13 +389,17 @@ fn settings_items(
                 "Applies when starting the game"
             };
             let r = setting(ui, "LOD preset", Control::Choice, Some(hint), |ui| {
-                choice(ui, &mut settings.world_preset, &[
-                    (WorldPreset::Game, "Game settings"),
-                    (WorldPreset::Eco, "Eco"),
-                    (WorldPreset::Balanced, "Balanced"),
-                    (WorldPreset::Detail, "Detail"),
-                    (WorldPreset::Custom, "Custom"),
-                ])
+                choice(
+                    ui,
+                    &mut settings.world_preset,
+                    &[
+                        (WorldPreset::Game, "Game settings"),
+                        (WorldPreset::Eco, "Eco"),
+                        (WorldPreset::Balanced, "Balanced"),
+                        (WorldPreset::Detail, "Detail"),
+                        (WorldPreset::Custom, "Custom"),
+                    ],
+                )
             });
             if r.changed() && !matches!(settings.world_preset, WorldPreset::Game | WorldPreset::Custom) {
                 settings.world = WorldDetail::preset(settings.world_preset);
@@ -408,11 +424,11 @@ fn settings_items(
         }
         SettingsTab::Controls => {
             setting(ui, "Touch controls", Control::Choice, None, |ui| {
-                choice(ui, &mut settings.touch, &[
-                    (TouchMode::Auto, "Auto"),
-                    (TouchMode::Always, "On"),
-                    (TouchMode::Off, "Off"),
-                ])
+                choice(
+                    ui,
+                    &mut settings.touch,
+                    &[(TouchMode::Auto, "Auto"), (TouchMode::Always, "On"), (TouchMode::Off, "Off")],
+                )
             })
             .on_hover_text("Auto: shown on touch screens; hidden while using a controller or keyboard");
             setting(ui, "Size", Control::Slider, None, |ui| {
@@ -426,6 +442,8 @@ fn settings_items(
             }
         }
         SettingsTab::Game => {
+            #[cfg(target_vendor = "apple")]
+            icloud_setting(ui, settings);
             setting(
                 ui,
                 "Streaming budget",
@@ -436,12 +454,16 @@ fn settings_items(
                     "Independent of graphics quality"
                 }),
                 |ui| {
-                    choice(ui, &mut settings.resource_budget, &[
-                        (ResourceBudget::Auto, "Auto"),
-                        (ResourceBudget::Balanced, "1536 MiB"),
-                        (ResourceBudget::Compact, "1280 MiB"),
-                        (ResourceBudget::Compatibility, "2048 MiB"),
-                    ])
+                    choice(
+                        ui,
+                        &mut settings.resource_budget,
+                        &[
+                            (ResourceBudget::Auto, "Auto"),
+                            (ResourceBudget::Balanced, "1536 MiB"),
+                            (ResourceBudget::Compact, "1280 MiB"),
+                            (ResourceBudget::Compatibility, "2048 MiB"),
+                        ],
+                    )
                 },
             );
             ui.label(RichText::new("1536 MiB is a reduced-budget test, not a total RAM cap. Auto uses 2048 MiB on mobile, or 768 with legacy Low memory. Too little can leave world assets missing. Restart to apply.").small().color(theme::MUTED));
@@ -503,6 +525,22 @@ fn settings_items(
             });
         }
     }
+}
+
+#[cfg(target_vendor = "apple")]
+fn icloud_setting(ui: &mut egui::Ui, settings: &mut Settings) {
+    let forced = settings::icloud_forced();
+    let note = match forced {
+        Some(true) => "GLUE5_ICLOUD is on.",
+        Some(false) => "GLUE5_ICLOUD is off. Saves stay on this device.",
+        None if !settings.icloud => "Off. Saves stay on this device.",
+        None => glue5_runtime::icloud::status_note(),
+    };
+    setting(ui, "iCloud", Control::Toggle, Some(note), |ui| {
+        ui.add_enabled_ui(forced.is_none(), |ui| {
+            toggle(ui, &mut settings.icloud);
+        });
+    });
 }
 
 fn distance_options(ui: &mut egui::Ui, settings: &mut Settings, status: &Status) {
@@ -660,12 +698,15 @@ mod tests {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(874.0, 402.0))),
                     time: Some(pass as f64),
                     events: if pass == 4 {
-                        vec![egui::Event::PointerMoved(Pos2::new(430.0, 300.0)), egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Point,
-                            delta: vec2(0.0, -10000.0),
-                            phase: egui::TouchPhase::Move,
-                            modifiers: egui::Modifiers::default(),
-                        }]
+                        vec![
+                            egui::Event::PointerMoved(Pos2::new(430.0, 300.0)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: vec2(0.0, -10000.0),
+                                phase: egui::TouchPhase::Move,
+                                modifiers: egui::Modifiers::default(),
+                            },
+                        ]
                     } else {
                         Vec::new()
                     },

@@ -1,7 +1,8 @@
 # Memory and cooling changes
 
 This build keeps the working TV preload guard, performance profiles, game
-settings and saves. It does not add iCloud sync or change the normal engine
+settings and saves. iCloud sync of those saves is separate (see the README).
+It does not change the normal engine
 streaming budget (2048 MiB on mobile; the existing Low memory mode uses 768).
 The resource budget is not a hard process-memory limit. Engine allocation
 requests can still grow it to avoid failed streaming reads.

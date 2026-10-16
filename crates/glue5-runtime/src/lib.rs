@@ -19,6 +19,7 @@ mod gamelog;
 mod gamer_tags;
 pub mod gpu;
 mod granular;
+pub mod icloud;
 mod imports;
 pub mod input;
 pub mod memory;

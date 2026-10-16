@@ -79,6 +79,11 @@ pub struct Settings {
     pub touch_size: f32,
     /// The Taptic Engine taps under pressed touch controls and plays the game's rumble (iPhone).
     pub haptics: bool,
+    /// Copy saves and these settings through iCloud on iPhone, iPad and Mac.
+    /// The game folder stays on this device. Off, or when iCloud is not
+    /// signed in, leaves the files local.
+    #[serde(default = "default_icloud")]
+    pub icloud: bool,
     /// The game starts in the sandbox (the map, no story) rather than the
     /// story: the start page's last choice.
     pub sandbox: bool,
@@ -398,6 +403,7 @@ impl Default for Settings {
             touch_opacity: 0.6,
             touch_size: 1.0,
             haptics: true,
+            icloud: default_icloud(),
             sandbox: false,
             online: false,
             online_name: String::new(),
@@ -437,6 +443,19 @@ pub fn new_lobby_code() -> String {
 /// case ("k7q 29f" is "K7Q-29F").
 pub fn lobby_key(code: &str) -> String {
     code.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()).collect()
+}
+
+fn default_icloud() -> bool {
+    cfg!(target_vendor = "apple")
+}
+
+/// `GLUE5_ICLOUD=0` or `1` overrides the toggle. `None` means the toggle wins.
+pub fn icloud_forced() -> Option<bool> {
+    match std::env::var("GLUE5_ICLOUD").ok().as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("0" | "off" | "false") => Some(false),
+        Some("1" | "on" | "true") => Some(true),
+        _ => None,
+    }
 }
 
 fn random() -> u64 {
@@ -483,6 +502,15 @@ impl Settings {
         Self::save_snapshot(user_dir, &self.snapshot());
     }
 
+    /// Whether saves should be copied through iCloud. Never on a platform
+    /// that has no ubiquity container.
+    pub fn icloud_enabled(&self) -> bool {
+        if !cfg!(target_vendor = "apple") {
+            return false;
+        }
+        icloud_forced().unwrap_or(self.icloud)
+    }
+
     /// JSON for the lifecycle watch, which cannot borrow `Settings`.
     pub fn snapshot(&self) -> Vec<u8> {
         serde_json::to_vec_pretty(self).unwrap_or_default()
@@ -497,6 +525,7 @@ impl Settings {
         if let Err(e) = durable_write(&Self::file(user_dir), json) {
             log::warn!("cannot save settings: {e}");
         }
+        glue5_runtime::icloud::on_settings_saved(user_dir, json);
     }
 
     /// The distance, fog, resolution and thermal options the graphics menu owns.
@@ -790,5 +819,22 @@ mod tests {
         assert_eq!(values[0], ("LodScale", "1.000000".into()));
         assert_eq!(values[3], ("CityDensity", "0.000000".into()));
         assert!(values.iter().all(|(name, _)| !name.contains("Texture") && !name.contains("MSAA")));
+    }
+
+    #[test]
+    fn icloud_follows_the_file_and_stays_off_without_apple() {
+        let dir = std::env::temp_dir().join(format!("glue5-icloud-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("glue5.json"), r#"{"icloud": false}"#).unwrap();
+        assert!(!Settings::load(&dir).icloud);
+        std::fs::write(dir.join("glue5.json"), r#"{"icloud": true}"#).unwrap();
+        let on = Settings::load(&dir);
+        assert!(on.icloud);
+        if !cfg!(target_vendor = "apple") {
+            assert!(!on.icloud_enabled());
+            assert!(!Settings::default().icloud);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,9 +1,18 @@
 //! Where things are, per platform.
 //!
 //! - The user directory (settings, saves, caches) is SDL's per-user
-//!   application directory: `~/Library/Application Support/glue5` on macOS,
-//!   `~/.local/share/glue5` on Linux, `%APPDATA%\glue5` on Windows, the app's
-//!   sandbox on iOS and Android.
+//!   application directory. The org passed to `SDL_GetPrefPath` is empty and
+//!   the app name is `glue5`, so the folder is `Application Support/glue5`
+//!   (iOS and iPadOS share this; both are `target_os = "ios"`):
+//!   - iOS and iPadOS: `<sandbox>/Library/Application Support/glue5/`,
+//!     where the sandbox is
+//!     `/var/mobile/Containers/Data/Application/<UUID>/`.
+//!   - macOS, not sandboxed: `~/Library/Application Support/glue5/`.
+//!     A sandboxed Mac app would use
+//!     `~/Library/Containers/com.lennertwilhelm.gta5offline/Data/Library/Application Support/glue5/`
+//!     instead. This build does not enable the App Sandbox.
+//!   - Linux: `~/.local/share/glue5`. Windows: `%APPDATA%\glue5`.
+//!     Android: the app's sandbox.
 //! - The game (`b/<build>/` and `data/`, ~21 GB) is never part of the app: it
 //!   is wherever the user put it. Mobile defaults are user-visible places
 //!   (iOS: the app's Documents, through Finder or Files; Android: the app's

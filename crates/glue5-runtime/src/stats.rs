@@ -72,7 +72,10 @@ pub(crate) fn save() {
         let path = file();
         let saved = crate::vfs::durable_write(&path, text.as_bytes());
         match saved {
-            Ok(()) => s.dirty = false,
+            Ok(()) => {
+                s.dirty = false;
+                crate::icloud::note_write();
+            }
             Err(e) => log::error!("stats: saving {}: {e}", path.display()),
         }
     })

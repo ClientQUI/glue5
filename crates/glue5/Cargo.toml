@@ -10,7 +10,7 @@ publish.workspace = true
 # Version and executable are taken from Cargo by cargo-packager.
 [package.metadata.packager]
 product-name = "Glue 5"
-identifier = "local.glue5"
+identifier = "com.lennertwilhelm.gta5offline"
 category = "Game"
 formats = ["app"]
 out-dir = "../../target/package"
@@ -20,7 +20,9 @@ resources = [{ src = "../../target/package/macos-assets/Assets.car", target = "A
 [package.metadata.packager.macos]
 minimum-system-version = "14.0"
 info-plist-path = "../../platform/macos/Info.plist"
-# No signing identity: no bundle signing or notarization.
+entitlements = "../../platform/macos/Glue5.entitlements"
+# No signing identity: no bundle signing or notarization. iCloud needs a
+# signature from team 9WKKC8XF38; see the README.
 
 [dependencies]
 glue5-runtime.workspace = true

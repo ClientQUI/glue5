@@ -7,5 +7,19 @@
 	     personal development teams cannot have it and phones need less). -->
 	<key>com.apple.developer.kernel.increased-memory-limit</key>
 	<true/>
+	<!-- iCloud Documents for team 9WKKC8XF38, bundle com.lennertwilhelm.gta5offline.
+	     The container has to exist on that App ID; see the README, iCloud. -->
+	<key>com.apple.developer.icloud-container-identifiers</key>
+	<array>
+		<string>iCloud.com.lennertwilhelm.gta5offline</string>
+	</array>
+	<key>com.apple.developer.ubiquity-container-identifiers</key>
+	<array>
+		<string>iCloud.com.lennertwilhelm.gta5offline</string>
+	</array>
+	<key>com.apple.developer.icloud-services</key>
+	<array>
+		<string>CloudDocuments</string>
+	</array>
 </dict>
 </plist>

@@ -104,6 +104,9 @@ pub(crate) unsafe extern "C" fn stats_update(env: *mut Env) {
     }
     without_lan(env, || unsafe { orig::stats_update(env) });
     if pending > done {
+        // Cash lives in extra-stats.txt as well as the engine's member file.
+        // The member file can load back as 0; this file is what Drive syncs.
+        crate::stats::save();
         SAVE_DONE.fetch_max(pending, Ordering::Release);
     }
     let new = NEW_SLOTS.load(Ordering::Relaxed);

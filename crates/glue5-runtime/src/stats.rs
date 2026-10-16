@@ -26,9 +26,12 @@ thread_local! {
 }
 
 /// Stat values by key: `h<hash>` (int, float bits, or bool), `p<slot>:<index>`
-/// (packed: a bool or a byte).
+/// (packed: a bool or a byte). `cash_zero` is a cash hash whose stored 0 is a
+/// real empty wallet (a spend), and the engine balance that 0 replaced, so a
+/// later read of that same engine number does not bring the money back.
 struct Store {
     values: BTreeMap<String, i64>,
+    cash_zero: BTreeMap<u32, i64>,
     dirty: bool,
 }
 
@@ -41,15 +44,8 @@ fn file() -> std::path::PathBuf {
 fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> R {
     let mut store = STORE.lock().unwrap();
     let store = store.get_or_insert_with(|| {
-        let values = std::fs::read_to_string(file())
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| {
-                let (k, v) = l.split_once(' ')?;
-                Some((k.to_string(), v.parse().ok()?))
-            })
-            .collect();
-        Store { values, dirty: false }
+        let (values, cash_zero) = parse_store(&std::fs::read_to_string(file()).unwrap_or_default());
+        Store { values, cash_zero, dirty: false }
     });
     f(store)
 }
@@ -77,7 +73,10 @@ pub(crate) fn save() {
         if !s.dirty {
             return;
         }
-        let text: String = s.values.iter().map(|(k, v)| format!("{k} {v}\n")).collect();
+        let mut text: String = s.values.iter().map(|(k, v)| format!("{k} {v}\n")).collect();
+        for (hash, against) in &s.cash_zero {
+            text.push_str(&format!("z{hash:08x} {against}\n"));
+        }
         let path = file();
         let saved = crate::vfs::durable_write(&path, text.as_bytes());
         match saved {
@@ -187,6 +186,45 @@ fn hash_key(hash: u32) -> String {
     format!("h{hash:08x}")
 }
 
+/// `h<hash> <value>` and, for a cash spend down to 0, `z<hash> <against>`.
+fn parse_store(text: &str) -> (BTreeMap<String, i64>, BTreeMap<u32, i64>) {
+    let mut values = BTreeMap::new();
+    let mut cash_zero = BTreeMap::new();
+    for line in text.lines() {
+        let Some((key, raw)) = line.split_once(' ') else { continue };
+        let Ok(value) = raw.parse::<i64>() else { continue };
+        if let Some(hex) = key.strip_prefix('z') {
+            if let Ok(hash) = u32::from_str_radix(hex, 16) {
+                cash_zero.insert(hash, value);
+            }
+            continue;
+        }
+        values.insert(key.to_string(), value);
+    }
+    (values, cash_zero)
+}
+
+fn cash_pin(hash: u32) -> Option<i64> {
+    with_store(|s| s.cash_zero.get(&hash).copied())
+}
+
+fn pin_cash(hash: u32, against: i64) {
+    with_store(|s| {
+        if s.cash_zero.get(&hash) != Some(&against) {
+            s.cash_zero.insert(hash, against);
+            s.dirty = true;
+        }
+    });
+}
+
+fn unpin_cash(hash: u32) {
+    with_store(|s| {
+        if s.cash_zero.remove(&hash).is_some() {
+            s.dirty = true;
+        }
+    });
+}
+
 fn packed_key_name(index: u32, slot: u32) -> String {
     format!("p{}:{index}", slot as i32)
 }
@@ -211,27 +249,39 @@ pub(crate) unsafe extern "C" fn packed_set(env: *mut Env, value: u32, index: u32
 /// float, bool and masked int variants, and the setters. Floats are kept as
 /// their bits.
 pub(crate) unsafe extern "C" fn get_int(env: *mut Env, hash: u32, out: u64, player: u32) -> u32 {
-    if is_cash_hash(hash)
-        && let Some(value) = stored(&hash_key(hash))
-    {
-        // The earn script adds to whatever this returns, then the HUD reads
-        // it back. The engine's copy of these stats stays 0 (a member-file
-        // load, or a set the engine does not keep); the green "+$25" is the
-        // change popup and does not read the balance.
-        return write(env, out, value);
+    if is_cash_hash(hash) {
+        return unsafe { cash_get(env, hash, out, player) };
+    }
+    with_stat(hash, || {
+        engine_or(|| unsafe { orig::stat_get_int(env, hash, out, player) }, || write(env, out, get(&hash_key(hash))))
+    })
+}
+
+/// Story cash. The HUD balance is `SPn_TOTAL_CASH`; the green "+$" line is
+/// only the change. A stored 0 (the value extra-stats.txt had after a story
+/// earn) must not hide the engine: that 0 is what the signed-in sync copies
+/// into the script global and then writes back. A balance this session has
+/// set still wins when the engine reads 0. The story profile under
+/// `Documents/Rockstar Games/GTA V/` is the engine's copy of this same stat,
+/// not a second wallet.
+unsafe fn cash_get(env: *mut Env, hash: u32, out: u64, player: u32) -> u32 {
+    let stored_v = stored(&hash_key(hash));
+    let pinned = cash_pin(hash);
+    if pinned.is_none() && stored_v.is_some_and(|value| value != 0) {
+        return write(env, out, stored_v.unwrap_or(0));
     }
     let result = with_stat(hash, || {
         engine_or(|| unsafe { orig::stat_get_int(env, hash, out, player) }, || write(env, out, get(&hash_key(hash))))
     });
-    if is_cash_hash(hash) && result != 0 {
-        let engine = i64::from(unsafe { Mem::of(env) }.u32(out) as i32);
-        let (_value, seed) = resolve_cash(None, Some(engine));
-        if let Some(seed) = seed {
-            set(hash_key(hash), seed);
-            save();
-        }
+    let engine = (result != 0).then(|| i64::from(unsafe { Mem::of(env) }.u32(out) as i32));
+    let (value, seed) = resolve_cash_get(stored_v, engine, pinned);
+    if let Some(seed) = seed {
+        log::info!("stats: h{hash:08x} cash is {seed} from the engine (host was {stored_v:?})");
+        set(hash_key(hash), seed);
+        unpin_cash(hash);
+        save();
     }
-    result
+    write(env, out, value)
 }
 
 pub(crate) unsafe extern "C" fn get_float(env: *mut Env, hash: u32, out: u64, player: u32) -> u32 {
@@ -266,17 +316,37 @@ pub(crate) unsafe extern "C" fn get_masked_int(
 }
 
 pub(crate) unsafe extern "C" fn set_int(env: *mut Env, hash: u32, value: u32, save_flag: u32) -> u32 {
-    let result = with_stat(hash, || {
-        engine_or(|| unsafe { orig::stat_set_int(env, hash, value, save_flag) }, || keep(hash, i64::from(value as i32)))
-    });
     if is_cash_hash(hash) {
-        // Always remember the balance the script just wrote, even when the
-        // engine also has an entry and leaves it at 0. `save` puts it in
-        // `cloud/extra-stats.txt`, which Drive syncs.
-        keep(hash, i64::from(value as i32));
+        return unsafe { cash_set(env, hash, value, save_flag) };
+    }
+    with_stat(hash, || {
+        engine_or(|| unsafe { orig::stat_set_int(env, hash, value, save_flag) }, || keep(hash, i64::from(value as i32)))
+    })
+}
+
+/// Remember a story or online cash write. A set of 0 before any balance
+/// exists is the startup sync, not a spend: forwarding it would wipe a
+/// story-save load or a pickup the engine already counted.
+unsafe fn cash_set(env: *mut Env, hash: u32, value: u32, save_flag: u32) -> u32 {
+    let value_i = i64::from(value as i32);
+    let decision = accept_cash_set(stored(&hash_key(hash)), value_i);
+    let result = if decision.forward {
+        log::info!("stats: h{hash:08x} set cash to {value_i}");
+        with_stat(hash, || engine_or(|| unsafe { orig::stat_set_int(env, hash, value, save_flag) }, || 1))
+    } else {
+        log::info!("stats: h{hash:08x} ignored cash set of 0");
+        1
+    };
+    if let Some(keep_v) = decision.keep {
+        keep(hash, keep_v);
+        if let Some(against) = decision.pin_against {
+            pin_cash(hash, against);
+        } else {
+            unpin_cash(hash);
+        }
         save();
     }
-    result
+    if decision.keep.is_some() { 1 } else { result }
 }
 
 pub(crate) unsafe extern "C" fn set_float(env: *mut Env, hash: u32, value: f32, save_flag: u32) -> u32 {
@@ -370,17 +440,41 @@ fn is_cash_hash(hash: u32) -> bool {
     CASH_STATS.contains(&hash)
 }
 
-/// What a cash read should return, and a value to store when the host has
-/// none yet. The host wins once a set (or a non-zero engine read) has been
-/// remembered, so a later engine read of 0 does not wipe the balance.
-fn resolve_cash(stored: Option<i64>, engine: Option<i64>) -> (i64, Option<i64>) {
-    if let Some(value) = stored {
+/// What a cash read should return, and a value to store when the engine's
+/// number should replace the host's. A remembered earn wins over an engine
+/// that still reads 0. A stored 0 does not, unless `pinned_against` says
+/// that 0 was a spend of that engine balance.
+fn resolve_cash_get(stored: Option<i64>, engine: Option<i64>, pinned_against: Option<i64>) -> (i64, Option<i64>) {
+    if let Some(against) = pinned_against {
+        return match engine {
+            Some(value) if value != 0 && value != against => (value, Some(value)),
+            _ => (0, None),
+        };
+    }
+    if let Some(value) = stored.filter(|value| *value != 0) {
         return (value, None);
     }
     match engine {
         Some(value) if value != 0 => (value, Some(value)),
-        Some(value) => (value, None),
-        None => (0, None),
+        _ => (0, None),
+    }
+}
+
+/// A cash set. `forward` calls the engine. `keep` is what to store. `pin_against`
+/// is the previous balance a new 0 must keep hiding.
+struct CashSet {
+    forward: bool,
+    keep: Option<i64>,
+    pin_against: Option<i64>,
+}
+
+fn accept_cash_set(stored: Option<i64>, value: i64) -> CashSet {
+    if value != 0 {
+        CashSet { forward: true, keep: Some(value), pin_against: None }
+    } else if let Some(prev) = stored.filter(|prev| *prev != 0) {
+        CashSet { forward: true, keep: Some(0), pin_against: Some(prev) }
+    } else {
+        CashSet { forward: false, keep: None, pin_against: None }
     }
 }
 
@@ -431,18 +525,57 @@ mod tests {
 
     #[test]
     fn earn_and_spend_stick_when_the_engine_still_reads_zero() {
-        assert_eq!(super::resolve_cash(None, None), (0, None));
-        assert_eq!(super::resolve_cash(None, Some(0)), (0, None));
-        // A real balance already in the engine is remembered.
-        assert_eq!(super::resolve_cash(None, Some(500)), (500, Some(500)));
+        assert_eq!(super::resolve_cash_get(None, None, None), (0, None));
+        assert_eq!(super::resolve_cash_get(None, Some(0), None), (0, None));
+        // A real balance already in the engine (the story save) is remembered.
+        assert_eq!(super::resolve_cash_get(None, Some(500), None), (500, Some(500)));
         // +$25 was stored. The engine (and a cloud reload) still say 0.
-        assert_eq!(super::resolve_cash(Some(25), Some(0)), (25, None));
-        // Spending replaces that balance rather than adding to the engine's 0.
-        assert_eq!(super::resolve_cash(Some(60), Some(100)), (60, None));
+        assert_eq!(super::resolve_cash_get(Some(25), Some(0), None), (25, None));
+        // Spending to a lower total replaces the balance. The engine's old
+        // number does not come back.
+        assert_eq!(super::resolve_cash_get(Some(60), Some(100), None), (60, None));
+    }
+
+    #[test]
+    fn a_stored_zero_does_not_hide_franklin_earning() {
+        // The story session's extra-stats.txt. SP1_TOTAL_CASH is h44bd6982.
+        // The two fives are not cash stats.
+        let text = "h0324c31d 0\nh29d38e8a 5\nh44bd6982 0\nh5f89566d 5\nh8d75047d 0\n";
+        let (values, pins) = super::parse_store(text);
+        assert!(pins.is_empty());
+        assert_eq!(values["h44bd6982"], 0);
+        assert!(!super::is_cash_hash(0x29d3_8e8a));
+        assert!(!super::is_cash_hash(0x5f89_566d));
+        let franklin = 0x44bd_6982;
+        assert_eq!(super::joaat(b"SP1_TOTAL_CASH"), franklin);
+        // That stored 0 yields to money the engine already has.
+        assert_eq!(super::resolve_cash_get(Some(0), Some(200), None), (200, Some(200)));
+        // A startup set of 0 is not stored and is not written through,
+        // so it cannot wipe the earn.
+        let startup = super::accept_cash_set(None, 0);
+        assert!(!startup.forward);
+        assert_eq!(startup.keep, None);
+        let again = super::accept_cash_set(Some(0), 0);
+        assert!(!again.forward);
+        // The earn script adds, then sets the new total.
+        let earn = super::accept_cash_set(Some(0), 200);
+        assert!(earn.forward);
+        assert_eq!(earn.keep, Some(200));
+        assert_eq!(earn.pin_against, None);
+        assert_eq!(super::resolve_cash_get(Some(200), Some(0), None), (200, None));
+        // Spending the last dollar stays empty even if the engine still
+        // reads the old total, until the engine moves to a different number.
+        let spent = super::accept_cash_set(Some(200), 0);
+        assert!(spent.forward);
+        assert_eq!(spent.keep, Some(0));
+        assert_eq!(spent.pin_against, Some(200));
+        assert_eq!(super::resolve_cash_get(Some(0), Some(200), Some(200)), (0, None));
+        assert_eq!(super::resolve_cash_get(Some(0), Some(40), Some(200)), (40, Some(40)));
     }
 }
 
-/// This module's hooks, online.
+/// Stat commands for story and online. Story cash never reached these when
+/// they were installed only with GTA Online.
 pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.stat_find = Some(stat_find);
     hooks.packed_key = Some(packed_key);

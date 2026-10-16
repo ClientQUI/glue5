@@ -359,6 +359,14 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
     tour::hooks(&mut hooks);
     upscale::hooks(&mut hooks);
     boot_screen::hooks(&mut hooks);
+    // Story mode earns and spends through the same stat commands as online.
+    // Installing these only from `online::start` left Franklin's cash on the
+    // engine's copy, which stays 0, so the HUD never moved.
+    stats::hooks(&mut hooks);
+    // The stat XML marks some stats server-authoritative. With no server, a
+    // local earn of those (story cash included) is dropped. Online already
+    // clears the flag; story loads the same file.
+    cloud::stat_authority_hook(&mut hooks);
     if let Some(online) = &rt().config.online {
         online::start(online, &mut hooks);
     }

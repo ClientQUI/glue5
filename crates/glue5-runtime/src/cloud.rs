@@ -313,6 +313,13 @@ mod tests {
     }
 }
 
+/// Story and online both load the stat XML. `ServerAuthoritative` would
+/// make the engine ignore a local `STAT_SET_INT` of cash and keep the HUD
+/// at the server value, which is 0 here.
+pub(crate) fn stat_authority_hook(hooks: &mut glue5_game::Hooks) {
+    hooks.xml_bool_attribute = Some(xml_bool_attribute);
+}
+
 /// This module's hooks, online.
 pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.xml_bool_attribute = Some(xml_bool_attribute);

@@ -78,13 +78,12 @@ targets:
         GCSupportsControllerUserInteraction: true
         # GTA Online: players on the same network find each other there.
         NSLocalNetworkUsageDescription: Glue 5 finds GTA Online players on your network.
-        # Google sign-in on iPhone and iPad. Replace glue5-oauth with
-        # com.googleusercontent.apps.<ios-client-prefix> before building
-        # (see the README, Google Drive). A custom URL scheme does not need
-        # a paid Apple developer account.
+        # Google sign-in on iPhone and iPad. The scheme is the reversed iOS
+        # client id. The redirect is that scheme plus :/oauth2redirect.
+        # A custom URL scheme does not need a paid Apple developer account.
         CFBundleURLTypes:
           - CFBundleURLName: glue5.google
             CFBundleURLSchemes:
-              - glue5-oauth
+              - com.googleusercontent.apps.566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu
         GCSupportedGameControllers:
           - ProfileName: ExtendedGamepad

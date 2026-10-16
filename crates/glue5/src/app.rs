@@ -111,11 +111,21 @@ pub fn run() -> Result<()> {
     glue5_runtime::qos::set_mode(settings.runtime_mode());
     // Before the window, so a save from another device is the one the start
     // page and the engine see. Bounded: a missing container gives up.
-    glue5_runtime::drive::configure(&user_dir, settings.drive_enabled(), &settings.google_client_id());
+    glue5_runtime::drive::configure(
+        &user_dir,
+        settings.drive_enabled(),
+        &settings.google_client_id(),
+        &settings.google_client_secret(),
+    );
     if settings.drive_enabled() {
         glue5_runtime::drive::sync_now(&user_dir);
         settings = Settings::load(&user_dir);
-        glue5_runtime::drive::configure(&user_dir, settings.drive_enabled(), &settings.google_client_id());
+        glue5_runtime::drive::configure(
+            &user_dir,
+            settings.drive_enabled(),
+            &settings.google_client_id(),
+            &settings.google_client_secret(),
+        );
     }
     // Before the GPU opens; turned on later, it shows from the next launch.
     let metal_hud = cfg!(target_vendor = "apple") && settings.overlay == PerfOverlay::MetalHud;
@@ -1036,6 +1046,7 @@ impl App {
                         &self.user_dir,
                         self.settings.drive_enabled(),
                         &self.settings.google_client_id(),
+                        &self.settings.google_client_secret(),
                     );
                     self.lifecycle.remember(&self.settings);
                 }

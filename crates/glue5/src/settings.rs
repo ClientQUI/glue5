@@ -85,13 +85,18 @@ pub struct Settings {
     #[serde(default)]
     pub google_drive: bool,
     /// iOS OAuth client id (`….apps.googleusercontent.com`). Not a secret.
-    /// Empty uses `GLUE5_GOOGLE_CLIENT_ID`.
+    /// Empty uses the built-in iOS client, unless `GLUE5_GOOGLE_CLIENT_ID` is set.
     #[serde(default)]
     pub google_client_id_ios: String,
-    /// Desktop OAuth client id, for the Mac. Not a secret. Empty uses
-    /// `GLUE5_GOOGLE_CLIENT_ID`.
+    /// Desktop OAuth client id, for the Mac. Not a secret. Empty uses the
+    /// built-in desktop client, unless `GLUE5_GOOGLE_CLIENT_ID` is set.
     #[serde(default)]
     pub google_client_id_desktop: String,
+    /// Desktop OAuth client secret. Google issues one for a Desktop client.
+    /// Empty omits it. Not uploaded with the other settings. iOS does not use it.
+    /// `GLUE5_GOOGLE_CLIENT_SECRET` wins.
+    #[serde(default)]
+    pub google_client_secret: String,
     /// The game starts in the sandbox (the map, no story) rather than the
     /// story: the start page's last choice.
     pub sandbox: bool,
@@ -414,6 +419,7 @@ impl Default for Settings {
             google_drive: false,
             google_client_id_ios: String::new(),
             google_client_id_desktop: String::new(),
+            google_client_secret: String::new(),
             sandbox: false,
             online: false,
             online_name: String::new(),
@@ -469,6 +475,11 @@ pub fn google_client_id_from_env() -> Option<String> {
     std::env::var("GLUE5_GOOGLE_CLIENT_ID").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
+/// `GLUE5_GOOGLE_CLIENT_SECRET`, when it is set and not blank.
+pub fn google_client_secret_from_env() -> Option<String> {
+    std::env::var("GLUE5_GOOGLE_CLIENT_SECRET").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
 fn random() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     std::collections::hash_map::RandomState::new().build_hasher().finish()
@@ -522,12 +533,30 @@ impl Settings {
         drive_forced().unwrap_or(self.google_drive)
     }
 
-    /// The OAuth client id for this device. The environment variable wins.
+    /// The OAuth client id for this device. The environment variable wins,
+    /// then a non-empty saved field, then the built-in client for this platform.
     pub fn google_client_id(&self) -> String {
         if let Some(id) = google_client_id_from_env() {
             return id;
         }
-        if cfg!(target_os = "ios") { self.google_client_id_ios.clone() } else { self.google_client_id_desktop.clone() }
+        let saved = if cfg!(target_os = "ios") {
+            self.google_client_id_ios.trim()
+        } else {
+            self.google_client_id_desktop.trim()
+        };
+        if saved.is_empty() { glue5_runtime::drive::default_client_id().to_owned() } else { saved.to_owned() }
+    }
+
+    /// The desktop client secret, if one was set. iOS always returns empty.
+    /// The environment variable wins. This is not copied to another device.
+    pub fn google_client_secret(&self) -> String {
+        if cfg!(target_os = "ios") {
+            return String::new();
+        }
+        if let Some(secret) = google_client_secret_from_env() {
+            return secret;
+        }
+        self.google_client_secret.trim().to_owned()
     }
 
     /// JSON for the lifecycle watch, which cannot borrow `Settings`.
@@ -861,6 +890,12 @@ mod tests {
         if !cfg!(target_os = "ios") {
             assert_eq!(on.google_client_id(), "desktop.apps.googleusercontent.com");
         }
+        std::fs::write(dir.join("glue5.json"), r#"{"google_drive": true}"#).unwrap();
+        let builtin = Settings::load(&dir);
+        if google_client_id_from_env().is_none() {
+            assert_eq!(builtin.google_client_id(), glue5_runtime::drive::default_client_id());
+        }
+        assert!(builtin.google_client_secret().is_empty() || google_client_secret_from_env().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

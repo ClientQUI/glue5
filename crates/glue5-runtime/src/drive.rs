@@ -22,6 +22,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 const SCOPE: &str = "https://www.googleapis.com/auth/drive.appdata";
+/// Built-in iOS OAuth client. Public. iPhone and iPad use this unless the
+/// settings field or `GLUE5_GOOGLE_CLIENT_ID` replaces it.
+pub const DEFAULT_IOS_CLIENT_ID: &str = "566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu.apps.googleusercontent.com";
+/// Built-in desktop OAuth client. Public. Mac uses this unless the settings
+/// field or `GLUE5_GOOGLE_CLIENT_ID` replaces it.
+pub const DEFAULT_DESKTOP_CLIENT_ID: &str = "566965852987-md6g70j3j5qep867r642mg5u05furtfe.apps.googleusercontent.com";
+
+/// The client id this device uses when the saved field is empty.
+pub fn default_client_id() -> &'static str {
+    if cfg!(target_os = "ios") { DEFAULT_IOS_CLIENT_ID } else { DEFAULT_DESKTOP_CLIENT_ID }
+}
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 /// Keychain item. The bundle id is `com.lennertwilhelm.gta5offline`.
@@ -60,6 +71,8 @@ struct State {
     user_dir: PathBuf,
     enabled: bool,
     client_id: String,
+    /// Desktop OAuth client secret. Empty on iOS. Never uploaded.
+    client_secret: String,
 }
 
 #[derive(Clone)]
@@ -168,10 +181,12 @@ pub fn generation() -> u64 {
 }
 
 /// Remembers where saves are, whether the toggle wants sync, and the client id.
-pub fn configure(user_dir: &Path, enabled: bool, client_id: &str) {
+/// `client_secret` is the desktop secret, or empty. iOS ignores it.
+pub fn configure(user_dir: &Path, enabled: bool, client_id: &str, client_secret: &str) {
     let client_id = client_id.trim().to_owned();
+    let client_secret = if cfg!(target_os = "ios") { String::new() } else { client_secret.trim().to_owned() };
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    *state = Some(State { user_dir: user_dir.to_path_buf(), enabled, client_id });
+    *state = Some(State { user_dir: user_dir.to_path_buf(), enabled, client_id, client_secret });
     if !enabled {
         set_status(STATUS_OFF, "");
     }
@@ -182,6 +197,7 @@ fn state_snapshot() -> Option<State> {
         user_dir: s.user_dir.clone(),
         enabled: s.enabled,
         client_id: s.client_id.clone(),
+        client_secret: s.client_secret.clone(),
     })
 }
 
@@ -192,8 +208,8 @@ fn is_enabled() -> bool {
 /// `glue5.json` was just written. Enables or disables sync from that file
 /// and queues an upload when it is on.
 pub fn on_settings_saved(user_dir: &Path, json: &[u8]) {
-    let (enabled, client_id) = enabled_from_json(json);
-    configure(user_dir, enabled, &client_id);
+    let (enabled, client_id, client_secret) = enabled_from_json(json);
+    configure(user_dir, enabled, &client_id, &client_secret);
     if is_enabled() {
         note_write();
     }
@@ -255,10 +271,11 @@ pub fn push_now(user_dir: &Path) {
 
 /// Opens the Google sign-in page. The button's thread is the main thread on
 /// iPhone and iPad, which is what `ASWebAuthenticationSession` requires.
-pub fn sign_in(client_id: &str) {
+pub fn sign_in(client_id: &str, client_secret: &str) {
     let client_id = client_id.trim().to_owned();
+    let client_secret = client_secret.trim().to_owned();
     if let Some(state) = state_snapshot() {
-        configure(&state.user_dir, true, &client_id);
+        configure(&state.user_dir, true, &client_id, &client_secret);
     }
     if client_id.is_empty() {
         set_status(STATUS_NEED_ID, "");
@@ -294,7 +311,7 @@ pub fn sign_in(client_id: &str) {
     #[cfg(not(target_os = "ios"))]
     {
         let _ = std::thread::Builder::new().name("drive-auth".into()).spawn(move || {
-            let result = loopback_sign_in(&client_id, &verifier, &challenge, &state);
+            let result = loopback_sign_in(&client_id, &client_secret, &verifier, &challenge, &state);
             SIGNING_IN.store(false, Ordering::Relaxed);
             match result {
                 Ok(()) => {
@@ -317,7 +334,7 @@ pub fn sign_in(client_id: &str) {
 
 #[cfg(target_os = "ios")]
 fn finish_sign_in(callback: Result<String, String>, client_id: &str, verifier: &str, redirect: &str, state: &str) {
-    let result = callback.and_then(|url| exchange_from_redirect(&url, client_id, verifier, redirect, state));
+    let result = callback.and_then(|url| exchange_from_redirect(&url, client_id, "", verifier, redirect, state));
     SIGNING_IN.store(false, Ordering::Relaxed);
     match result {
         Ok(()) => {
@@ -402,7 +419,7 @@ struct RemoteFile {
 }
 
 fn reconcile_drive(state: &State, way: Way, deadline: Instant) -> Result<Counts, String> {
-    let access = fresh_access(&state.client_id)?;
+    let access = fresh_access(&state.client_id, &state.client_secret)?;
     let remote = list_files(&access)?;
     let mirror = std::env::temp_dir().join(format!("glue5-drive-{}", std::process::id()));
     let _ = fs::remove_dir_all(&mirror);
@@ -440,7 +457,7 @@ fn reconcile_drive(state: &State, way: Way, deadline: Instant) -> Result<Counts,
     let mut counts = reconcile(&state.user_dir, &mirror, way, &hold);
     // `up` from the mirror copy is not a network upload. Count those below.
     counts.up = 0;
-    let access = fresh_access(&state.client_id)?;
+    let access = fresh_access(&state.client_id, &state.client_secret)?;
     let mut rels = Vec::new();
     collect(&mirror, &mirror, &mut rels);
     for rel in rels {
@@ -679,18 +696,30 @@ fn set_mtime(path: &Path, mtime_ns: u128) {
 
 /// `GLUE5_GOOGLE_DRIVE` wins. A file with no `google_drive` field is off.
 /// `GLUE5_GOOGLE_CLIENT_ID` wins over the platform's saved client id.
-fn enabled_from_json(json: &[u8]) -> (bool, String) {
+fn enabled_from_json(json: &[u8]) -> (bool, String, String) {
     let value = serde_json::from_slice::<Value>(json).ok();
     let client_id = client_id_from(value.as_ref());
+    let client_secret = client_secret_from(value.as_ref());
     if !cfg!(target_vendor = "apple") {
-        return (false, client_id);
+        return (false, client_id, client_secret);
     }
     let enabled = match std::env::var("GLUE5_GOOGLE_DRIVE").ok().as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("0" | "off" | "false") => false,
         Some("1" | "on" | "true") => true,
         _ => value.as_ref().and_then(|v| v.get("google_drive")).and_then(Value::as_bool).unwrap_or(false),
     };
-    (enabled, client_id)
+    (enabled, client_id, client_secret)
+}
+
+/// Desktop clients send this on the token request when it is set. iOS clients
+/// have no secret. An empty string omits the parameter.
+fn with_secret(form: String, secret: &str) -> String {
+    let secret = secret.trim();
+    if secret.is_empty() || cfg!(target_os = "ios") {
+        form
+    } else {
+        format!("{form}&client_secret={}", form_encode(secret))
+    }
 }
 
 fn client_id_from(value: Option<&Value>) -> String {
@@ -701,8 +730,23 @@ fn client_id_from(value: Option<&Value>) -> String {
         }
     }
     let key = if cfg!(target_os = "ios") { "google_client_id_ios" } else { "google_client_id_desktop" };
+    let id =
+        value.and_then(|v| v.get(key)).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("");
+    if id.is_empty() { default_client_id().to_owned() } else { id.to_owned() }
+}
+
+fn client_secret_from(value: Option<&Value>) -> String {
+    if cfg!(target_os = "ios") {
+        return String::new();
+    }
+    if let Ok(env) = std::env::var("GLUE5_GOOGLE_CLIENT_SECRET") {
+        let env = env.trim();
+        if !env.is_empty() {
+            return env.to_owned();
+        }
+    }
     value
-        .and_then(|v| v.get(key))
+        .and_then(|v| v.get("google_client_secret"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -711,15 +755,13 @@ fn client_id_from(value: Option<&Value>) -> String {
 }
 
 fn device_keys() -> &'static [&'static str] {
-    &["game_dir", "google_client_id_ios", "google_client_id_desktop"]
+    &["game_dir", "google_client_id_ios", "google_client_id_desktop", "google_client_secret"]
 }
 
 fn normalized_settings(bytes: &[u8]) -> Option<String> {
     let mut value: Value = serde_json::from_slice(bytes).ok()?;
-    let obj = value.as_object_mut()?;
-    obj.insert("game_dir".into(), Value::Null);
-    obj.insert("google_client_id_ios".into(), Value::String(String::new()));
-    obj.insert("google_client_id_desktop".into(), Value::String(String::new()));
+    value.as_object()?;
+    strip_device_fields(&mut value);
     Some(value.to_string())
 }
 
@@ -741,12 +783,16 @@ fn remote_has_device_fields(bytes: &[u8]) -> bool {
 /// Cloud copy: the same settings, without this device's game folder or client ids.
 fn cloud_settings_bytes(local: &[u8]) -> Vec<u8> {
     let Ok(mut value) = serde_json::from_slice::<Value>(local) else { return local.to_vec() };
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("game_dir".into(), Value::Null);
-        obj.insert("google_client_id_ios".into(), Value::String(String::new()));
-        obj.insert("google_client_id_desktop".into(), Value::String(String::new()));
-    }
+    strip_device_fields(&mut value);
     serde_json::to_vec_pretty(&value).unwrap_or_else(|_| local.to_vec())
+}
+
+fn strip_device_fields(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else { return };
+    obj.insert("game_dir".into(), Value::Null);
+    for key in device_keys().iter().skip(1) {
+        obj.insert((*key).into(), Value::String(String::new()));
+    }
 }
 
 /// Local copy after a newer cloud file: cloud settings, this device's folder and client ids.
@@ -895,7 +941,13 @@ fn bundle_has_scheme(scheme: &str) -> bool {
 }
 
 #[cfg(not(target_os = "ios"))]
-fn loopback_sign_in(client_id: &str, verifier: &str, challenge: &str, state: &str) -> Result<(), String> {
+fn loopback_sign_in(
+    client_id: &str,
+    client_secret: &str,
+    verifier: &str,
+    challenge: &str,
+    state: &str,
+) -> Result<(), String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("cannot listen for the sign-in redirect: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -917,12 +969,13 @@ fn loopback_sign_in(client_id: &str, verifier: &str, challenge: &str, state: &st
         html.len()
     );
     let _ = stream.write_all(response.as_bytes());
-    exchange_from_redirect(target, client_id, verifier, &redirect, state)
+    exchange_from_redirect(target, client_id, client_secret, verifier, &redirect, state)
 }
 
 fn exchange_from_redirect(
     url: &str,
     client_id: &str,
+    client_secret: &str,
     verifier: &str,
     redirect: &str,
     expect_state: &str,
@@ -938,12 +991,15 @@ fn exchange_from_redirect(
         return Err("Sign-in came back with the wrong state. Try again.".into());
     }
     let code = query_param(url, "code").ok_or_else(|| "Sign-in did not return a code.".to_owned())?;
-    let form = format!(
-        "client_id={}&code={}&code_verifier={}&grant_type=authorization_code&redirect_uri={}",
-        form_encode(client_id),
-        form_encode(&code),
-        form_encode(verifier),
-        form_encode(redirect),
+    let form = with_secret(
+        format!(
+            "client_id={}&code={}&code_verifier={}&grant_type=authorization_code&redirect_uri={}",
+            form_encode(client_id),
+            form_encode(&code),
+            form_encode(verifier),
+            form_encode(redirect),
+        ),
+        client_secret,
     );
     let value = post_form(TOKEN_URL, &form, None)?;
     store_token_response(&value, None).map(|_| ())
@@ -961,7 +1017,7 @@ fn open_browser(url: &str) -> Result<(), String> {
     result.map(|_| ()).map_err(|e| format!("cannot open the browser: {e}"))
 }
 
-fn fresh_access(client_id: &str) -> Result<String, String> {
+fn fresh_access(client_id: &str, client_secret: &str) -> Result<String, String> {
     let Some(token) = ensure_token() else {
         return Err("Sign in to copy saves. Until then they stay on this device.".into());
     };
@@ -972,10 +1028,13 @@ fn fresh_access(client_id: &str) -> Result<String, String> {
     if token.refresh.is_empty() {
         return Err("Sign in again. Google did not return a refresh token.".into());
     }
-    let form = format!(
-        "client_id={}&grant_type=refresh_token&refresh_token={}",
-        form_encode(client_id),
-        form_encode(&token.refresh),
+    let form = with_secret(
+        format!(
+            "client_id={}&grant_type=refresh_token&refresh_token={}",
+            form_encode(client_id),
+            form_encode(&token.refresh),
+        ),
+        client_secret,
     );
     let value = post_form(TOKEN_URL, &form, None)?;
     let stored = store_token_response(&value, Some(&token.refresh))?;
@@ -1395,8 +1454,8 @@ mod tests {
 
     #[test]
     fn settings_keep_the_local_game_folder_and_client_ids() {
-        let local = br#"{"game_dir":"/iphone/Documents/game","google_drive":true,"google_client_id_ios":"ios.apps.googleusercontent.com","google_client_id_desktop":"desktop","fog":true}"#;
-        let remote = br#"{"game_dir":"/mac/game","google_drive":true,"google_client_id_ios":"other","google_client_id_desktop":"mac","fog":false}"#;
+        let local = br#"{"game_dir":"/iphone/Documents/game","google_drive":true,"google_client_id_ios":"ios.apps.googleusercontent.com","google_client_id_desktop":"desktop","google_client_secret":"local-secret","fog":true}"#;
+        let remote = br#"{"game_dir":"/mac/game","google_drive":true,"google_client_id_ios":"other","google_client_id_desktop":"mac","google_client_secret":"remote-secret","fog":false}"#;
         assert!(!settings_equal(local, remote));
         let merged = local_settings_bytes(remote, local);
         let parsed: Value = serde_json::from_slice(&merged).unwrap();
@@ -1404,10 +1463,12 @@ mod tests {
         assert_eq!(parsed["fog"], false);
         assert_eq!(parsed["google_client_id_ios"], "ios.apps.googleusercontent.com");
         assert_eq!(parsed["google_client_id_desktop"], "desktop");
+        assert_eq!(parsed["google_client_secret"], "local-secret");
         let cloud = cloud_settings_bytes(local);
         let parsed: Value = serde_json::from_slice(&cloud).unwrap();
         assert!(parsed["game_dir"].is_null());
         assert_eq!(parsed["google_client_id_ios"], "");
+        assert_eq!(parsed["google_client_secret"], "");
         assert_eq!(parsed["fog"], true);
         let again = cloud_settings_bytes(&merged);
         assert!(settings_equal(&merged, &again));
@@ -1426,6 +1487,16 @@ mod tests {
             ios_scheme("123-abc.apps.googleusercontent.com").as_deref(),
             Some("com.googleusercontent.apps.123-abc")
         );
+        assert_eq!(
+            ios_scheme(DEFAULT_IOS_CLIENT_ID).as_deref(),
+            Some("com.googleusercontent.apps.566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu")
+        );
+        let redirect = "com.googleusercontent.apps.566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu:/oauth2redirect";
+        assert!(auth_url(DEFAULT_IOS_CLIENT_ID, redirect, "c", "s").contains(&form_encode(redirect)));
+        if std::env::var_os("GLUE5_GOOGLE_CLIENT_ID").is_none() {
+            assert_eq!(client_id_from(None), default_client_id());
+            assert_eq!(client_id_from(Some(&serde_json::json!({"google_client_id_desktop": ""}))), default_client_id());
+        }
         assert!(ios_scheme("desktop-client.apps.googleusercontent.com").is_some());
         assert!(ios_scheme("not-a-google-client").is_none());
     }

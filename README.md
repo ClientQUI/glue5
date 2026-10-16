@@ -209,7 +209,8 @@ intent's extras).
 | `GLUE5_FOG` | `0` skips the fog pass. The menu's fog switch is the control while the app is running. Fog never tints a pixel inside 48 m, a pixel whose depth says it is close, or the ground when the depth buffer is the far clear. |
 | `GLUE5_RENDER_BOOST` | Multiplier on the chosen render scale while thermals are nominal, never past 100%. Unset is 1. The previous 1.25 phone default raised the back buffer enough that near textures stopped streaming in; raise it from the graphics menu if the device has the memory. Fair heat returns to the chosen scale; Serious and Critical go below it (×0.75, then ×0.6) when thermal protection is on. |
 | `GLUE5_GOOGLE_DRIVE` | `0` or `1`. Unset follows the Game-tab toggle, which defaults to off until you turn it on. Off, or any platform other than iPhone, iPad and Mac, keeps saves on the device. |
-| `GLUE5_GOOGLE_CLIENT_ID` | OAuth client id (`….apps.googleusercontent.com`). Wins over the Client ID field. Use the iOS client on iPhone and iPad, and the desktop client on Mac. See **Google Drive**. |
+| `GLUE5_GOOGLE_CLIENT_ID` | OAuth client id (`….apps.googleusercontent.com`). Wins over the Client ID field. Empty uses the built-in iOS client on iPhone and iPad, and the built-in desktop client on Mac. See **Google Drive**. |
+| `GLUE5_GOOGLE_CLIENT_SECRET` | Desktop OAuth client secret. Wins over the Secret field. Not used on iPhone or iPad. Not uploaded. See **Google Drive**. |
 | `GLUE5_EFFICIENCY` | `off`, `hybrid` (recommended), or `full` / `full-e`. Unset follows the Video choice, which defaults to Hybrid. Hybrid runs startup and loading uncapped, with streaming and shader compiles at user-interactive, then drops the game, render and GPU threads to utility and paces at 24 FPS. Streaming stays user-interactive after that: putting it below the frame stretched a load from 1-2 s to 6-10 s. A missed frame raises the game and render threads, then eases them back. Full-E keeps those threads at utility and paces at 20 FPS, including the load. Off keeps frame, streaming and compile threads user-interactive, and still lifts the frame cap until the load's reads go quiet. The mixer, the audio pump and the device callback stay user-interactive in every mode; hybrid and full-E buffer 250 ms, and on Apple the callback takes a time-constraint schedule and joins an audio workgroup. Shader compiles and texture decompression stay off the game thread. `GLUE5_EFFICIENCY_MODE=1` is full-E and `=0` is off. `GLUE5_EFFICIENCY_CORES=0` is off. Nothing here uses the Neural Engine. |
 | `GLUE5_SHADOW_DISTANCE` | Metres past which distant shadow casters are skipped. `0` disables that culling. Unset uses 120 m on phones and 250 m on desktop, shorter while the device is hot. |
 | `GLUE5_PLAY=1` | Start the game without the start page (as `--play`; on a phone too). |
@@ -395,16 +396,30 @@ not appear in the Drive file list. Sync runs at launch, when a save or
 `glue5.json` is written, and when the app backgrounds. A newer file wins; the
 older one is kept next to it as `name.glue5-conflict-<seconds>-local.bak` or
 `-remote.bak`. Each device keeps its own game folder and its own OAuth client
-ids (those fields are cleared in the cloud copy). While a session is running,
+ids and the desktop client secret (those fields are cleared in the cloud copy). While a session is running,
 local saves upload and a newer cloud copy waits until the next launch, so an
 open file is not replaced under the engine.
 
-Sign-in is OAuth 2.0 for a native app, with PKCE and no client secret. iPhone
-and iPad use `ASWebAuthenticationSession` and an **iOS** OAuth client. Mac
-opens the browser and listens on `http://127.0.0.1` (a **Desktop** OAuth
-client). The refresh token is stored in the Keychain
-(`com.lennertwilhelm.gta5offline` / `google-drive`), not in `glue5.json`.
-**Sign out** deletes that Keychain item and leaves the Drive copies in place.
+Sign-in is OAuth 2.0 for a native app, with PKCE. iPhone and iPad use
+`ASWebAuthenticationSession` and the built-in **iOS** client
+(`566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu.apps.googleusercontent.com`).
+The redirect is
+`com.googleusercontent.apps.566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu:/oauth2redirect`,
+which is the URL scheme in `platform/ios/project.yml`. Mac opens the browser
+and listens on `http://127.0.0.1` with the built-in **Desktop** client
+(`566965852987-md6g70j3j5qep867r642mg5u05furtfe.apps.googleusercontent.com`).
+Leave the ID field empty to keep that client. A value in the field, or
+`GLUE5_GOOGLE_CLIENT_ID`, replaces it. The refresh token is stored in the
+Keychain (`com.lennertwilhelm.gta5offline` / `google-drive`), not in
+`glue5.json`. **Sign out** deletes that Keychain item and leaves the Drive
+copies in place.
+
+A Desktop client has a client secret. Google's token endpoint does not use
+one for iOS, and the published exchange sample omits it, but a Desktop client
+is not in that exemption. The Mac **Secret** field (or
+`GLUE5_GOOGLE_CLIENT_SECRET`) is sent on the token and refresh requests when
+it is set. It is not built into the app, and it is not uploaded. iPhone and
+iPad never send it.
 
 If the toggle is off, you are signed out, or Drive cannot be reached, the
 files stay on the device and the toggle's note says so. `GLUE5_GOOGLE_DRIVE=0`
@@ -422,22 +437,20 @@ Create the OAuth clients once, in [Google Cloud Console](https://console.cloud.g
    Google review is required for this non-sensitive scope) so a personal
    token keeps working.
 3. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
-   - **iPhone and iPad:** application type **iOS**. Bundle ID
-     `com.lennertwilhelm.gta5offline`. Copy the client ID
-     (`<prefix>.apps.googleusercontent.com`). Google's redirect is
-     `com.googleusercontent.apps.<prefix>:/oauth2redirect`. In
-     `platform/ios/project.yml`, replace the `glue5-oauth` entry under
-     `CFBundleURLSchemes` with `com.googleusercontent.apps.<prefix>` and
-     rebuild (`mise run ios` or the CI IPA). A custom URL scheme is not an
-     entitlement. Paste that same client ID into the Game tab's **ID** field,
-     or set `GLUE5_GOOGLE_CLIENT_ID` for the process.
-   - **Mac:** application type **Desktop app**. Copy that client ID into the
-     Mac app's **ID** field (or `GLUE5_GOOGLE_CLIENT_ID`). Desktop clients
-     accept `http://127.0.0.1` on any port; no URL scheme and no client secret.
+   The app already has one iOS client and one Desktop client. Replace them
+   only if you create new ones: put the iOS client id in the iPhone/iPad
+   **ID** field (or `GLUE5_GOOGLE_CLIENT_ID`) and change
+   `CFBundleURLSchemes` in `platform/ios/project.yml` to
+   `com.googleusercontent.apps.<prefix>`, then rebuild. Put a new Desktop
+   client id in the Mac **ID** field. Desktop clients accept
+   `http://127.0.0.1` on any port. Copy the Desktop client's secret into the
+   Mac **Secret** field or `GLUE5_GOOGLE_CLIENT_SECRET`. Do not put that
+   secret in the iOS app.
 4. On each device: Game tab → **Google Drive** on → **Sign in**, with the
-   same Google account. The first launch after that copies the newer save
-   across. An ad-hoc build can sign in; the token still has to land in the
-   Keychain, which needs a real signature (a free team is enough).
+   same Google account. On Mac, fill **Secret** first if Google answers
+   `client_secret is missing`. The first launch after that copies the newer
+   save across. An ad-hoc build can sign in; the token still has to land in
+   the Keychain, which needs a real signature (a free team is enough).
 
 The iOS and desktop client ids are different. Each device reads its own field
 (`google_client_id_ios` or `google_client_id_desktop`). Syncing settings does

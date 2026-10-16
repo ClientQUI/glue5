@@ -550,7 +550,14 @@ fn drive_setting(ui: &mut egui::Ui, settings: &mut Settings) {
         } else {
             &mut settings.google_client_id_desktop
         };
-        text_field(ui, "ID", client, "….apps.googleusercontent.com", 200);
+        text_field(ui, "ID", client, glue5_runtime::drive::default_client_id(), 200);
+    }
+    if !cfg!(target_os = "ios") {
+        if settings::google_client_secret_from_env().is_some() {
+            ui.label(RichText::new("Client secret comes from GLUE5_GOOGLE_CLIENT_SECRET.").small().color(theme::MUTED));
+        } else {
+            text_field(ui, "Secret", &mut settings.google_client_secret, "Desktop client secret", 80);
+        }
     }
     let signed = glue5_runtime::drive::signed_in();
     setting(ui, "Account", Control::Action, Some(if signed { "Signed in" } else { "Not signed in" }), |ui| {
@@ -559,7 +566,7 @@ fn drive_setting(ui: &mut egui::Ui, settings: &mut Settings) {
                 glue5_runtime::drive::sign_out();
             } else {
                 settings.google_drive = true;
-                glue5_runtime::drive::sign_in(&settings.google_client_id());
+                glue5_runtime::drive::sign_in(&settings.google_client_id(), &settings.google_client_secret());
             }
         }
     });

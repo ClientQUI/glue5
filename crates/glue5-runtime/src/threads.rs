@@ -167,12 +167,13 @@ fn engine_name(mem: crate::memory::Mem, arg: u64) -> Option<String> {
 }
 
 fn run_pthread(pthread: u64, start: u64, arg: u64, name: Option<String>) {
-    // Hybrid starts this thread at user-interactive (a load) and drops it
-    // once play is steady, unless it is the mixer, which stays interactive.
-    // A load that left streaming below the frame used to stretch a
-    // post-cutscene load from 1-2 s to 6-10 s on an iPhone 13 Pro.
-    // Streaming is user-interactive during that boost and utility after.
-    // The class is read again every frame on the game and render threads.
+    // Hybrid starts this thread at user-interactive (a load) and drops the
+    // game and render threads once play is steady. The mixer stays
+    // interactive, and so does streaming: leaving it below the frame
+    // stretched a post-cutscene load from 1-2 s to 6-10 s on an iPhone 13
+    // Pro, because those threads kept the performance cores. Full-E is the
+    // mode that does put streaming on efficiency cores. The class is read
+    // again every frame on the game and render threads.
     crate::qos::apply_engine_thread(name.as_deref());
     let env = new_env();
     let mem = rt().memory.mem();

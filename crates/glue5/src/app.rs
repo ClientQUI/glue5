@@ -794,6 +794,16 @@ impl App {
         let engine_cap = self.game.as_ref().and_then(|g| (g.started.max_fps > 0).then_some(g.started.max_fps));
         let requested = limited_fps(self.settings.max_fps, engine_cap);
         let thermal = limited_fps(requested, self.thermal_cap.filter(|_| self.settings.thermal_protection));
+        // The engine advances a streaming budget per frame. Sleeping to the
+        // menu cap (30 on a phone, 24 in Hybrid) multiplies the load. The
+        // cap returns once archive and shader reads have gone quiet. A
+        // serious or critical thermal state still applies.
+        if glue5_runtime::qos::load_uncapped() {
+            if self.settings.thermal_protection && self.thermal_state >= 2 {
+                return thermal;
+            }
+            return 0;
+        }
         limited_fps(thermal, glue5_runtime::qos::pace_fps())
     }
 
@@ -881,6 +891,10 @@ impl App {
             s.max_fps,
             self.mode,
         ));
+        // Before the engine's first frame. The load reads archives and
+        // shaders for a long time after this returns; the frame cap stays
+        // off until those reads go quiet.
+        glue5_runtime::qos::note_load();
         let game = glue5_runtime::start(
             glue5_runtime::Config {
                 game_dir: game_dir.clone(),
@@ -916,7 +930,6 @@ impl App {
             resource_budget: s.resource_budget,
         };
         self.game = Some(Running { game, input: None, started, back_buffer, _audio: audio });
-        glue5_runtime::qos::note_load();
         self.ui.game_started();
         glue5_runtime::diagnostics::note(format_args!("game launch complete: waiting for engine input block"));
         Ok(())
@@ -964,10 +977,11 @@ impl App {
         let buttons: &[ButtonData] = if MOBILE {
             &[ButtonData { flags: Button::RETURNKEY_DEFAULT, button_id: 0, text: "OK" }]
         } else {
-            &[
-                ButtonData { flags: Button::ESCAPEKEY_DEFAULT, button_id: 0, text: "Quit" },
-                ButtonData { flags: Button::RETURNKEY_DEFAULT, button_id: 1, text: "Start page" },
-            ]
+            &[ButtonData { flags: Button::ESCAPEKEY_DEFAULT, button_id: 0, text: "Quit" }, ButtonData {
+                flags: Button::RETURNKEY_DEFAULT,
+                button_id: 1,
+                text: "Start page",
+            }]
         };
         let shown =
             sdl3::messagebox::show_message_box(MessageBoxFlag::ERROR, buttons, "Glue 5", &text, &self.window, None);
@@ -1124,12 +1138,7 @@ fn upscaler(settings: &Settings) -> Upscaler {
 const UPSCALERS: &[Upscaling] = &[Upscaling::Bicubic, Upscaling::MetalFx, Upscaling::MetalFxTemporal, Upscaling::Fsr];
 
 /// Keyboard and mouse into the game's input block.
-fn game_input(
-    input: &InputBlock,
-    event: &Event,
-    window: &sdl3::video::Window,
-    back_buffer: (u32, u32),
-) {
+fn game_input(input: &InputBlock, event: &Event, window: &sdl3::video::Window, back_buffer: (u32, u32)) {
     let (bw, bh) = (back_buffer.0 as f32, back_buffer.1 as f32);
     match *event {
         Event::KeyDown { scancode: Some(sc), repeat, .. } => {

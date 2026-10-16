@@ -38,6 +38,8 @@ static PACE: Mutex<Pace> = Mutex::new(Pace::new());
 static WARP: AtomicBool = AtomicBool::new(false);
 static STREAM_BYTES: AtomicU64 = AtomicU64::new(0);
 static STREAM_JOBS: AtomicU32 = AtomicU32::new(0);
+/// Game-file and shader bytes read since the pace last looked.
+static READ_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Bumped when the class a thread should hold changes, so it can re-apply
 /// without a syscall on the frames in between.
 static PLACEMENT: AtomicU64 = AtomicU64::new(1);
@@ -110,12 +112,33 @@ pub fn demand() -> Demand {
 }
 
 /// Frames per second this mode paces at. The menu's own cap can only go lower.
+/// None while the initial load is still reading, except Full-E, so a loading
+/// screen is not sliced by the play cap.
 pub fn pace_fps() -> Option<u32> {
     match mode() {
-        Mode::Off => None,
-        Mode::Hybrid => Some(24),
         Mode::FullE => Some(20),
+        Mode::Hybrid if !load_uncapped() => Some(24),
+        Mode::Off | Mode::Hybrid => None,
     }
+}
+
+/// The initial load has not gone quiet yet. The presenter should not sleep
+/// to the menu cap. Full-E stays capped.
+pub fn load_uncapped() -> bool {
+    PACE.lock().map(|pace| pace.uncapped()).unwrap_or(false)
+}
+
+/// Bytes just read from a game archive or a shader. The load latch treats a
+/// frame of these as "still starting".
+pub fn note_io(bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    READ_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+fn take_io() -> u64 {
+    READ_BYTES.swap(0, Ordering::Relaxed)
 }
 
 /// Playback does not start, and does not restart after an underrun, until
@@ -150,7 +173,14 @@ pub fn note_stream(bytes: u64, jobs: u32) {
     STREAM_BYTES.store(bytes, Ordering::Relaxed);
     STREAM_JOBS.store(jobs, Ordering::Relaxed);
     if bytes >= Pace::STREAM_BYTES || jobs >= Pace::STREAM_JOBS {
-        observe(PaceSample { frame_ms: 0.0, budget_ms: 1.0, stream_bytes: bytes, stream_jobs: jobs, warp: false });
+        observe(PaceSample {
+            frame_ms: 0.0,
+            budget_ms: 1.0,
+            stream_bytes: bytes,
+            stream_jobs: jobs,
+            io_bytes: take_io(),
+            warp: false,
+        });
     }
 }
 
@@ -162,6 +192,7 @@ pub fn note_frame(took_ms: f32, budget_ms: f32) {
         budget_ms,
         stream_bytes: STREAM_BYTES.load(Ordering::Relaxed),
         stream_jobs: STREAM_JOBS.load(Ordering::Relaxed),
+        io_bytes: take_io(),
         warp,
     });
 }
@@ -278,10 +309,14 @@ pub fn host_qos(normal: Qos) -> Qos {
 /// utility once play is steady.
 pub fn compile_qos() -> Qos {
     match mode() {
-        Mode::Off => Qos::Initiated,
+        // The engine creates thousands of shaders while loading. Initiated
+        // loses the performance cores to the interactive game and render
+        // threads, and a cold pipeline is about 200 ms of CPU on an A15.
+        Mode::Off => Qos::Interactive,
         Mode::FullE => Qos::Utility,
         Mode::Hybrid => match demand() {
-            Demand::Boost | Demand::Hitch => Qos::Initiated,
+            Demand::Boost => Qos::Interactive,
+            Demand::Hitch => Qos::Initiated,
             Demand::Ease | Demand::Cruise => Qos::Utility,
         },
     }
@@ -291,7 +326,7 @@ pub fn compile_qos() -> Qos {
 /// on performance cores; steady play wants efficiency cores.
 pub fn decompress_qos() -> Qos {
     match mode() {
-        Mode::Off => Qos::Initiated,
+        Mode::Off => Qos::Interactive,
         Mode::FullE => Qos::Utility,
         Mode::Hybrid => match demand() {
             Demand::Boost => Qos::Interactive,

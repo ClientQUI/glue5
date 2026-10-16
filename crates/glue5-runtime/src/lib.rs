@@ -155,10 +155,19 @@ impl Config {
         // pause menu, and after it the pad's other buttons went to the debug
         // tools). Pads as in a retail build.
         args.extend(["-disableDebugPadButtons", "-disallowdebugpad"].map(String::from));
-        // The engine's limiter counts 60 Hz intervals per frame (0: off).
-        let frame_limit = match self.max_fps {
-            0 => 0,
-            fps => (60 / fps.clamp(1, 60)).max(1),
+        // The engine's limiter counts 60 Hz intervals per frame (0: off) and
+        // cannot be changed until the next start. Left on, it slices the
+        // load by the menu cap (30 on a phone: a frame-budgeted stream takes
+        // twice as long as at 60). The presenter applies that cap once play
+        // is steady, and lifts it during the load. The benchmark keeps the
+        // engine limiter so its numbers follow the menu.
+        let frame_limit = if self.benchmark {
+            match self.max_fps {
+                0 => 0,
+                fps => (60 / fps.clamp(1, 60)).max(1),
+            }
+        } else {
+            0
         };
         args.push(format!("-frameLimit={frame_limit}"));
         args.push(format!("-wasmstartchoice={}", self.start_mode));

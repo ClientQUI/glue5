@@ -330,15 +330,23 @@ impl Vfs {
     pub fn read(&self, fd: i32, buf: &mut [u8], offset: Option<u64>) -> Result<usize, Errno> {
         let open = self.get(fd)?;
         match &open.node {
-            Node::File(f) => match offset {
-                Some(off) => read_at(f, buf, off).map_err(io_errno),
-                None => {
-                    let mut pos = open.pos.lock().unwrap();
-                    let n = read_at(f, buf, *pos).map_err(io_errno)?;
-                    *pos += n as u64;
-                    Ok(n)
+            Node::File(f) => {
+                let n = match offset {
+                    Some(off) => read_at(f, buf, off).map_err(io_errno)?,
+                    None => {
+                        let mut pos = open.pos.lock().unwrap();
+                        let n = read_at(f, buf, *pos).map_err(io_errno)?;
+                        *pos += n as u64;
+                        n
+                    }
+                };
+                // The load latch. Gameplay reads stay under it once the
+                // initial burst has gone quiet; this only counts archives.
+                if n > 0 && open.path.starts_with("/game") {
+                    crate::qos::note_io(n as u64);
                 }
-            },
+                Ok(n)
+            }
             Node::Stdin | Node::Null => Ok(0),
             Node::Random => getrandom::fill(buf).map(|()| buf.len()).map_err(|_| errno::IO),
             Node::Dir(_) => Err(errno::ISDIR),

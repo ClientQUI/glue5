@@ -270,15 +270,12 @@ impl Library {
                 continue;
             };
             let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
-            index.insert(
-                hash,
-                Entry {
-                    label: format!("{}::{}", s("effect"), s("program")),
-                    ok: v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
-                    consts: v.get("consts").is_some(),
-                    error: v.get("error").and_then(|x| x.as_str()).map(String::from),
-                },
-            );
+            index.insert(hash, Entry {
+                label: format!("{}::{}", s("effect"), s("program")),
+                ok: v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
+                consts: v.get("consts").is_some(),
+                error: v.get("error").and_then(|x| x.as_str()).map(String::from),
+            });
         }
         log::info!("gpu: {} translated shaders in {}", index.len(), dir.display());
         Ok(Library { dir: dir.to_owned(), index, programs: Mutex::default() })
@@ -330,6 +327,9 @@ impl Library {
         }
         let name = format!("{hash:016x}");
         let source = std::fs::read_to_string(self.dir.join(format!("{name}.wgsl")))?;
+        // Counted with archive reads: the engine creates every shader while
+        // loading, and that flood is what the startup latch waits out.
+        glue5_runtime::qos::note_io(source.len() as u64);
         let source = if stage == Stage::Pixel && entry.label == "radar::PS_TexturedUnlitAA" {
             with_radar_coverage(&source).context("unexpected radar edge input")?
         } else {

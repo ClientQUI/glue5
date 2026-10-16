@@ -33,14 +33,25 @@ requests can still grow it to avoid failed streaming reads.
   copying it. Textual rewrites keep their own source.
 - Background shader-module cleanup and the frame watchdog run at Utility
   QoS. Shader compilation and BC decompression run on their own pools, not
-  the game thread. The Video choice **Efficiency** defaults to Hybrid:
-  startup, loading, teleports and a streaming backlog stay user-interactive,
-  and steady play drops the game, render and GPU threads to utility while
-  pacing at 24 FPS. A missed frame raises the game and render threads, then
-  eases them back. Full-E keeps that low class and paces at 20 FPS. The
-  mixer, audio pump and device callback stay user-interactive, with 250 ms
-  buffered in those modes. Saves stay at background in Hybrid. Nothing here
-  uses the Neural Engine.
+  the game thread. The Video choice **Efficiency** defaults to Hybrid.
+  Streaming stays user-interactive in Off and Hybrid. Leaving it below the
+  frame stretched a post-cutscene load from 1-2 s to 6-10 s on an iPhone 13
+  Pro, and the initial load is the same wait over the whole city plus the
+  shader flood (thousands of shaders; a cold pipeline is about 200 ms of CPU
+  on an A15). Off used to keep that work at user-initiated anyway, so the
+  interactive game and render threads still owned the performance cores.
+  The menu frame cap is also lifted until archive and shader reads go quiet
+  for about three seconds: the engine spends a streaming budget per frame,
+  and a phone's 30 FPS cap (or Hybrid's 24) was slicing that budget for the
+  whole session because the engine limiter cannot change until the next
+  start. The presenter applies the cap once play is steady. A serious or
+  critical thermal state still caps the load. Full-E keeps utility QoS and
+  20 FPS, including during the load. Steady Hybrid play drops the game,
+  render and GPU threads to utility and paces at 24 FPS. A missed frame
+  raises the game and render threads, then eases them back. The mixer, audio
+  pump and device callback stay user-interactive, with 250 ms buffered in
+  hybrid and full-E. Saves stay at background in Hybrid. Nothing here uses
+  the Neural Engine.
 - Video settings now offer 20 FPS as a lower, live frame cap. The renderer
   paces before submit/completion, reducing engine frame progress too.
 

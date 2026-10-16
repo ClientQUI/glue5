@@ -128,6 +128,8 @@ pub struct PaceSample {
     pub stream_bytes: u64,
     /// Decode jobs still waiting.
     pub stream_jobs: u32,
+    /// Game-file and shader bytes read since the previous sample.
+    pub io_bytes: u64,
     /// A teleport, or the game just started.
     pub warp: bool,
 }
@@ -143,6 +145,14 @@ pub struct Pace {
     ease_left: u32,
     miss_run: u32,
     demand: Demand,
+    /// The process just started the game. Heavy reads keep this up so the
+    /// frame cap stays off until the load's reads fall away. A later
+    /// teleport boosts thread class without lifting the cap again.
+    booting: bool,
+    /// A heavy read has been seen since [`Self::note_load`]. Quiet frames
+    /// before that do not end the load: the screen can be up before the
+    /// archives start.
+    seen_load: bool,
 }
 
 impl Pace {
@@ -160,6 +170,10 @@ impl Pace {
     /// and ordinary driving stays under this. The hard cap that stalls a frame
     /// is 64 jobs.
     pub const STREAM_JOBS: u32 = 24;
+    /// Game-file or shader bytes in one sample that mean the load is still
+    /// reading. Only consulted while [`Self::booting`] is set, so a burst
+    /// during play does not lift the frame cap.
+    pub const LOAD_IO: u64 = 128 << 10;
 
     pub const fn new() -> Self {
         Self {
@@ -171,6 +185,8 @@ impl Pace {
             ease_left: 0,
             miss_run: 0,
             demand: Demand::Boost,
+            booting: false,
+            seen_load: false,
         }
     }
 
@@ -189,9 +205,18 @@ impl Pace {
         }
     }
 
-    /// The game is starting, or the player just teleported.
+    /// The game is starting. The frame cap stays off until the load's reads
+    /// have been quiet for the steady window.
     pub fn note_load(&mut self) {
+        self.booting = true;
+        self.seen_load = false;
         self.begin_boost();
+    }
+
+    /// The menu's frame cap is not applied yet. Full-E keeps its cap: that
+    /// mode is the efficiency-core test, including during the load.
+    pub fn uncapped(&self) -> bool {
+        self.booting && self.mode != Mode::FullE
     }
 
     fn begin_boost(&mut self) {
@@ -205,13 +230,28 @@ impl Pace {
     }
 
     pub fn observe(&mut self, sample: PaceSample) -> Demand {
-        if self.mode != Mode::Hybrid {
+        if self.mode == Mode::FullE {
+            self.booting = false;
+            self.settled = true;
             self.demand = Demand::Cruise;
             return self.demand;
         }
         let backlog = sample.stream_bytes >= Self::STREAM_BYTES || sample.stream_jobs >= Self::STREAM_JOBS;
-        if sample.warp || backlog {
+        // A smooth loading screen is not play. Archive and shader reads hold
+        // the boost, and the uncap, until they drop. Off uses the same latch
+        // so its menu cap does not slice the load; its thread class does not
+        // follow demand.
+        let loading_io = self.booting && sample.io_bytes >= Self::LOAD_IO;
+        if loading_io {
+            self.seen_load = true;
+        }
+        if sample.warp || backlog || loading_io {
             self.begin_boost();
+            return self.demand;
+        }
+        // Frames before the first archive or shader burst are not "play".
+        if self.booting && !self.seen_load {
+            self.demand = Demand::Boost;
             return self.demand;
         }
         let over = sample.budget_ms > 0.0 && sample.frame_ms > sample.budget_ms * 1.35;
@@ -227,10 +267,15 @@ impl Pace {
             }
             if self.steady >= Self::STEADY_FRAMES && self.boost_left == 0 {
                 self.settled = true;
+                self.booting = false;
                 self.demand = Demand::Cruise;
             } else {
                 self.demand = Demand::Boost;
             }
+            return self.demand;
+        }
+        if self.mode != Mode::Hybrid {
+            self.demand = Demand::Cruise;
             return self.demand;
         }
         if over {
@@ -274,14 +319,19 @@ pub fn class_for(role: Role, mode: Mode, demand: Demand) -> Class {
     if role == Role::Audio {
         return Class::Interactive;
     }
+    // Streaming below the frame stretched a post-cutscene load from 1-2 s
+    // to 6-10 s on an iPhone 13 Pro: the interactive game and render threads
+    // kept the performance cores, and the load waited on the other class.
+    // Off and Hybrid keep streaming with the frame. Full-E is the test that
+    // does not.
     match mode {
         Mode::Off => match role {
-            Role::Frame => Class::Interactive,
-            Role::Stream | Role::Save | Role::Worker => Class::Initiated,
-            Role::Audio => Class::Interactive,
+            Role::Save => Class::Initiated,
+            _ => Class::Interactive,
         },
         Mode::FullE => Class::Utility,
         Mode::Hybrid => match (role, demand) {
+            (Role::Stream, _) => Class::Interactive,
             (Role::Save, _) => Class::Background,
             (Role::Frame, Demand::Cruise) => Class::Utility,
             (Role::Frame, Demand::Ease) => Class::Initiated,
@@ -289,8 +339,6 @@ pub fn class_for(role: Role, mode: Mode, demand: Demand) -> Class {
             (Role::Worker, Demand::Cruise) => Class::Utility,
             (Role::Worker, Demand::Ease | Demand::Hitch) => Class::Initiated,
             (Role::Worker, Demand::Boost) => Class::Interactive,
-            (Role::Stream, Demand::Boost) => Class::Interactive,
-            (Role::Stream, _) => Class::Utility,
             (Role::Audio, _) => Class::Interactive,
         },
     }
@@ -412,11 +460,14 @@ mod tests {
         let cruise = Demand::Cruise;
         assert_eq!(class_for(Role::Frame, Mode::Off, cruise), Class::Interactive);
         assert_eq!(class_for(Role::Audio, Mode::Off, cruise), Class::Interactive);
-        assert_eq!(class_for(Role::Stream, Mode::Off, cruise), Class::Initiated);
+        assert_eq!(class_for(Role::Stream, Mode::Off, cruise), Class::Interactive);
+        assert_eq!(class_for(Role::Worker, Mode::Off, cruise), Class::Interactive);
+        assert_eq!(class_for(Role::Save, Mode::Off, cruise), Class::Initiated);
         assert_eq!(class_for(Role::Audio, Mode::Hybrid, cruise), Class::Interactive);
         assert_eq!(class_for(Role::Audio, Mode::FullE, Demand::Boost), Class::Interactive);
         assert_eq!(class_for(Role::Frame, Mode::Hybrid, cruise), Class::Utility);
-        assert_eq!(class_for(Role::Stream, Mode::Hybrid, cruise), Class::Utility);
+        assert_eq!(class_for(Role::Stream, Mode::Hybrid, cruise), Class::Interactive);
+        assert_eq!(class_for(Role::Stream, Mode::FullE, cruise), Class::Utility);
         assert_eq!(class_for(Role::Save, Mode::Hybrid, cruise), Class::Background);
         assert_eq!(class_for(Role::Frame, Mode::Hybrid, Demand::Boost), Class::Interactive);
         assert_eq!(class_for(Role::Stream, Mode::Hybrid, Demand::Boost), Class::Interactive);
@@ -429,8 +480,14 @@ mod tests {
     }
 
     fn good(pace: &mut Pace, n: u32) {
-        let sample =
-            PaceSample { frame_ms: 40.0, budget_ms: 1000.0 / 24.0, stream_bytes: 0, stream_jobs: 0, warp: false };
+        let sample = PaceSample {
+            frame_ms: 40.0,
+            budget_ms: 1000.0 / 24.0,
+            stream_bytes: 0,
+            stream_jobs: 0,
+            io_bytes: 0,
+            warp: false,
+        };
         for _ in 0..n {
             pace.observe(sample);
         }
@@ -440,6 +497,14 @@ mod tests {
     fn hybrid_stays_boosted_until_play_is_steady() {
         let mut pace = Pace::new();
         pace.note_load();
+        pace.observe(PaceSample {
+            frame_ms: 40.0,
+            budget_ms: 1000.0 / 24.0,
+            stream_bytes: 0,
+            stream_jobs: 0,
+            io_bytes: Pace::LOAD_IO,
+            warp: false,
+        });
         good(&mut pace, Pace::BOOST_HOLD);
         assert_eq!(pace.demand(), Demand::Boost, "the hold is not cruise");
         good(&mut pace, Pace::STEADY_FRAMES - Pace::BOOST_HOLD - 1);
@@ -458,6 +523,7 @@ mod tests {
             budget_ms: 1000.0 / 24.0,
             stream_bytes: 0,
             stream_jobs: 0,
+            io_bytes: 0,
             warp: true,
         });
         assert_eq!(pace.demand(), Demand::Boost);
@@ -468,6 +534,7 @@ mod tests {
             budget_ms: 1000.0 / 24.0,
             stream_bytes: 0,
             stream_jobs: Pace::STREAM_JOBS,
+            io_bytes: 0,
             warp: false,
         });
         assert_eq!(pace.demand(), Demand::Boost);
@@ -477,8 +544,14 @@ mod tests {
     fn a_spike_steps_up_and_then_back_and_a_run_of_them_reloads() {
         let mut pace = Pace::new();
         good(&mut pace, Pace::STEADY_FRAMES);
-        let slow =
-            PaceSample { frame_ms: 80.0, budget_ms: 1000.0 / 24.0, stream_bytes: 0, stream_jobs: 0, warp: false };
+        let slow = PaceSample {
+            frame_ms: 80.0,
+            budget_ms: 1000.0 / 24.0,
+            stream_bytes: 0,
+            stream_jobs: 0,
+            io_bytes: 0,
+            warp: false,
+        };
         assert_eq!(pace.observe(slow), Demand::Hitch);
         good(&mut pace, Pace::HITCH_HOLD - 1);
         assert_eq!(pace.demand(), Demand::Hitch);
@@ -490,6 +563,58 @@ mod tests {
             assert_eq!(pace.observe(slow), Demand::Hitch);
         }
         assert_eq!(pace.observe(slow), Demand::Boost);
+    }
+
+    #[test]
+    fn loading_reads_hold_the_boost_until_they_go_quiet() {
+        let mut pace = Pace::new();
+        pace.note_load();
+        assert!(pace.uncapped());
+        let loading = PaceSample {
+            frame_ms: 16.0,
+            budget_ms: 16.7,
+            stream_bytes: 0,
+            stream_jobs: 0,
+            io_bytes: Pace::LOAD_IO,
+            warp: false,
+        };
+        for _ in 0..Pace::STEADY_FRAMES * 3 {
+            assert_eq!(pace.observe(loading), Demand::Boost);
+        }
+        assert!(pace.uncapped(), "a loading screen that renders on time is still a load");
+        good(&mut pace, Pace::STEADY_FRAMES);
+        assert_eq!(pace.demand(), Demand::Cruise);
+        assert!(!pace.uncapped());
+        // Reads after the load has settled do not lift the cap or the boost.
+        // A teleport still does, through the warp signal.
+        pace.observe(loading);
+        assert_eq!(pace.demand(), Demand::Cruise);
+        assert!(!pace.uncapped());
+    }
+
+    #[test]
+    fn off_uncaps_the_load_and_then_the_menu_cap_returns() {
+        let mut pace = Pace::new();
+        pace.set_mode(Mode::Off);
+        pace.note_load();
+        assert!(pace.uncapped());
+        pace.observe(PaceSample {
+            frame_ms: 16.0,
+            budget_ms: 16.7,
+            stream_bytes: 0,
+            stream_jobs: 0,
+            io_bytes: Pace::LOAD_IO,
+            warp: false,
+        });
+        assert!(pace.uncapped());
+        assert_eq!(class_for(Role::Stream, Mode::Off, pace.demand()), Class::Interactive);
+        assert_eq!(class_for(Role::Worker, Mode::Off, pace.demand()), Class::Interactive);
+        good(&mut pace, Pace::STEADY_FRAMES);
+        assert!(!pace.uncapped());
+        let mut full = Pace::new();
+        full.set_mode(Mode::FullE);
+        full.note_load();
+        assert!(!full.uncapped(), "full-E keeps its cap through the load");
     }
 
     #[test]

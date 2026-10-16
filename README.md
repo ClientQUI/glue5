@@ -167,8 +167,10 @@ Silicon. Downloaded unsigned distributions may be blocked by Gatekeeper.
 Game data and shaders are **not bundled**. Choose the external game directory
 on the start page, or put a `game` directory beside `Glue 5.app`. The executable
 still contains the game code compiled from the build-time `game.wasm`.
-Saves and settings stay in the user directory below, and can follow an iCloud
-account. The Mac bundle id is `com.lennertwilhelm.gta5offline`, the same as iOS.
+Saves and settings stay in the user directory below, and can follow a Google
+account (Drive's hidden app data; see **Google Drive**). The Mac bundle id is
+`com.lennertwilhelm.gta5offline`, the same as iOS. There is no iCloud
+entitlement, so a free Apple developer account can sign the app.
 Closing or backgrounding the app (iOS: resigning active, entering the
 background, or terminating) queues a stats save and flushes it to disk, so
 the money stat is still there on the next launch.
@@ -206,7 +208,8 @@ intent's extras).
 | `GLUE5_VIEW_DISTANCE` | Metres past which an LOD stand-in or a full tree is not drawn. High-detail materials are not dropped by this, because their origin can be a sector away from the camera. `0` disables the cutoff. Unset: 260 m on phones, 420 m on desktop, shorter while hot. Fog, when on, ends here unless the menu sets its own distance. |
 | `GLUE5_FOG` | `0` skips the fog pass. The menu's fog switch is the control while the app is running. Fog never tints a pixel inside 48 m, a pixel whose depth says it is close, or the ground when the depth buffer is the far clear. |
 | `GLUE5_RENDER_BOOST` | Multiplier on the chosen render scale while thermals are nominal, never past 100%. Unset is 1. The previous 1.25 phone default raised the back buffer enough that near textures stopped streaming in; raise it from the graphics menu if the device has the memory. Fair heat returns to the chosen scale; Serious and Critical go below it (×0.75, then ×0.6) when thermal protection is on. |
-| `GLUE5_ICLOUD` | `0` or `1`. Unset follows the Game-tab toggle, which defaults to on for iPhone, iPad and Mac. Off, or any other platform, keeps saves on the device. See **Where saves are** and **iCloud**. |
+| `GLUE5_GOOGLE_DRIVE` | `0` or `1`. Unset follows the Game-tab toggle, which defaults to off until you turn it on. Off, or any platform other than iPhone, iPad and Mac, keeps saves on the device. |
+| `GLUE5_GOOGLE_CLIENT_ID` | OAuth client id (`….apps.googleusercontent.com`). Wins over the Client ID field. Use the iOS client on iPhone and iPad, and the desktop client on Mac. See **Google Drive**. |
 | `GLUE5_EFFICIENCY` | `off`, `hybrid` (recommended), or `full` / `full-e`. Unset follows the Video choice, which defaults to Hybrid. Hybrid runs startup and loading uncapped, with streaming and shader compiles at user-interactive, then drops the game, render and GPU threads to utility and paces at 24 FPS. Streaming stays user-interactive after that: putting it below the frame stretched a load from 1-2 s to 6-10 s. A missed frame raises the game and render threads, then eases them back. Full-E keeps those threads at utility and paces at 20 FPS, including the load. Off keeps frame, streaming and compile threads user-interactive, and still lifts the frame cap until the load's reads go quiet. The mixer, the audio pump and the device callback stay user-interactive in every mode; hybrid and full-E buffer 250 ms, and on Apple the callback takes a time-constraint schedule and joins an audio workgroup. Shader compiles and texture decompression stay off the game thread. `GLUE5_EFFICIENCY_MODE=1` is full-E and `=0` is off. `GLUE5_EFFICIENCY_CORES=0` is off. Nothing here uses the Neural Engine. |
 | `GLUE5_SHADOW_DISTANCE` | Metres past which distant shadow casters are skipped. `0` disables that culling. Unset uses 120 m on phones and 250 m on desktop, shorter while the device is hot. |
 | `GLUE5_PLAY=1` | Start the game without the start page (as `--play`; on a phone too). |
@@ -365,12 +368,12 @@ and iPad). `<sandbox>` is
 
 | What | Path under the user directory | Who writes it |
 |---|---|---|
-| App settings (fog, distances, Efficiency, the iCloud toggle, the chosen game folder) | `glue5.json` | `Settings::save` / `save_snapshot` in `crates/glue5/src/settings.rs`, including the background flush in `app.rs` |
+| App settings (fog, distances, Efficiency, the Google Drive toggle, the chosen game folder) | `glue5.json` | `Settings::save` / `save_snapshot` in `crates/glue5/src/settings.rs`, including the background flush in `app.rs` |
 | Story and game saves, the engine's graphics settings | `Documents/Rockstar Games/GTA V/` (settings at `settings.xml`; a graphics reset also writes `settings.xml.bak`; profile slots such as `Profiles/<id>/SGTA5…` are whatever the engine creates through `/userdata`) | The engine, via the vfs (`/userdata` → this directory). The host also writes `settings.xml` from `crates/glue5-runtime/src/game_settings.rs` |
 | GTA Online characters | `cloud/<member file>` (`…_default0000.save`, `…_char0001.save`, and the same kind of name) | `post_member_file` in `crates/glue5-runtime/src/cloud.rs` |
 | Stats the game data does not define, including money when it lives in those stats | `cloud/extra-stats.txt` | `stats::save` in `crates/glue5-runtime/src/stats.rs` |
 | This install's online player id | `online-id` | `gamer_id` in `crates/glue5-runtime/src/online.rs` |
-| Benchmarks | `Documents/Rockstar Games/GTA V/Benchmarks/` | The engine. Not part of iCloud sync |
+| Benchmarks | `Documents/Rockstar Games/GTA V/Benchmarks/` | The engine. Not part of Google Drive sync |
 | Renderer cache | `cache/` | The GPU. Not synced |
 | Scratch files | `fsroot/` | The vfs. Not synced |
 | Last start failure | `last-failure.txt` | `app.rs`. Not synced |
@@ -383,57 +386,62 @@ On macOS, while the app is not sandboxed, the user directory is
 `~/Library/Application Support/glue5/`, and diagnostics sit in
 `Glue5 Diagnostics` inside it.
 
-## iCloud
+## Google Drive
 
-On iPhone, iPad and Mac the Game tab has **iCloud** (on by default). It copies
-the save rows in the table above, plus `glue5.json`, through the ubiquity
-container `iCloud.com.lennertwilhelm.gta5offline`. Sync runs at launch, when a
-save or `glue5.json` is written, and when the app backgrounds. A newer file
-wins; the older one is kept next to it as
-`name.glue5-conflict-<seconds>-local.bak` or `-remote.bak`. Each device keeps
-its own game folder (`game_dir` is stored as null in the cloud copy). While a
-session is running, local saves upload and a newer cloud copy waits until the
-next launch, so an open file is not replaced under the engine.
+On iPhone, iPad and Mac the Game tab has **Google Drive** (off until you turn
+it on). It copies the save rows in the table above, plus `glue5.json`, into
+that Google account's hidden Drive app data (`drive.appdata`). The files do
+not appear in the Drive file list. Sync runs at launch, when a save or
+`glue5.json` is written, and when the app backgrounds. A newer file wins; the
+older one is kept next to it as `name.glue5-conflict-<seconds>-local.bak` or
+`-remote.bak`. Each device keeps its own game folder and its own OAuth client
+ids (those fields are cleared in the cloud copy). While a session is running,
+local saves upload and a newer cloud copy waits until the next launch, so an
+open file is not replaced under the engine.
 
-If the container URL is nil (iCloud signed out, or the entitlement is not in
-the profile), the files stay on the device and the toggle's note says so.
-`GLUE5_ICLOUD=0` forces that. Nothing here uses CloudKit.
+Sign-in is OAuth 2.0 for a native app, with PKCE and no client secret. iPhone
+and iPad use `ASWebAuthenticationSession` and an **iOS** OAuth client. Mac
+opens the browser and listens on `http://127.0.0.1` (a **Desktop** OAuth
+client). The refresh token is stored in the Keychain
+(`com.lennertwilhelm.gta5offline` / `google-drive`), not in `glue5.json`.
+**Sign out** deletes that Keychain item and leaves the Drive copies in place.
 
-The entitlements (`com.apple.developer.icloud-container-identifiers`,
-`com.apple.developer.ubiquity-container-identifiers`, and
-`com.apple.developer.icloud-services` = `CloudDocuments`) are in
-`platform/ios/Glue5.entitlements` and `platform/macos/Glue5.entitlements`.
-The bundle id is `com.lennertwilhelm.gta5offline`. Signing has to be team
-`9WKKC8XF38` (`GLUE5_TEAM`). An ad-hoc or unsigned build keeps saves local.
+If the toggle is off, you are signed out, or Drive cannot be reached, the
+files stay on the device and the toggle's note says so. `GLUE5_GOOGLE_DRIVE=0`
+forces that. Nothing here uses iCloud, CloudKit, or an iCloud entitlement, so
+a free Apple developer account can still sign the app.
 
-Portal steps, once, on the Apple ID for that team:
+Create the OAuth clients once, in [Google Cloud Console](https://console.cloud.google.com/):
 
-1. [developer.apple.com/account](https://developer.apple.com/account) →
-   Certificates, Identifiers & Profiles → Identifiers → the App ID
-   `com.lennertwilhelm.gta5offline` (register it first if it is missing).
-2. Enable **iCloud**. In its configuration enable **iCloud Documents**
-   (CloudKit is not required) and add the container
-   `iCloud.com.lennertwilhelm.gta5offline`.
-3. Regenerate the Development provisioning profile for that App ID so it
-   includes the new entitlement, then download it (Xcode → Settings →
-   Accounts → Download Manual Profiles, or automatic signing). Do the same
-   for Distribution if you ship with a distribution profile. An old profile
-   makes `URLForUbiquityContainerIdentifier` return nil.
-4. iOS: build with `GLUE5_TEAM=9WKKC8XF38`. The Xcode project already points
-   `CODE_SIGN_ENTITLEMENTS` at `Glue5.entitlements`.
-5. Mac: `mise run macos:build` embeds the entitlements path, but this repo
-   still has no signing identity. Sign the app with that team, for example
-   `codesign --force --sign "Apple Development: …" --entitlements platform/macos/Glue5.entitlements "Glue 5.app"`.
-   If Apple then requires the App Sandbox for iCloud on macOS, enable it on
-   the App ID and add `com.apple.security.app-sandbox`. A sandboxed Mac app
-   reads
-   `~/Library/Containers/com.lennertwilhelm.gta5offline/Data/Library/Application Support/glue5/`
-   instead of `~/Library/Application Support/glue5/`. Copy the old folder
-   across once. This build does not turn the sandbox on, so existing Mac
-   saves stay where they are.
-6. Sign each device into iCloud with the same Apple ID. The container shows
-   in iCloud Drive as **Glue 5** (`NSUbiquitousContainers` in the iOS and
-   Mac Info plists).
+1. Create or pick a project. **APIs & Services → Library**, enable **Google Drive API**.
+2. **APIs & Services → OAuth consent screen**. User type **External** (or
+   **Internal** if this is a Workspace org). App name `Glue 5`. Add the scope
+   `https://www.googleapis.com/auth/drive.appdata`. Add your Google account
+   as a **test user** while the app is in Testing. Testing-mode refresh
+   tokens expire after 7 days; **Publish app** on the consent screen (no
+   Google review is required for this non-sensitive scope) so a personal
+   token keeps working.
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
+   - **iPhone and iPad:** application type **iOS**. Bundle ID
+     `com.lennertwilhelm.gta5offline`. Copy the client ID
+     (`<prefix>.apps.googleusercontent.com`). Google's redirect is
+     `com.googleusercontent.apps.<prefix>:/oauth2redirect`. In
+     `platform/ios/project.yml`, replace the `glue5-oauth` entry under
+     `CFBundleURLSchemes` with `com.googleusercontent.apps.<prefix>` and
+     rebuild (`mise run ios` or the CI IPA). A custom URL scheme is not an
+     entitlement. Paste that same client ID into the Game tab's **ID** field,
+     or set `GLUE5_GOOGLE_CLIENT_ID` for the process.
+   - **Mac:** application type **Desktop app**. Copy that client ID into the
+     Mac app's **ID** field (or `GLUE5_GOOGLE_CLIENT_ID`). Desktop clients
+     accept `http://127.0.0.1` on any port; no URL scheme and no client secret.
+4. On each device: Game tab → **Google Drive** on → **Sign in**, with the
+   same Google account. The first launch after that copies the newer save
+   across. An ad-hoc build can sign in; the token still has to land in the
+   Keychain, which needs a real signature (a free team is enough).
+
+The iOS and desktop client ids are different. Each device reads its own field
+(`google_client_id_ios` or `google_client_id_desktop`). Syncing settings does
+not replace the other device's client id.
 
 [wasm2c]: https://github.com/WebAssembly/wabt/tree/main/wasm2c
 [xcodegen]: https://github.com/yonaskolb/XcodeGen

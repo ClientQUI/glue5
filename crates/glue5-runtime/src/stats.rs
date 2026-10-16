@@ -74,7 +74,7 @@ pub(crate) fn save() {
         match saved {
             Ok(()) => {
                 s.dirty = false;
-                crate::icloud::note_write();
+                crate::drive::note_write();
             }
             Err(e) => log::error!("stats: saving {}: {e}", path.display()),
         }

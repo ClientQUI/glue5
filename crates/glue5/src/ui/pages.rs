@@ -443,7 +443,7 @@ fn settings_items(
         }
         SettingsTab::Game => {
             #[cfg(target_vendor = "apple")]
-            icloud_setting(ui, settings);
+            drive_setting(ui, settings);
             setting(
                 ui,
                 "Streaming budget",
@@ -528,18 +528,40 @@ fn settings_items(
 }
 
 #[cfg(target_vendor = "apple")]
-fn icloud_setting(ui: &mut egui::Ui, settings: &mut Settings) {
-    let forced = settings::icloud_forced();
-    let note = match forced {
-        Some(true) => "GLUE5_ICLOUD is on.",
-        Some(false) => "GLUE5_ICLOUD is off. Saves stay on this device.",
-        None if !settings.icloud => "Off. Saves stay on this device.",
-        None => glue5_runtime::icloud::status_note(),
+fn drive_setting(ui: &mut egui::Ui, settings: &mut Settings) {
+    let forced = settings::drive_forced();
+    let status = glue5_runtime::drive::status_note();
+    let note: &str = match forced {
+        Some(true) => "GLUE5_GOOGLE_DRIVE is on.",
+        Some(false) => "GLUE5_GOOGLE_DRIVE is off. Saves stay on this device.",
+        None if !settings.google_drive => "Off. Saves stay on this device.",
+        None => status.as_str(),
     };
-    setting(ui, "iCloud", Control::Toggle, Some(note), |ui| {
+    setting(ui, "Google Drive", Control::Toggle, Some(note), |ui| {
         ui.add_enabled_ui(forced.is_none(), |ui| {
-            toggle(ui, &mut settings.icloud);
+            toggle(ui, &mut settings.google_drive);
         });
+    });
+    if settings::google_client_id_from_env().is_some() {
+        ui.label(RichText::new("Client ID comes from GLUE5_GOOGLE_CLIENT_ID.").small().color(theme::MUTED));
+    } else {
+        let client = if cfg!(target_os = "ios") {
+            &mut settings.google_client_id_ios
+        } else {
+            &mut settings.google_client_id_desktop
+        };
+        text_field(ui, "ID", client, "….apps.googleusercontent.com", 200);
+    }
+    let signed = glue5_runtime::drive::signed_in();
+    setting(ui, "Account", Control::Action, Some(if signed { "Signed in" } else { "Not signed in" }), |ui| {
+        if action_button(ui, if signed { "Sign out" } else { "Sign in" }).clicked() {
+            if signed {
+                glue5_runtime::drive::sign_out();
+            } else {
+                settings.google_drive = true;
+                glue5_runtime::drive::sign_in(&settings.google_client_id());
+            }
+        }
     });
 }
 

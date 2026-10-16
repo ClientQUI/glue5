@@ -280,7 +280,7 @@ impl Vfs {
         // Utility for the sync, then this thread's class comes back.
         crate::qos::lower(crate::qos::Qos::Utility, || self.sync_open(&open));
         if writable_flags(open.flags) {
-            crate::icloud::note_userdata(&open.path);
+            crate::drive::note_userdata(&open.path);
         }
         Ok(())
     }

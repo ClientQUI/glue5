@@ -111,11 +111,11 @@ pub fn run() -> Result<()> {
     glue5_runtime::qos::set_mode(settings.runtime_mode());
     // Before the window, so a save from another device is the one the start
     // page and the engine see. Bounded: a missing container gives up.
-    glue5_runtime::icloud::configure(&user_dir, settings.icloud_enabled());
-    if settings.icloud_enabled() {
-        glue5_runtime::icloud::sync_now(&user_dir);
+    glue5_runtime::drive::configure(&user_dir, settings.drive_enabled(), &settings.google_client_id());
+    if settings.drive_enabled() {
+        glue5_runtime::drive::sync_now(&user_dir);
         settings = Settings::load(&user_dir);
-        glue5_runtime::icloud::configure(&user_dir, settings.icloud_enabled());
+        glue5_runtime::drive::configure(&user_dir, settings.drive_enabled(), &settings.google_client_id());
     }
     // Before the GPU opens; turned on later, it shows from the next launch.
     let metal_hud = cfg!(target_vendor = "apple") && settings.overlay == PerfOverlay::MetalHud;
@@ -308,7 +308,7 @@ impl Lifecycle {
         Settings::save_snapshot(&self.user_dir, &json);
         glue5_runtime::flush_on_suspend();
         // The debounced upload would not finish before iOS suspends the process.
-        glue5_runtime::icloud::push_now(&self.user_dir);
+        glue5_runtime::drive::push_now(&self.user_dir);
     }
 }
 
@@ -888,8 +888,8 @@ impl App {
         self.settings.save(&self.user_dir);
         // Newest save wins before the engine opens the files. A session that
         // is already running uploads only (see background and note_write).
-        if self.settings.icloud_enabled() {
-            glue5_runtime::icloud::sync_now(&self.user_dir);
+        if self.settings.drive_enabled() {
+            glue5_runtime::drive::sync_now(&self.user_dir);
         }
         // A new attempt: the last one's failure is history.
         let _ = std::fs::remove_file(self.user_dir.join(FAILURE_FILE));
@@ -1027,16 +1027,20 @@ impl App {
         #[cfg(target_os = "android")]
         self.replace_surface();
         self.ui.repaint();
-        if self.settings.icloud_enabled() {
+        if self.settings.drive_enabled() {
             if self.game.is_none() {
-                glue5_runtime::icloud::sync_now(&self.user_dir);
+                glue5_runtime::drive::sync_now(&self.user_dir);
                 if self.ui.page() != Some(Page::Settings) {
                     self.settings = Settings::load(&self.user_dir);
-                    glue5_runtime::icloud::configure(&self.user_dir, self.settings.icloud_enabled());
+                    glue5_runtime::drive::configure(
+                        &self.user_dir,
+                        self.settings.drive_enabled(),
+                        &self.settings.google_client_id(),
+                    );
                     self.lifecycle.remember(&self.settings);
                 }
             } else {
-                glue5_runtime::icloud::push_now(&self.user_dir);
+                glue5_runtime::drive::push_now(&self.user_dir);
             }
         }
         // The game's files may have been copied in meanwhile (Finder, the

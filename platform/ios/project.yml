@@ -15,8 +15,8 @@ settings:
     TARGETED_DEVICE_FAMILY: "1,2"
     ARCHS: arm64
     DEAD_CODE_STRIPPING: YES
-    # iCloud uses team 9WKKC8XF38 with bundle com.lennertwilhelm.gta5offline.
-    # Set GLUE5_TEAM to that id when signing (see the README, iCloud).
+    # Set GLUE5_TEAM when signing. A free Apple developer account is enough:
+    # saves sync through Google Drive, not an iCloud entitlement.
     DEVELOPMENT_TEAM: ${GLUE5_TEAM}
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_ENTITLEMENTS: Glue5.entitlements
@@ -51,6 +51,8 @@ targets:
       - sdk: MetalFX.framework
       - sdk: OpenGLES.framework
       - sdk: QuartzCore.framework
+      - sdk: AuthenticationServices.framework
+      - sdk: Security.framework
       - sdk: UIKit.framework
     info:
       path: Info.plist
@@ -76,11 +78,13 @@ targets:
         GCSupportsControllerUserInteraction: true
         # GTA Online: players on the same network find each other there.
         NSLocalNetworkUsageDescription: Glue 5 finds GTA Online players on your network.
-        # iCloud Drive shows this container when the capability is on the App ID.
-        NSUbiquitousContainers:
-          iCloud.com.lennertwilhelm.gta5offline:
-            NSUbiquitousContainerIsDocumentScopePublic: true
-            NSUbiquitousContainerName: Glue 5
-            NSUbiquitousContainerSupportedFolderLevels: Any
+        # Google sign-in on iPhone and iPad. Replace glue5-oauth with
+        # com.googleusercontent.apps.<ios-client-prefix> before building
+        # (see the README, Google Drive). A custom URL scheme does not need
+        # a paid Apple developer account.
+        CFBundleURLTypes:
+          - CFBundleURLName: glue5.google
+            CFBundleURLSchemes:
+              - glue5-oauth
         GCSupportedGameControllers:
           - ProfileName: ExtendedGamepad

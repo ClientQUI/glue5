@@ -16,22 +16,25 @@ getrandom = "0.4"
 # The system's time zone, the same way on every platform.
 jiff = "0.2"
 serde_json.workspace = true
+# Google Drive's hidden app data (OAuth and the files REST API).
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+md-5 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# iCloud Documents (NSFileManager ubiquity container and NSFileCoordinator).
+# The refresh token lives in the Keychain.
 [target.'cfg(target_vendor = "apple")'.dependencies]
+security-framework = "2.11"
+
+# Sign-in on iPhone and iPad (ASWebAuthenticationSession).
+[target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
-    "NSError",
-    "NSFileCoordinator",
-    "NSFileManager",
     "NSString",
     "NSURL",
-    "block2",
 ] }
 
 [target.'cfg(windows)'.dependencies]

@@ -79,11 +79,19 @@ pub struct Settings {
     pub touch_size: f32,
     /// The Taptic Engine taps under pressed touch controls and plays the game's rumble (iPhone).
     pub haptics: bool,
-    /// Copy saves and these settings through iCloud on iPhone, iPad and Mac.
-    /// The game folder stays on this device. Off, or when iCloud is not
-    /// signed in, leaves the files local.
-    #[serde(default = "default_icloud")]
-    pub icloud: bool,
+    /// Copy saves and these settings through Google Drive on iPhone, iPad and
+    /// Mac. The game folder stays on this device. Off, signed out, or offline
+    /// leaves the files local.
+    #[serde(default)]
+    pub google_drive: bool,
+    /// iOS OAuth client id (`….apps.googleusercontent.com`). Not a secret.
+    /// Empty uses `GLUE5_GOOGLE_CLIENT_ID`.
+    #[serde(default)]
+    pub google_client_id_ios: String,
+    /// Desktop OAuth client id, for the Mac. Not a secret. Empty uses
+    /// `GLUE5_GOOGLE_CLIENT_ID`.
+    #[serde(default)]
+    pub google_client_id_desktop: String,
     /// The game starts in the sandbox (the map, no story) rather than the
     /// story: the start page's last choice.
     pub sandbox: bool,
@@ -403,7 +411,9 @@ impl Default for Settings {
             touch_opacity: 0.6,
             touch_size: 1.0,
             haptics: true,
-            icloud: default_icloud(),
+            google_drive: false,
+            google_client_id_ios: String::new(),
+            google_client_id_desktop: String::new(),
             sandbox: false,
             online: false,
             online_name: String::new(),
@@ -445,17 +455,18 @@ pub fn lobby_key(code: &str) -> String {
     code.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()).collect()
 }
 
-fn default_icloud() -> bool {
-    cfg!(target_vendor = "apple")
-}
-
-/// `GLUE5_ICLOUD=0` or `1` overrides the toggle. `None` means the toggle wins.
-pub fn icloud_forced() -> Option<bool> {
-    match std::env::var("GLUE5_ICLOUD").ok().as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
+/// `GLUE5_GOOGLE_DRIVE=0` or `1` overrides the toggle. `None` means the toggle wins.
+pub fn drive_forced() -> Option<bool> {
+    match std::env::var("GLUE5_GOOGLE_DRIVE").ok().as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("0" | "off" | "false") => Some(false),
         Some("1" | "on" | "true") => Some(true),
         _ => None,
     }
+}
+
+/// `GLUE5_GOOGLE_CLIENT_ID`, when it is set and not blank.
+pub fn google_client_id_from_env() -> Option<String> {
+    std::env::var("GLUE5_GOOGLE_CLIENT_ID").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
 fn random() -> u64 {
@@ -502,13 +513,21 @@ impl Settings {
         Self::save_snapshot(user_dir, &self.snapshot());
     }
 
-    /// Whether saves should be copied through iCloud. Never on a platform
-    /// that has no ubiquity container.
-    pub fn icloud_enabled(&self) -> bool {
+    /// Whether saves should be copied through Google Drive. Never off Apple:
+    /// the sign-in window is the Mac browser or the iOS authentication session.
+    pub fn drive_enabled(&self) -> bool {
         if !cfg!(target_vendor = "apple") {
             return false;
         }
-        icloud_forced().unwrap_or(self.icloud)
+        drive_forced().unwrap_or(self.google_drive)
+    }
+
+    /// The OAuth client id for this device. The environment variable wins.
+    pub fn google_client_id(&self) -> String {
+        if let Some(id) = google_client_id_from_env() {
+            return id;
+        }
+        if cfg!(target_os = "ios") { self.google_client_id_ios.clone() } else { self.google_client_id_desktop.clone() }
     }
 
     /// JSON for the lifecycle watch, which cannot borrow `Settings`.
@@ -525,7 +544,7 @@ impl Settings {
         if let Err(e) = durable_write(&Self::file(user_dir), json) {
             log::warn!("cannot save settings: {e}");
         }
-        glue5_runtime::icloud::on_settings_saved(user_dir, json);
+        glue5_runtime::drive::on_settings_saved(user_dir, json);
     }
 
     /// The distance, fog, resolution and thermal options the graphics menu owns.
@@ -822,18 +841,25 @@ mod tests {
     }
 
     #[test]
-    fn icloud_follows_the_file_and_stays_off_without_apple() {
-        let dir = std::env::temp_dir().join(format!("glue5-icloud-settings-{}", std::process::id()));
+    fn google_drive_follows_the_file_and_stays_off_without_apple() {
+        let dir = std::env::temp_dir().join(format!("glue5-drive-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("glue5.json"), r#"{"icloud": false}"#).unwrap();
-        assert!(!Settings::load(&dir).icloud);
-        std::fs::write(dir.join("glue5.json"), r#"{"icloud": true}"#).unwrap();
+        std::fs::write(dir.join("glue5.json"), r#"{"google_drive": false}"#).unwrap();
+        assert!(!Settings::load(&dir).google_drive);
+        std::fs::write(
+            dir.join("glue5.json"),
+            r#"{"google_drive": true, "google_client_id_desktop": "desktop.apps.googleusercontent.com"}"#,
+        )
+        .unwrap();
         let on = Settings::load(&dir);
-        assert!(on.icloud);
+        assert!(on.google_drive);
+        assert!(!Settings::default().google_drive);
         if !cfg!(target_vendor = "apple") {
-            assert!(!on.icloud_enabled());
-            assert!(!Settings::default().icloud);
+            assert!(!on.drive_enabled());
+        }
+        if !cfg!(target_os = "ios") {
+            assert_eq!(on.google_client_id(), "desktop.apps.googleusercontent.com");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

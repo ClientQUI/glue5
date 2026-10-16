@@ -224,7 +224,7 @@ pub(crate) unsafe extern "C" fn post_member_file(
         Ok(()) => {
             log::info!("cloud: saved {name} ({size} bytes)");
             crate::stats::save();
-            crate::icloud::note_write();
+            crate::drive::note_write();
             if let Some(slot) = slot(&name) {
                 NEW_SLOTS.fetch_and(!(1 << slot), Ordering::Relaxed);
             }

@@ -20,9 +20,8 @@ resources = [{ src = "../../target/package/macos-assets/Assets.car", target = "A
 [package.metadata.packager.macos]
 minimum-system-version = "14.0"
 info-plist-path = "../../platform/macos/Info.plist"
-entitlements = "../../platform/macos/Glue5.entitlements"
-# No signing identity: no bundle signing or notarization. iCloud needs a
-# signature from team 9WKKC8XF38; see the README.
+# No signing identity: no bundle signing or notarization. No iCloud
+# entitlement: a free Apple developer account can sign this build.
 
 [dependencies]
 glue5-runtime.workspace = true

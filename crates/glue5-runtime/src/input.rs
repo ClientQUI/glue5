@@ -6,6 +6,7 @@
 //!   pad code: the `pad_update` hook writes [`Gamepad`] into `rage::ioPad`
 //!   after the original update, exactly where XInput would on PC.
 
+use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -133,6 +134,33 @@ pub(crate) unsafe extern "C" fn radio_wheel_axes(env: *mut Env, this: u64, x: u6
     unsafe { orig::selection_wheel_axes(env, this, x, y) }
 }
 
+// ---- web browser ---------------------------------------------------------------
+
+/// The browser's input events (`SET_INPUT_EVENT`): a mouse click, accept.
+const MOUSE_ACCEPT: f64 = 1001.0;
+const ACCEPT: f64 = 16.0;
+
+thread_local! {
+    /// Whether this thread is building a `SET_INPUT_EVENT` call.
+    static INPUT_EVENT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Hook for `CScaleformMgr::BeginMethod`, how scripts start a method call.
+pub(crate) unsafe extern "C" fn scaleform_begin_method(env: *mut Env, movie: u32, base: u32, name: u64, index: u32) -> u32 {
+    let mem = unsafe { Mem::of(env) };
+    INPUT_EVENT.set(mem.bytes(name, 16) == b"SET_INPUT_EVENT\0");
+    unsafe { orig::scaleform_begin_method(env, movie, base, name, index) }
+}
+
+/// Hook for `CScaleformMgr::AddParamFloat`. The phone's internet app sends a
+/// left click as `SET_INPUT_EVENT(1001)`, which the browser movie of this
+/// game data does not handle: links opened only with Enter, accept (16),
+/// which opens what the pointer is on. A click is sent as accept.
+pub(crate) unsafe extern "C" fn scaleform_add_param_float(env: *mut Env, value: f64) {
+    let value = if INPUT_EVENT.get() && value == MOUSE_ACCEPT { ACCEPT } else { value };
+    unsafe { orig::scaleform_add_param_float(env, value) }
+}
+
 // ---- text entry ----------------------------------------------------------------
 
 static TEXT_BOX: AtomicBool = AtomicBool::new(false);
@@ -174,6 +202,11 @@ const TEXT: u64 = 296; // u16[64] ring of UTF-16 units
 const TEXT_LEN: u32 = 64;
 const WIN_W: u64 = 432;
 const WIN_H: u64 = 436;
+
+/// `CMousePointer`'s "shown last frame" in this build: what its `Update`
+/// decided (the pause menu or another screen with a cursor, the window in
+/// front), kept from one update to the next.
+const CURSOR_SHOWN: u64 = 19505961;
 
 /// Mouse buttons in the input block.
 pub mod mouse {
@@ -243,6 +276,13 @@ impl InputBlock {
         self.mem.set_u32(self.at + LOCKED, locked as u32);
     }
 
+    /// Whether the game shows its own mouse cursor (the pause menu, the
+    /// map, the phone's browser, ...: wherever it is clicked on). The game
+    /// draws it itself; on PC it then frees the pointer.
+    pub fn cursor_shown(&self) -> bool {
+        self.mem.u8(CURSOR_SHOWN) & 1 != 0
+    }
+
     /// Typed text (Enter = 13, Backspace = 8 also go through here).
     pub fn text(&self, s: &str) {
         let head = self.mem.atomic_u32(self.at + TEXT_HEAD);
@@ -268,6 +308,8 @@ impl InputBlock {
 pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.pad_update = Some(pad_update);
     hooks.radio_wheel_axes = Some(radio_wheel_axes);
+    hooks.scaleform_begin_method = Some(scaleform_begin_method);
+    hooks.scaleform_add_param_float = Some(scaleform_add_param_float);
     hooks.text_box_open = Some(text_box_open_hook);
     hooks.text_box_close = Some(text_box_close_hook);
 }

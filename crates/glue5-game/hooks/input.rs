@@ -7,6 +7,10 @@
     // reads the selection wheel's instead (and calls them here).
     ("radio_wheel_axes", "CRadioWheel::GetInputAxis(rage::ioValue const*&, rage::ioValue const*&) const"),
     ("selection_wheel_axes", "CSelectionWheel::GetInputAxis(rage::ioValue const*&, rage::ioValue const*&) const"),
+    // A Scaleform method the scripts call, with its float arguments: the
+    // phone's web browser gets mouse clicks it understands.
+    ("scaleform_begin_method", "CScaleformMgr::BeginMethod(int, eSCALEFORM_BASE_CLASS, char const*, int)"),
+    ("scaleform_add_param_float", "CScaleformMgr::AddParamFloat(double)"),
     // The game's text box (save names, the phone's cheat entry, ...): touch
     // devices show the system keyboard while it is open.
     ("text_box_open", "CTextInputBox::Open(rage::ioVirtualKeyboard::Params const&)"),

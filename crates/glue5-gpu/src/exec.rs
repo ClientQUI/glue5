@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
+use arrayvec::ArrayVec;
 use glue5_runtime::gpu::{Command, GpuRing, Reader, op};
 use rustc_hash::{FxHashMap, FxHashSet};
 use wgpu::TextureFormat;
@@ -93,10 +94,21 @@ impl Default for D3d {
 /// Destroyed while the commands being recorded use it.
 pub use crate::submit::Grave;
 
+/// Formats of one render-pass shape, without a heap key. The trailing
+/// slots past `count` are unused.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TailKey {
+    pub targets: [Option<TextureFormat>; 8],
+    pub count: u8,
+    pub depth: Option<TextureFormat>,
+    pub samples: u32,
+    pub read_only: u8,
+}
+
 /// The render pass being recorded.
 pub struct PassInfo {
     pub key: [u32; 37],
-    pub targets: Vec<Option<TextureFormat>>,
+    pub targets: ArrayVec<Option<TextureFormat>, 8>,
     pub depth: Option<TextureFormat>,
     pub samples: u32,
     pub read_only: u8,
@@ -157,6 +169,10 @@ pub struct Stats {
 pub struct Gpu {
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
+    /// Same queue the submitter records on. Dummy textures and vertex streams
+    /// are cleared through it when they are created, on this thread, before
+    /// the draw that samples them is submitted.
+    pub queue: wgpu::Queue,
     pub caps: Caps,
     pub limits: wgpu::Limits,
     pub library: Arc<Library>,
@@ -195,6 +211,9 @@ pub struct Gpu {
     /// destroyed; and the variant last picked for that count.
     pub formats_seen: [u64; 3],
     pub bound_formats: [Option<(u32, u64, Arc<Program>, u128)>; 3],
+    /// Sampler coarseness of the current draw, in quarter-mip steps
+    /// (0: the engine's, 16: four mips down). See `detail::lod_quanta`.
+    pub mip_floor: u32,
     /// Render passes recorded since the last submit.
     pub chunk_passes: u32,
     /// When the work not yet handed over started gathering (see `idle`).
@@ -211,7 +230,7 @@ pub struct Gpu {
     pub pipes: FxHashMap<Arc<Recipe>, Arc<pipeline::Cell>>,
     /// Recipes as recorded: those of the seed, of earlier runs and of this one.
     pub known: FxHashSet<Arc<Recipe>>,
-    pub pass_tails: FxHashMap<(Vec<Option<TextureFormat>>, Option<TextureFormat>, u32, u8), u32>,
+    pub pass_tails: FxHashMap<TailKey, u32>,
     pub recipes_new: Vec<Arc<Recipe>>,
     pub key: Vec<u32>,
 
@@ -249,6 +268,9 @@ pub struct Gpu {
     pub total_presents: u64,
     pub started: Instant,
     pub last_stats: Instant,
+    /// The counters at the last frame, for the performance overlay.
+    pub perf: crate::perf::Mark,
+    pub gpu_timer: crate::perf::GpuTimer,
     pub last_save: Instant,
     /// Pipelines compiled when the driver's cache was last saved.
     pub saved_compiled: u32,
@@ -261,7 +283,8 @@ pub struct Decode {
     /// Queued jobs release their compressed copy immediately on cancellation;
     /// an already-running job owns it until that decode finishes.
     source: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-    bytes: u64,
+    /// Compressed plus decoded size, for the streaming-backlog signal.
+    pub(crate) bytes: u64,
     /// The texture's object, and the texture it was when the data came.
     id: u32,
     texture: wgpu::Texture,
@@ -296,6 +319,7 @@ impl Gpu {
         self.ring.set_state(glue5_runtime::gpu::State::Running);
         log::info!("gpu: running");
         loop {
+            glue5_runtime::qos::refresh();
             let head = reader.head();
             if reader.is_empty(head) {
                 self.idle();
@@ -612,7 +636,10 @@ impl Gpu {
         self.finish_decodes(false);
         self.recycler.trim(self.epoch, &mut self.graveyard);
         let (uploads, staging) = self.uploads.finish();
-        let encoders = uploads.into_iter().chain(self.encoder.take()).collect();
+        let mut encoders = uploads.into_iter().chain(self.encoder.take()).collect();
+        if let Some(timing) = self.gpu_timer.time(&self.device, &mut encoders, frame, &self.staging) {
+            self.maps.push(timing.map());
+        }
         *self.stats.submits.entry(reason).or_default() += 1;
         self.submitter.send(crate::submit::Batch {
             encoders,
@@ -933,6 +960,7 @@ impl Gpu {
             if decode_backpressure(pending, self.decodes.len(), bytes) {
                 // Backpressure, not failed allocations or missing textures:
                 // drain older jobs in order and submit their staging first.
+                glue5_runtime::qos::note_stream(pending.saturating_add(bytes), (self.decodes.len() + 1) as u32);
                 self.finish_decodes(true);
                 self.flush("decode budget");
             }
@@ -942,9 +970,16 @@ impl Gpu {
             let (tx, rx) = std::sync::mpsc::channel();
             let bpr = bpr as usize;
             self.decoder.get_or_insert_with(|| Pool::new("gpu decode", 2)).urgent(move || {
-                let Some(src) = job_source.lock().unwrap().take() else { return };
-                let texels = crate::bc::decode(bc, &src, bpr, src_rows, cols as usize, block_rows as usize, d as usize);
-                let _ = tx.send(if etc2 { crate::bc::etc2_rgba(texels, cols * 4, block_rows * 4 * d) } else { texels });
+                // The GPU thread only waits at a flush. Decompression runs here,
+                // off that thread: performance cores during a load, efficiency
+                // cores once play is steady. The pool's class is restored after.
+                glue5_runtime::qos::lower(glue5_runtime::qos::decompress_qos(), || {
+                    let Some(src) = job_source.lock().unwrap().take() else { return };
+                    let texels =
+                        crate::bc::decode(bc, &src, bpr, src_rows, cols as usize, block_rows as usize, d as usize);
+                    let _ =
+                        tx.send(if etc2 { crate::bc::etc2_rgba(texels, cols * 4, block_rows * 4 * d) } else { texels });
+                });
             });
             self.decodes.push(Decode {
                 data: rx,
@@ -1071,7 +1106,17 @@ impl Gpu {
         let words: Box<[u32]> = c.payload.get(2..).unwrap_or(&[]).into();
         let (sampler, comparison) =
             if kind == 3 { (Some(self.make_sampler(&words, false)), words[0] & 0x80 != 0) } else { (None, false) };
-        self.objs.insert(id, Obj::State(Box::new(State { words, sampler, comparison, nearest: None })));
+        self.objs.insert(
+            id,
+            Obj::State(Box::new(State {
+                words,
+                sampler,
+                comparison,
+                nearest: None,
+                coarse: Default::default(),
+                coarse_nearest: Default::default(),
+            })),
+        );
     }
 
     /// D3D11_SAMPLER_DESC: Filter, AddressU/V/W, MipLODBias, MaxAnisotropy,
@@ -1079,6 +1124,12 @@ impl Gpu {
     /// 2-3 mag, 0-1 mip (set = linear), 0x80 comparison, 0x55 anisotropic.
     /// `nearest`: without filtering, whatever the engine asked.
     pub fn make_sampler(&self, w: &[u32], nearest: bool) -> wgpu::Sampler {
+        self.make_sampler_at(w, nearest, 0.0)
+    }
+
+    /// `lod_add` raises the minimum mip. The engine's max clamp still wins,
+    /// so a short chain is not asked for a level it does not have.
+    pub fn make_sampler_at(&self, w: &[u32], nearest: bool, lod_add: f32) -> wgpu::Sampler {
         let w = |i: usize| w.get(i).copied().unwrap_or(0);
         let filter = if nearest { w(0) & 0x80 } else { w(0) };
         let aniso = filter & 0x7f == 0x55;
@@ -1089,6 +1140,7 @@ impl Gpu {
         let border_color = [7, 8, 9, 10].map(|i| f32::from_bits(w(i)));
         let lod_min = f32::from_bits(w(11)).max(0.0);
         let lod_max = f32::from_bits(w(12)).clamp(0.0, 32.0).max(lod_min);
+        let lod_min = (lod_min + lod_add.max(0.0)).min(lod_max);
         self.device.create_sampler(&wgpu::SamplerDescriptor {
             label: None,
             address_mode_u: format::address(w(1), border),
@@ -1229,6 +1281,7 @@ impl Gpu {
         ends.sort_by(|a, b| b.1.cmp(a.1));
         let ends: Vec<String> =
             ends.iter().take(6).map(|(op, n)| format!("op {op} {:.1}", **n as f64 / frames as f64)).collect();
+        self.perf.reset();
         let (mut textures, mut buffers) = (0u64, 0u64);
         let mut counts = [0usize; 4];
         let mut proxy_bytes = 0u64;
@@ -1344,6 +1397,19 @@ impl Gpu {
             let more = available.map_or(String::new(), |a| format!(", {} MiB more allowed", a >> 20));
             log::info!("memory: process footprint {} MiB{more}{}", used >> 20, self.gpu_memory());
         }
+    }
+
+    /// The textures' and buffers' bytes.
+    pub(crate) fn gpu_bytes(&self) -> [u64; 2] {
+        let (mut textures, mut buffers) = (0u64, 0u64);
+        for o in self.objs.values() {
+            match o {
+                Obj::Texture(t) => textures += t.bytes,
+                Obj::Buffer(b) => buffers += b.gpu.as_ref().map_or(0, |_| b.bytes),
+                _ => {}
+            }
+        }
+        [textures, buffers]
     }
 
     /// What Metal has allocated for the device, all resources included.

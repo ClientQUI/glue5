@@ -7,7 +7,7 @@
 //! go to and come from the disk.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use glue5_game::{Env, orig};
 
@@ -24,9 +24,24 @@ const LOAD_FAILED: u64 = 25461316;
 /// Slots without a file yet: a new player's (or a new character's),
 /// loaded empty rather than failed.
 static NEW_SLOTS: AtomicU32 = AtomicU32::new(0);
+/// A suspend asked the engine thread to queue a stats save. The generation
+/// is what was asked; `SAVE_DONE` is the newest generation `stats_update`
+/// has already queued and then finished.
+static SAVE_REQUEST: AtomicU64 = AtomicU64::new(0);
+static SAVE_DONE: AtomicU64 = AtomicU64::new(0);
+
+/// Asks the engine thread to queue a stats save on its next update.
+/// The returned generation is done once [`stats_save_done`] is true.
+pub(crate) fn request_stats_save() -> u64 {
+    SAVE_REQUEST.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+pub(crate) fn stats_save_done(generation: u64) -> bool {
+    SAVE_DONE.load(Ordering::Acquire) >= generation
+}
 /// `netStatus`: its code, then a result code.
-const NET_STATUS_FAILED: u32 = 2;
-const NET_STATUS_SUCCEEDED: u32 = 3;
+pub(crate) const NET_STATUS_FAILED: u32 = 2;
+pub(crate) const NET_STATUS_SUCCEEDED: u32 = 3;
 
 fn without_lan<R>(env: *mut Env, f: impl FnOnce() -> R) -> R {
     let m = unsafe { Mem::of(env) };
@@ -76,8 +91,33 @@ pub(crate) unsafe extern "C" fn stats_queue_load(env: *mut Env) -> u32 {
 }
 
 /// A slot without a file is a new one, not a failed one (`stats_load_failed`).
+///
+/// A suspend asks, from another thread, that this update queue a stats save
+/// first. Money is a stat: `QueueSave` is the save the engine already has,
+/// and this update is what finishes writing it.
 pub(crate) unsafe extern "C" fn stats_update(env: *mut Env) {
+    let pending = SAVE_REQUEST.load(Ordering::Acquire);
+    let done = SAVE_DONE.load(Ordering::Acquire);
+    if pending > done {
+        log::info!("stats: saving on suspend");
+        // The queued save copies the stats-map ints. Put the stored cash
+        // there first, or the save writes the $0 the HUD was showing.
+        unsafe { crate::stats::apply_stored_cash(env) };
+        stats_queue_save(env);
+    }
     without_lan(env, || unsafe { orig::stats_update(env) });
+    // The corner HUD reads these ints. A script `StatGetInt` is a different
+    // call, and editing extra-stats.txt does not change the ints.
+    unsafe { crate::stats::apply_stored_cash(env) };
+    // Local BAWSAQ quotes, into the script table the phone trades from.
+    // LCN is not touched. A changed quote is written to extra-stats.txt.
+    unsafe { crate::stats::publish_bawsaq(env) };
+    if pending > done {
+        // Cash lives in extra-stats.txt as well as the engine's member file.
+        // The member file can load back as 0; this file is what Drive syncs.
+        crate::stats::save();
+        SAVE_DONE.fetch_max(pending, Ordering::Release);
+    }
     let new = NEW_SLOTS.load(Ordering::Relaxed);
     if new != 0 {
         let m = unsafe { Mem::of(env) };
@@ -123,10 +163,12 @@ pub(crate) unsafe extern "C" fn mpstats_save_update(env: *mut Env, op: u64) -> u
 }
 
 /// Hook for `rage::rlRosCredentials::IsValid() const`: valid in the stats'
-/// saves and loads, which go to the disk; elsewhere the engine would talk
-/// to Rockstar's services with them.
+/// saves and loads, which go to the disk. Story mode also answers yes.
+/// BAWSAQ will not price or trade unless it does. Social Club stays
+/// uninitialized, and a member-file read or write is the disk copy, so this
+/// does not open a session or talk to Rockstar.
 pub(crate) unsafe extern "C" fn ros_credentials_valid(env: *mut Env, credentials: u64) -> u32 {
-    if IN_STATS_OPERATION.get() {
+    if IN_STATS_OPERATION.get() || crate::online::story_market() {
         return 1;
     }
     unsafe { orig::ros_credentials_valid(env, credentials) }
@@ -162,7 +204,7 @@ fn file(path: &str) -> PathBuf {
 /// HTTP's "Not Found": no such file yet (a new player).
 const NOT_FOUND: u32 = 404;
 
-fn finish(m: Mem, status: u64, code: u32) {
+pub(crate) fn finish(m: Mem, status: u64, code: u32) {
     finish_with(m, status, code, 0);
 }
 
@@ -191,12 +233,12 @@ pub(crate) unsafe extern "C" fn post_member_file(
     let m = unsafe { Mem::of(env) };
     let name = m.str(path);
     let to = file(&name);
-    let written =
-        std::fs::create_dir_all(to.parent().unwrap()).and_then(|()| std::fs::write(&to, m.bytes(data, size as usize)));
+    let written = crate::vfs::durable_write(&to, m.bytes(data, size as usize));
     match written {
         Ok(()) => {
             log::info!("cloud: saved {name} ({size} bytes)");
             crate::stats::save();
+            crate::drive::note_write();
             if let Some(slot) = slot(&name) {
                 NEW_SLOTS.fetch_and(!(1 << slot), Ordering::Relaxed);
             }
@@ -268,48 +310,29 @@ mod tests {
         assert_eq!(super::slot("GTA5/saves/mpstats/save_char0002.save"), Some(2));
         assert_eq!(super::slot("GTA5/saves/mpstats/save.save"), None);
     }
+
+    #[test]
+    fn a_suspend_save_stays_open_until_that_generation_finishes() {
+        use std::sync::atomic::Ordering;
+        let generation = super::request_stats_save();
+        assert!(!super::stats_save_done(generation));
+        super::SAVE_DONE.fetch_max(generation, Ordering::Release);
+        assert!(super::stats_save_done(generation));
+        let newer = super::request_stats_save();
+        assert!(newer > generation);
+        assert!(!super::stats_save_done(newer));
+    }
 }
 
-/// Hook for `rage::rlUgc::QueryContent(int, rlUgcContentType, char const*,
-/// char const*, int, int, int*, int*, atDelegate<...> const&,
-/// sysMemAllocator*, netStatus*)`: the players' creations are on Rockstar's
-/// servers, and a query fails to start, as the engine's does without
-/// credentials, but without making its web request first. Freemode's
-/// FM_maintain_cloud_header_data asks every frame, and each try logged five
-/// errors. (A query that succeeds with nothing found does not do: the way
-/// into GTA Online then stops at "Unable to connect to Rockstar game
-/// services".)
-pub(crate) unsafe extern "C" fn ugc_query_content(
-    _env: *mut Env,
-    _gamer: u32,
-    _content_type: u32,
-    _query: u64,
-    _params: u64,
-    _offset: u32,
-    _count: u32,
-    _found: u64,
-    _total: u64,
-    _delegate: u64,
-    _allocator: u64,
-    _status: u64,
-) -> u32 {
-    0
-}
-
-/// Hook for `rage::fiDevice::MakeGrowBufferFileName(char*, int,
-/// datGrowBuffer*)`: "growbuffer:" and the buffer's address in hex, which
-/// `fiDeviceGrowBuffer` reads back as the file's handle. The engine formats
-/// it with `%p`, which in this build's C library begins with "0x": the
-/// device read 0 (Windows' `%p` has no prefix), and files in memory had no
-/// buffer.
-pub(crate) unsafe extern "C" fn grow_buffer_file_name(env: *mut Env, name: u64, size: u32, buffer: u64) {
-    let m = unsafe { Mem::of(env) };
-    m.write_str(name, &format!("growbuffer:{buffer:x}"), size as usize);
+/// Story and online both load the stat XML. `ServerAuthoritative` would
+/// make the engine ignore a local `STAT_SET_INT` of cash and keep the HUD
+/// at the server value, which is 0 here.
+pub(crate) fn stat_authority_hook(hooks: &mut glue5_game::Hooks) {
+    hooks.xml_bool_attribute = Some(xml_bool_attribute);
 }
 
 /// This module's hooks, online.
 pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
-    hooks.grow_buffer_file_name = Some(grow_buffer_file_name);
     hooks.xml_bool_attribute = Some(xml_bool_attribute);
     hooks.stats_init = Some(stats_init);
     hooks.stats_update = Some(stats_update);
@@ -326,5 +349,15 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.ros_credentials_valid = Some(ros_credentials_valid);
     hooks.post_member_file = Some(post_member_file);
     hooks.get_member_file = Some(get_member_file);
-    hooks.ugc_query_content = Some(ugc_query_content);
+}
+
+/// Story BAWSAQ. The phone and the stock script both refuse the market
+/// unless Rockstar's credentials check passes, then they download the
+/// price file. The check passes, and the download is the disk copy (missing
+/// until the local quote fills the stat). The online character pipeline
+/// (stats init, queue, save, load) stays out of story.
+pub(crate) fn story_market_hooks(hooks: &mut glue5_game::Hooks) {
+    hooks.ros_credentials_valid = Some(ros_credentials_valid);
+    hooks.post_member_file = Some(post_member_file);
+    hooks.get_member_file = Some(get_member_file);
 }

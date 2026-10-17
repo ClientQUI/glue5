@@ -13,6 +13,7 @@
 
 mod bc;
 mod byte_cache;
+mod detail;
 mod done;
 mod draw;
 mod exec;
@@ -23,6 +24,7 @@ mod metalfx;
 mod objects;
 mod ops;
 mod overlay;
+pub mod perf;
 mod pipeline;
 mod pool;
 mod prepare;
@@ -46,8 +48,28 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use glue5_runtime::gpu::{GpuBackend, GpuRing, State};
 
+pub use detail::Policy;
 pub use overlay::Overlay;
 pub use present::{Presentation, Upscaler, Window};
+
+/// Installs the distance, fog and render-boost policy. The graphics menu
+/// calls this whenever the settings change; draws after it use the new values.
+pub fn set_distance_policy(policy: Policy) {
+    detail::set_policy(policy);
+}
+
+/// How far above the user's render scale the back buffer may go.
+/// `thermal` is 0 nominal through 3 critical. `boost` is the cool-device
+/// multiplier (`detail::policy().render_boost`).
+pub fn resolution_factor(thermal: u8, boost: f32) -> f32 {
+    detail::resolution_factor(thermal, boost)
+}
+
+/// The cool-device render-scale multiplier. The graphics menu sets it;
+/// unset, it is 1 (the user's render scale).
+pub fn render_boost() -> f32 {
+    detail::policy().render_boost
+}
 
 /// Apple's reported thermal state: 0 nominal, 1 fair, 2 serious, 3 critical.
 /// Platforms without this API return nominal. Sample infrequently in the app.
@@ -148,7 +170,7 @@ pub fn backend(settings: Settings, screen: Option<Screen>) -> GpuBackend {
             .name("gpu".into())
             .spawn(move || match init(ring, settings, screen) {
                 Ok(gpu) => {
-                    glue5_runtime::qos::set(glue5_runtime::qos::Qos::Interactive);
+                    glue5_runtime::qos::bind_host(glue5_runtime::qos::Qos::Interactive);
                     gpu.run()
                 }
                 Err(e) => {
@@ -319,7 +341,10 @@ impl Device {
         }
         let profile = std::env::var_os("GLUE5_GPU_PROFILE").is_some()
             && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        if profile {
+        // The performance overlay's GPU time (Apple GPUs time it otherwise).
+        if profile
+            || (cfg!(not(target_vendor = "apple")) && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY))
+        {
             features |= wgpu::Features::TIMESTAMP_QUERY;
         }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -407,6 +432,22 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         caps.features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
         settings.max_texture_dimension,
     ));
+    let distant = detail::policy();
+    let reach = detail::distances(distant, 0);
+    glue5_runtime::diagnostics::note(format_args!(
+        "distant detail: enabled={} aggressive={} mobile={} fog={} fog_m={:?} boost={:.2} clutter={:.0}m grass={:.0}m tree_lod={:.0}m view={:.0}m shadow={:?} (near surfaces stay fully textured; GLUE5_* or the graphics menu)",
+        distant.enabled,
+        distant.aggressive,
+        distant.mobile,
+        distant.fog,
+        distant.fog_override,
+        distant.render_boost,
+        reach.clutter,
+        reach.grass,
+        reach.tree_lod,
+        reach.view,
+        distant.shadow_override,
+    ));
     let saved_compiled = compiler.compiled.load(Ordering::Relaxed);
     // On iOS, compiling several Metal pipelines at once creates large CPU
     // and temporary shader-memory spikes while the game is streaming. Two
@@ -420,6 +461,7 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
     log::info!("gpu: ready in {:.0} ms ({threads} compile threads)", t0.elapsed().as_secs_f64() * 1000.0);
 
     let profiler = profile.then(|| profile::Profiler::new(&device, &queue));
+    let gpu_timer = perf::GpuTimer::new(&device, &queue);
     let uploads = uploads::Uploads::new(device.clone());
     let recycler = recycle::Recycler::default();
     let slabs = slabs::Slabs::new(device.clone(), recycler.finished.clone());
@@ -432,6 +474,7 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
             output,
             recycler.finished.clone(),
         ),
+        queue,
         uniforms: uniforms::Uniforms::new(limits.min_uniform_buffer_offset_alignment),
         uploads,
         adapter,
@@ -469,6 +512,7 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         fast_pipes: Default::default(),
         pipes,
         known,
+        mip_floor: 0,
         pass_tails: Default::default(),
         recipes_new: Vec::new(),
         key: Vec::new(),
@@ -494,6 +538,8 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
         total_presents: 0,
         started: Instant::now(),
         last_stats: Instant::now(),
+        perf: Default::default(),
+        gpu_timer,
         last_save: Instant::now(),
         saved_compiled,
     })

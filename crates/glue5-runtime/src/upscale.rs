@@ -9,6 +9,7 @@ use crate::gpu::op;
 
 /// Hook for `PostFX::ProcessNonDepthFX()`.
 pub(crate) unsafe extern "C" fn postfx_nondepth(env: *mut Env) {
+    crate::qos::refresh();
     unsafe {
         orig::postfx_nondepth(env);
         orig::gpu_emit(env, op::SCENE_DONE, 0, 0);

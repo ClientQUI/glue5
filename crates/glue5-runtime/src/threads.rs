@@ -64,7 +64,7 @@ pub(crate) fn spawn_main() -> Result<JoinHandle<i32>> {
 }
 
 fn run_main() -> i32 {
-    crate::qos::set(crate::qos::Qos::Interactive);
+    crate::qos::apply_engine_thread(Some("engine main"));
     crate::diagnostics::note(format_args!("engine main: starting"));
     let env = new_env();
     let result = (|| -> Result<u32, Trap> {
@@ -134,10 +134,11 @@ unsafe fn init_tls(env: *mut Env) -> Result<(), Trap> {
 pub(crate) unsafe fn create(env: *mut Env, pthread: u64, start: u64, arg: u64) -> u32 {
     rt().threads.reap(env);
     let name = engine_name(rt().memory.mem(), arg);
+    let thread_name = name.clone();
     let spawned = thread::Builder::new()
         .name(name.unwrap_or_else(|| format!("pthread {pthread:#x}")))
         .stack_size(PTHREAD_STACK)
-        .spawn(move || run_pthread(pthread, start, arg));
+        .spawn(move || run_pthread(pthread, start, arg, thread_name));
     match spawned {
         Ok(_) => 0,
         Err(e) => {
@@ -165,11 +166,15 @@ fn engine_name(mem: crate::memory::Mem, arg: u64) -> Option<String> {
     (name.len() >= 3 && name.len() < 48).then(|| String::from_utf8_lossy(&name).into_owned())
 }
 
-fn run_pthread(pthread: u64, start: u64, arg: u64) {
-    // Loading waits on the engine's workers and streaming threads: the render
-    // thread and the mixer above them (interactive) made a black screen after
-    // a cutscene take 6-10 s instead of 1-2 on an iPhone 13 Pro.
-    crate::qos::set(crate::qos::Qos::Initiated);
+fn run_pthread(pthread: u64, start: u64, arg: u64, name: Option<String>) {
+    // Hybrid starts this thread at user-interactive (a load) and drops the
+    // game and render threads once play is steady. The mixer stays
+    // interactive, and so does streaming: leaving it below the frame
+    // stretched a post-cutscene load from 1-2 s to 6-10 s on an iPhone 13
+    // Pro, because those threads kept the performance cores. Full-E is the
+    // mode that does put streaming on efficiency cores. The class is read
+    // again every frame on the game and render threads.
+    crate::qos::apply_engine_thread(name.as_deref());
     let env = new_env();
     let mem = rt().memory.mem();
     let result = (|| -> Result<(), Trap> {

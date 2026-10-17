@@ -16,7 +16,7 @@ pub enum Ty {
     V128,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sig {
     pub params: Vec<Ty>,
     pub result: Option<Ty>,

@@ -75,6 +75,22 @@ pub fn parse(text: &str) -> anyhow::Result<Vec<Stop>> {
     Ok(stops)
 }
 
+/// Hook for `CWarpManager::SetWarp`. A teleport, including the one a loading
+/// screen is about to stream. The original still does the move.
+pub(crate) unsafe extern "C" fn warp(
+    env: *mut Env,
+    pos: u64,
+    vel: u64,
+    heading: f32,
+    vehicle: u32,
+    snap: u32,
+    radius: f32,
+    fade: u32,
+) -> u32 {
+    crate::qos::note_warp();
+    unsafe { orig::warp(env, pos, vel, heading, vehicle, snap, radius, fade) }
+}
+
 /// Hook for `CWarpManager::Update()`.
 pub(crate) unsafe extern "C" fn warp_update(env: *mut Env) {
     unsafe { orig::warp_update(env) };
@@ -193,5 +209,6 @@ mod tests {
 
 /// This module's hooks.
 pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
+    hooks.warp = Some(warp);
     hooks.warp_update = Some(warp_update);
 }

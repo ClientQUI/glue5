@@ -37,6 +37,7 @@ const MAX_WAIT: Duration = Duration::from_millis(30);
 
 /// Hook for `audNorthAudioEngine::StartUpdate()`.
 pub(crate) unsafe extern "C" fn start_update(env: *mut Env) {
+    crate::qos::refresh();
     let mem = unsafe { Mem::of(env) };
     let two_behind = || {
         let count = mem.atomic_u32(FRAME_COUNT).load(Ordering::Acquire);

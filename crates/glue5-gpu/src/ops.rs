@@ -144,7 +144,13 @@ fn fullscreen_pipeline(
 }
 
 impl Blits {
-    /// 0: depth -> r32float, 1: stencil -> r8uint, 2: float -> depth32float.
+    /// 0: depth -> r32float, 1: stencil -> rg8uint, 2: float -> depth32float.
+    ///
+    /// A D3D stencil SRV (X24_TYPELESS_G8_UINT, X32_TYPELESS_G8X24_UINT)
+    /// reads the stencil in green, and the game's shaders test `.y` (the
+    /// interior bit, 8, decides which local lights and which ambient light
+    /// a pixel gets); WebGPU's stencil view has it in red. The copy has it
+    /// in both.
     fn proxy(&mut self, device: &wgpu::Device, kind: usize) -> Option<wgpu::RenderPipeline> {
         if self.proxies[kind].is_none() {
             self.proxies[kind] = match kind {
@@ -158,8 +164,8 @@ impl Blits {
                 1 => fullscreen_pipeline(
                     device,
                     "stencil as uint",
-                    "@group(0) @binding(0) var src: texture_2d<u32>;\n@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4<u32> { return textureLoad(src, vec2i(p.xy), 0); }",
-                    Some(TextureFormat::R8Uint),
+                    "@group(0) @binding(0) var src: texture_2d<u32>;\n@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4<u32> { let s = textureLoad(src, vec2i(p.xy), 0).x; return vec4<u32>(s, s, 0u, 1u); }",
+                    Some(TextureFormat::Rg8Uint),
                     None,
                 ),
                 _ => fullscreen_pipeline(
@@ -237,6 +243,11 @@ pub struct Occlusion {
 const OCCLUSION_SLOTS: u32 = 4096;
 
 impl Occlusion {
+    /// A query is open: its draws have to run, or the count is short.
+    pub fn running(&self) -> bool {
+        self.active.is_some()
+    }
+
     pub fn ensure_set(&mut self, device: &wgpu::Device) {
         if self.set.is_none() {
             self.set = Some(device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -306,7 +317,7 @@ impl Gpu {
             return;
         };
         if t.proxies[kind].is_none() {
-            let format = [TextureFormat::R32Float, TextureFormat::R8Uint, TextureFormat::Depth32Float][kind];
+            let format = [TextureFormat::R32Float, TextureFormat::Rg8Uint, TextureFormat::Depth32Float][kind];
             let size = wgpu::Extent3d { width: t.width, height: t.height, depth_or_array_layers: t.layers };
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("proxy"),

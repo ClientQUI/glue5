@@ -4,11 +4,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use glue5_runtime::Game;
 use glue5_runtime::audio::{CHANNELS, SAMPLE_RATE};
-use glue5_runtime::input::{self, Gamepad, button};
+use glue5_runtime::input::{self, button, Gamepad};
+use glue5_runtime::Game;
 
 /// The app's allocator (see src/main.rs), so measurements match it.
 #[cfg(windows)]
@@ -203,6 +203,7 @@ fn main() -> Result<()> {
     if args.audio {
         let out = game.audio();
         std::thread::spawn(move || {
+            glue5_runtime::qos::set_audio_callback();
             // The app's sound device: 256 frames at a time.
             const PERIOD: usize = 256;
             let mut buf = [0f32; PERIOD * CHANNELS];

@@ -15,6 +15,7 @@
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use glue5_game::{Env, orig};
 
@@ -71,20 +72,16 @@ pub(crate) fn start(online: &crate::Online, hooks: &mut glue5_game::Hooks) {
     self::hooks(hooks);
     crate::vnet::hooks(hooks);
     crate::cloud::hooks(hooks);
+    crate::jobs::hooks(hooks);
+    crate::texts::hooks(hooks);
+    // Stat commands are installed for every mode in `lib.rs` (story cash).
+    // Setting them again here keeps online's installer complete.
     crate::stats::hooks(hooks);
     // The stand-ins' methods, host functions the game calls through their
     // vtables (`glue5_game::host_function`): QueryInterface, a method doing
-    // nothing (0: S_OK, false, none), the profile manager's IsSignedIn and
-    // GetSignInInfo.
-    static FNS: OnceLock<[usize; 4]> = OnceLock::new();
-    glue5_game::set_host_functions(FNS.get_or_init(|| {
-        [
-            query_interface as *const () as usize,
-            nothing as *const () as usize,
-            signed_in as *const () as usize,
-            sign_in_info as *const () as usize,
-        ]
-    }));
+    // nothing (0: S_OK, false, none), the profile manager's IsSignedIn,
+    // GetSignInInfo, and IsOnline (yes only while `story_market` is set).
+    stand_in_functions();
     if let Err(e) = crate::p2p::start(&online.lobby, crate::vnet::deliver) {
         log::error!("p2p: {e}");
     }
@@ -94,6 +91,17 @@ const QUERY_INTERFACE: u32 = 0;
 const NOTHING: u32 = 1;
 const SIGNED_IN: u32 = 2;
 const SIGN_IN_INFO: u32 = 3;
+const PROFILE_ONLINE: u32 = 4;
+
+/// Story mode asks the profile manager whether the player is online. That
+/// is `NETWORK_IS_SIGNED_ONLINE`, which BAWSAQ requires before it will show
+/// a price. Online mode leaves the answer no, so Social Club's own paths
+/// stay off there. `rlPc::IsInitialized` is still no in both.
+static STORY_MARKET: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn story_market() -> bool {
+    STORY_MARKET.load(Ordering::Relaxed)
+}
 
 // Host functions: called with the thread's instance first, not its `Env`
 // (see `glue5_game::set_host_functions`); the wasm memory is the runtime's.
@@ -112,6 +120,12 @@ unsafe extern "C" fn nothing(_: *mut c_void) -> u64 {
 
 unsafe extern "C" fn signed_in(_: *mut c_void) -> u64 {
     1
+}
+
+/// Profile-manager IsOnline. Story's BAWSAQ page treats "no" as the market
+/// being down and never reads a price. Online stays no (see `STORY_MARKET`).
+unsafe extern "C" fn profile_online(_: *mut c_void) -> u64 {
+    u64::from(story_market())
 }
 
 /// GetSignInInfo(IProfile*): { vtable*, s64 id, char nickname[17] }.
@@ -136,8 +150,11 @@ unsafe fn install(env: *mut Env) {
         m.set_u64(object, vtable);
         object
     };
-    // IsSignedIn: yes; IsOnline: no (Social Club's own online paths stay off).
-    let profile_manager = object(&[QUERY_INTERFACE, SIGNED_IN, NOTHING, SIGN_IN_INFO]);
+    // IsSignedIn: yes. IsOnline: yes in story, so BAWSAQ will price; no in
+    // online, so Social Club's own online paths stay off. The slot is the
+    // method the script's `NETWORK_IS_SIGNED_ONLINE` reads.
+    let is_online = if story_market() { PROFILE_ONLINE } else { NOTHING };
+    let profile_manager = object(&[QUERY_INTERFACE, SIGNED_IN, is_online, SIGN_IN_INFO]);
     let other = object(&[QUERY_INTERFACE]);
     for offset in INTERFACES.step_by(8) {
         m.set_u64(RL_PC + offset, if offset == PROFILE_MANAGER { profile_manager } else { other });
@@ -152,6 +169,68 @@ pub(crate) unsafe extern "C" fn live_manager_init(env: *mut Env, mode: u32) {
     unsafe { orig::live_manager_init(env, mode) };
     // Init clears the store's state; nothing would populate it again.
     unsafe { populate_store_data(env) };
+}
+
+/// Story mode's stock page does not read `SPn_TOTAL_CASH`. It reads the
+/// script global the game copies that stat into, and only while
+/// `NETWORK_IS_SIGNED_IN` (`main` once a second, and again at the start of
+/// a buy or sell). The global is not in the story save, so after a restart
+/// it is 0: the page shows an empty wallet, a buy is capped to $0, and a
+/// sell would write the proceeds over the real balance.
+///
+/// The same profile-manager stand-in online uses makes that native true.
+/// Social Club stays uninitialized, and the commerce catalogue is not
+/// touched. Shares, the price paid and which stock are the story save's
+/// script block (Drive already syncs that profile), not these stats.
+pub(crate) unsafe extern "C" fn story_live_manager_init(env: *mut Env, mode: u32) {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| unsafe { install(env) });
+    unsafe { orig::live_manager_init(env, mode) };
+}
+
+/// The stand-in methods. `host_function` addresses them from a base
+/// registered here. Without that call every vtable slot is 0, and
+/// `CLiveManager::Init` jumps to address 0. The fifth is IsOnline, and
+/// only story's market answers yes.
+fn stand_in_functions() {
+    static FNS: OnceLock<[usize; 5]> = OnceLock::new();
+    glue5_game::set_host_functions(FNS.get_or_init(|| {
+        [
+            query_interface as *const () as usize,
+            nothing as *const () as usize,
+            signed_in as *const () as usize,
+            sign_in_info as *const () as usize,
+            profile_online as *const () as usize,
+        ]
+    }));
+}
+
+/// Signs the story player in so stock trades see the cash stat, and so
+/// BAWSAQ will ask for a price. Online installs this itself, with the rest
+/// of its hooks.
+///
+/// `CLiveManager::Init` calls `rlPresence::RefreshSigninState`, which calls
+/// `rage::internal::GetGamerHandle`. That original function calls through
+/// Social Club. Story has none, so the call lands at address 0 (`6e5fce8`,
+/// about 38 s in, engine main). Online replaces the function; story does
+/// too. `IsInitialized` stays no, so saves and the control settings keep
+/// the path that does not talk to Social Club. The cash HUD does not use
+/// this: it is `CStatsDataMgr::Update` writing the stored balance.
+///
+/// BAWSAQ is the other half. The phone shows an error, and the controller
+/// never copies a price, unless `NETWORK_IS_SIGNED_ONLINE` and
+/// `NETWORK_HAS_VALID_ROS_CREDENTIALS` are both true. Those read this
+/// profile manager's IsOnline and `rlRosCredentials::IsValid`. Story answers
+/// yes. It still does not start a session or mark Social Club initialized.
+/// The price itself is a local quote (`stats`), not Rockstar's service.
+/// LCN does not use either check: its prices are the script's own walk.
+pub(crate) fn story_sign_in(hooks: &mut glue5_game::Hooks) {
+    STORY_MARKET.store(true, Ordering::Relaxed);
+    stand_in_functions();
+    hooks.rl_gamer_handle = Some(gamer_handle);
+    hooks.rl_offline_name = Some(offline_name);
+    hooks.rl_pc_initialized = Some(rl_pc_initialized);
+    hooks.live_manager_init = Some(story_live_manager_init);
 }
 
 /// Hook for `CLiveManager::Update(unsigned int)`: the device's network
@@ -242,6 +321,9 @@ native_results! {
     profanity_pending = 0;
     /// `SC_PROFANITY_GET_CHECK_IS_VALID`: Social Club's text check (names); every text passes.
     profanity_valid = 1;
+    /// `NETWORK_HAS_SOCIAL_CLUB_ACCOUNT`: the player has one (the pause
+    /// menu's Creator needs it).
+    social_club_account = 1;
 }
 
 /// Hook for `CNetwork::CanAccessNetworkFeatures(eNetworkAccessArea,
@@ -363,17 +445,30 @@ pub(crate) unsafe extern "C" fn script_program_loaded(env: *mut Env, this: u64, 
 }
 
 /// gameconfig.xml: the scripts are a later version than the game data, and
-/// freemode registers more large player broadcast data blocks than it
-/// provides (the engine quits when they run out): the two largest sizes get
-/// more instances.
+/// they register more player broadcast data blocks than it provides; the
+/// engine quits when a script finds none free ("No local player broadcast
+/// data handler"). Freemode alone fills the larger sizes, and with the shops
+/// and ambient scripts around the player all 31 were in use (an iPhone log
+/// listed them), so the two largest sizes and the three smallest get more
+/// instances. A smaller block takes a larger one when its size has none
+/// left. Each longer number costs a tab of its line's indentation, so the
+/// file keeps its length.
 pub(crate) fn more_broadcast_data(text: String) -> Option<String> {
+    const FIELD: &str = "<NumInstances value=\"";
     let start = text.find("<PlayerBroadcastData>")?;
     let end = start + text[start..].find("</PlayerBroadcastData>")?;
     let mut block = text[start..end].to_string();
-    for (size, instances) in [(3600, 3), (2500, 4)] {
+    for (size, instances) in [(3600, 3), (2500, 4), (150, 12), (80, 12), (40, 16)] {
         let at = block.find(&format!("<SizeOfData value=\"{size}\"/>"))?;
-        let field = at + block[at..].find("<NumInstances value=\"")? + "<NumInstances value=\"".len();
-        block.replace_range(field..field + 1, &instances.to_string());
+        let field = at + block[at..].find(FIELD)?;
+        let digits = field + FIELD.len()..field + FIELD.len() + block[field + FIELD.len()..].find('"')?;
+        let new = instances.to_string();
+        let longer = new.len().checked_sub(digits.len())?;
+        if !block[..field].ends_with(&"\t".repeat(longer)) {
+            return None;
+        }
+        block.replace_range(digits, &new);
+        block.drain(field - longer..field);
     }
     Some(format!("{}{}{}", &text[..start], block, &text[end..]))
 }
@@ -395,8 +490,105 @@ pub(crate) unsafe extern "C" fn offline_name(env: *mut Env, name: u64) -> u32 {
     1
 }
 
+/// `rlNetworkMode`s: Rockstar's network, the LAN (the lobby, vnet.rs).
+const NETWORK_ONLINE: u32 = 1;
+const NETWORK_LAN: u32 = 2;
+
+/// Rockstar's network is the lobby's LAN here: the transition sessions
+/// that jobs are played in are hosted and joined online whatever the
+/// game's mode (`CNetworkSession::HostTransition`).
+fn on_lan(mode: u32) -> u32 {
+    if mode == NETWORK_ONLINE { NETWORK_LAN } else { mode }
+}
+
+/// Hooks for `rage::snSession::Host(int, rlNetworkMode, ...)` and
+/// `Join(int, rlSessionInfo const&, rlNetworkMode, ...)`: on the LAN.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn session_host(
+    env: *mut Env,
+    session: u64,
+    gamer: u32,
+    mode: u32,
+    public_slots: u32,
+    private_slots: u32,
+    attributes: u64,
+    flags: u32,
+    data: u64,
+    size: u32,
+    status: u64,
+) -> u32 {
+    let mode = on_lan(mode);
+    unsafe { orig::session_host(env, session, gamer, mode, public_slots, private_slots, attributes, flags, data, size, status) }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn session_join(
+    env: *mut Env,
+    session: u64,
+    gamer: u32,
+    info: u64,
+    mode: u32,
+    slot: u32,
+    flags: u32,
+    data: u64,
+    size: u32,
+    group: u64,
+    group_size: u32,
+    status: u64,
+) -> u32 {
+    let mode = on_lan(mode);
+    unsafe { orig::session_join(env, session, gamer, info, mode, slot, flags, data, size, group, group_size, status) }
+}
+
+/// Hooks for `rage::rlSessionFinder::Find(int, rlNetworkMode, ...)` and
+/// the two `rlSessionManager::QueryDetail(rlNetworkMode, ...)`: finding
+/// and asking about sessions (a job's, joined or looked for), on the LAN.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn session_find(
+    env: *mut Env,
+    gamer: u32,
+    mode: u32,
+    a: u32,
+    b: u32,
+    filter: u64,
+    details: u64,
+    c: u32,
+    found: u64,
+    status: u64,
+) -> u32 {
+    unsafe { orig::session_find(env, gamer, on_lan(mode), a, b, filter, details, c, found, status) }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn session_query(
+    env: *mut Env,
+    mode: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+    e: u32,
+    infos: u64,
+    count: u32,
+    gamer: u64,
+    details: u64,
+    found: u64,
+    status: u64,
+) -> u32 {
+    unsafe { orig::session_query(env, on_lan(mode), a, b, c, d, e, infos, count, gamer, details, found, status) }
+}
+
+pub(crate) unsafe extern "C" fn session_query_any(env: *mut Env, mode: u32, a: u32, b: u64, c: u64, d: u64, e: u64) -> u32 {
+    unsafe { orig::session_query_any(env, on_lan(mode), a, b, c, d, e) }
+}
+
 /// This module's hooks, online.
 pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
+    hooks.session_host = Some(session_host);
+    hooks.session_join = Some(session_join);
+    hooks.session_find = Some(session_find);
+    hooks.session_query = Some(session_query);
+    hooks.session_query_any = Some(session_query_any);
     hooks.rl_gamer_handle = Some(gamer_handle);
     hooks.rl_offline_name = Some(offline_name);
     hooks.live_manager_init = Some(live_manager_init);
@@ -411,10 +603,32 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.profanity_status = Some(profanity_status);
     hooks.profanity_pending = Some(profanity_pending);
     hooks.profanity_valid = Some(profanity_valid);
+    hooks.social_club_account = Some(social_club_account);
     hooks.script_program_loaded = Some(script_program_loaded);
     hooks.presence_online = Some(presence_online);
     hooks.can_enter_multiplayer = Some(can_enter_multiplayer);
     hooks.populate_store_data = Some(populate_store_data);
     hooks.photo_to_jpeg = Some(photo_to_jpeg);
     hooks.can_access_network_features = Some(can_access_network_features);
+}
+
+#[test]
+fn broadcast_data_keeps_the_length() {
+    let item = |size: u32, n: u32| {
+        format!(
+            "\t\t<Item>\r\n\t\t\t<SizeOfData value=\"{size}\"/>\r\n\t\t\t<NumInstances value=\"{n}\"/>\r\n\t\t</Item>\r\n"
+        )
+    };
+    let sizes = [(3600, 1), (2500, 2), (150, 4), (80, 4), (40, 8)];
+    let text = format!(
+        "<HostBroadcastData>\r\n{}</HostBroadcastData>\r\n<PlayerBroadcastData>\r\n{}</PlayerBroadcastData>\r\n",
+        item(40, 8),
+        sizes.map(|(s, n)| item(s, n)).concat()
+    );
+    let patched = more_broadcast_data(text.clone()).unwrap();
+    assert_eq!(patched.len(), text.len());
+    assert!(patched.starts_with(&format!("<HostBroadcastData>\r\n{}", item(40, 8))));
+    assert!(patched.contains("<SizeOfData value=\"3600\"/>\r\n\t\t\t<NumInstances value=\"3\"/>"));
+    assert!(patched.contains("<SizeOfData value=\"150\"/>\r\n\t\t<NumInstances value=\"12\"/>"));
+    assert!(patched.contains("<SizeOfData value=\"40\"/>\r\n\t\t<NumInstances value=\"16\"/>"));
 }

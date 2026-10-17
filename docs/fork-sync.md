@@ -24,7 +24,7 @@ The previous local sources are preserved at commit `487cae5` on
 We do not install two hooks for the same engine function. The old movie
 preload refusal and MPShopSale-only override are superseded by upstream's
 general handling; malformed TXD maps still fail closed. This is not an
-iCloud/save-sync implementation.
+Google Drive save-sync implementation.
 
 ## Frame generation
 

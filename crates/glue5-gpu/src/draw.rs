@@ -4,11 +4,10 @@ use std::sync::{Arc, OnceLock};
 
 use arrayvec::ArrayVec;
 use glue5_runtime::gpu::Command;
-use glue5_runtime::qos::{self, Qos};
 use rustc_hash::FxHashMap;
 use wgpu::{TextureFormat, TextureViewDimension};
 
-use crate::exec::{Bound, Clear, Gpu, PassInfo, depth_attachment};
+use crate::exec::{Bound, Clear, Gpu, PassInfo, TailKey, depth_attachment};
 use crate::format;
 use crate::objects::{NO_LAYOUT, Objects, View};
 use crate::pipeline::{self, Recipe};
@@ -80,6 +79,7 @@ impl Dummies {
     fn texture(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         dim: TextureViewDimension,
         sample: Sample,
         ms: bool,
@@ -100,6 +100,12 @@ impl Dummies {
                     TextureViewDimension::D3 => wgpu::TextureDimension::D3,
                     _ => wgpu::TextureDimension::D2,
                 };
+                // Unbound samples used to be uninitialized. On Apple that is
+                // garbage, often white, and a shader that divides by alpha
+                // turns alpha 0 into NaNs. Door geometry (the Liquor Ace meth
+                // kitchen's fragments) multiplies that by the hinge matrix, so
+                // the garbage sweeps the room as the door opens. Opaque black
+                // stays black. A depth stand-in is cleared to the far plane.
                 let tex = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("dummy"),
                     size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: layers },
@@ -108,10 +114,27 @@ impl Dummies {
                     dimension,
                     format,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | if ms { wgpu::TextureUsages::RENDER_ATTACHMENT } else { wgpu::TextureUsages::empty() },
+                        | if ms { wgpu::TextureUsages::RENDER_ATTACHMENT } else { wgpu::TextureUsages::COPY_DST },
                     view_formats: &[],
                 });
-                tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(dim), ..Default::default() })
+                let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(dim), ..Default::default() });
+                if ms {
+                    clear_dummy_target(device, queue, &view, sample);
+                } else {
+                    let texel = dummy_texels(sample, layers);
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &texel,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) },
+                        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: layers },
+                    );
+                }
+                view
             })
             .clone()
     }
@@ -128,32 +151,93 @@ impl Dummies {
     }
 
     /// One per binding: a writable storage buffer bound twice is an aliasing error.
-    fn buffer(&mut self, device: &wgpu::Device, binding: u32) -> wgpu::Buffer {
+    fn buffer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, binding: u32) -> wgpu::Buffer {
         self.buffers
             .entry(binding)
             .or_insert_with(|| {
-                device.create_buffer(&wgpu::BufferDescriptor {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("dummy"),
                     size: 65536,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
-                })
+                });
+                // Not on the stack: this runs on the command thread.
+                static ZEROS: [u8; 65536] = [0; 65536];
+                queue.write_buffer(&buffer, 0, &ZEROS);
+                buffer
             })
             .clone()
     }
 
-    fn vertices(&mut self, device: &wgpu::Device) -> wgpu::Buffer {
+    fn vertices(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Buffer {
         self.vertices
             .get_or_insert_with(|| {
-                device.create_buffer(&wgpu::BufferDescriptor {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("zero vertices"),
                     size: ZERO_VB,
-                    usage: wgpu::BufferUsages::VERTEX,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
-                })
+                });
+                // A missing vertex stream used to be uninitialized. Transformed
+                // by a door bone, those positions become streaks the length of
+                // the room. Zeros stay on the hinge.
+                queue.write_buffer(&buffer, 0, &[0; ZERO_VB as usize]);
+                buffer
             })
             .clone()
     }
+}
+
+/// One texel per layer, rows padded to the copy alignment. Float is opaque
+/// black. Depth is 1 (far). Integer formats are zero.
+fn dummy_texels(sample: Sample, layers: u32) -> Vec<u8> {
+    let row = 256usize;
+    let mut data = vec![0u8; row * layers.max(1) as usize];
+    match sample {
+        Sample::Float => {
+            for layer in 0..layers.max(1) as usize {
+                data[layer * row + 3] = 255;
+            }
+        }
+        Sample::Depth => {
+            let far = 1.0f32.to_le_bytes();
+            for layer in 0..layers.max(1) as usize {
+                data[layer * row..layer * row + 4].copy_from_slice(&far);
+            }
+        }
+        Sample::Uint | Sample::Sint => {}
+    }
+    data
+}
+
+fn clear_dummy_target(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView, sample: Sample) {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dummy clear") });
+    if sample == Sample::Depth {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+    } else {
+        let color = if sample == Sample::Float {
+            wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+        } else {
+            wgpu::Color::TRANSPARENT
+        };
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(color), store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+    }
+    queue.submit([encoder.finish()]);
 }
 
 /// What a bind group entry is built from.
@@ -199,8 +283,10 @@ impl Gpu {
             self.flush("chunk");
         }
         let epoch = self.epoch;
-        let mut colors: Vec<Option<(wgpu::TextureView, Option<u32>, wgpu::LoadOp<wgpu::Color>)>> = Vec::new();
-        let mut targets = Vec::new();
+        // On the stack: a frame opens many passes, and these used to allocate.
+        let mut colors: ArrayVec<Option<(wgpu::TextureView, Option<u32>, wgpu::LoadOp<wgpu::Color>)>, 8> =
+            ArrayVec::new();
+        let mut targets: ArrayVec<Option<TextureFormat>, 8> = ArrayVec::new();
         let (mut samples, mut width, mut height) = (1, 1, 1);
         let mut clears = std::mem::take(&mut self.clears);
         let take_clear = |clears: &mut Vec<Clear>, tex, mip, slice| {
@@ -257,7 +343,7 @@ impl Gpu {
 
         self.pass_profile = self.time_pass("draw");
         let encoder = self.encoder.get_or_insert_with(|| self.device.create_command_encoder(&Default::default()));
-        let attachments: Vec<_> = colors
+        let attachments: ArrayVec<Option<wgpu::RenderPassColorAttachment>, 8> = colors
             .iter()
             .map(|c| {
                 c.as_ref().map(|(view, depth_slice, load)| wgpu::RenderPassColorAttachment {
@@ -283,7 +369,12 @@ impl Gpu {
         self.pass = Some(pass.forget_lifetime());
         self.stats.passes += 1;
         self.chunk_passes += 1;
-        let tail_key = (targets.clone(), depth_format, samples, ro);
+        let mut key_targets = [None; 8];
+        for (i, format) in targets.iter().enumerate() {
+            key_targets[i] = *format;
+        }
+        let tail_key =
+            TailKey { targets: key_targets, count: targets.len() as u8, depth: depth_format, samples, read_only: ro };
         let next = self.pass_tails.len() as u32 + 1;
         let tail = *self.pass_tails.entry(tail_key).or_insert(next);
         self.pass_info = Some(PassInfo {
@@ -349,7 +440,7 @@ impl Gpu {
                     blend: words(self.s.blend),
                     depth: words(self.s.depth_stencil),
                     raster: words(self.s.raster).map(|w| pipeline::without_depth_bias(&w)),
-                    targets: info.targets.clone(),
+                    targets: info.targets.iter().copied().collect(),
                     samples: info.samples,
                     depth_format: info.depth,
                     read_only: info.read_only,
@@ -390,15 +481,11 @@ impl Gpu {
         if self.settings.sync_pipelines {
             job();
         } else {
-            // Its draws are skipped meanwhile, nothing waits: in a lower
-            // class (efficiency cores, where there are some) it leaves the
-            // engine's threads their cores. A new pipeline takes ~200 ms
-            // of CPU on an A15, which has two performance cores.
-            self.pool.urgent(move || {
-                qos::set(Qos::Utility);
-                job();
-                qos::set(Qos::Initiated);
-            });
+            // Its draws are skipped meanwhile, nothing waits. The compile
+            // pool is not the game thread. It sits at user-initiated during
+            // a load and utility once play is steady (see qos::compile_qos).
+            // A new pipeline takes ~200 ms of CPU on an A15.
+            self.pool.urgent(job);
         }
         cell
     }
@@ -435,7 +522,9 @@ impl Gpu {
         let epoch = self.epoch;
         let mut key = std::mem::take(&mut self.key);
         key.clear();
-        key.extend([prog.id, stage as u32, pack.map_or(0, |a| a.chunk_id)]);
+        // The mip floor is part of the key: a distant draw must not reuse the
+        // sharp bind group, or the other way round.
+        key.extend([prog.id, stage as u32, pack.map_or(0, |a| a.chunk_id), self.mip_floor]);
         for b in &prog.bindings {
             match &b.kind {
                 Kind::Uniform => {}
@@ -556,7 +645,9 @@ impl Gpu {
                     let target = self.objs.srv(id).is_some_and(|v| self.is_target(v, *dim));
                     match if target { None } else { self.srv_view(id, *dim, *sample) } {
                         Some(v) => Res::View(v),
-                        None => Res::View(self.dummies.texture(&self.device, *dim, *sample, *multisampled)),
+                        None => {
+                            Res::View(self.dummies.texture(&self.device, &self.queue, *dim, *sample, *multisampled))
+                        }
                     }
                 }
                 Kind::Storage { .. } => {
@@ -593,7 +684,7 @@ impl Gpu {
                                 }
                             }
                         }
-                        _ => Res::Buffer(self.dummies.buffer(&self.device, b.binding), 0, None),
+                        _ => Res::Buffer(self.dummies.buffer(&self.device, &self.queue, b.binding), 0, None),
                     }
                 }
                 Kind::StorageTexture { dim, .. } => {
@@ -638,16 +729,35 @@ impl Gpu {
     }
 
     /// A sampler state's sampler (`nearest`: its non-filtering twin).
+    /// Comparison samplers and a floor of 0 are the engine's own.
     fn sampler(&mut self, id: u32, comparison: bool, nearest: bool) -> Option<wgpu::Sampler> {
-        let state = self.objs.state(id).filter(|s| s.comparison == comparison && s.sampler.is_some())?;
-        if !nearest {
-            return state.sampler.clone();
+        let floor = if comparison { 0 } else { self.mip_floor.min(crate::detail::LOD_QUANTA) };
+        let words = {
+            let state = self.objs.state(id).filter(|s| s.comparison == comparison && s.sampler.is_some())?;
+            if floor == 0 {
+                if !nearest {
+                    return state.sampler.clone();
+                }
+                if let Some(s) = &state.nearest {
+                    return Some(s.clone());
+                }
+            } else {
+                let cached = if nearest { &state.coarse_nearest } else { &state.coarse };
+                if let Some(s) = &cached[(floor - 1) as usize] {
+                    return Some(s.clone());
+                }
+            }
+            state.words.clone()
+        };
+        let sampler = self.make_sampler_at(&words, nearest, floor as f32 * 0.25);
+        let state = self.objs.state_mut(id)?;
+        if floor == 0 {
+            state.nearest = Some(sampler.clone());
+        } else if nearest {
+            state.coarse_nearest[(floor - 1) as usize] = Some(sampler.clone());
+        } else {
+            state.coarse[(floor - 1) as usize] = Some(sampler.clone());
         }
-        if let Some(s) = &state.nearest {
-            return Some(s.clone());
-        }
-        let sampler = self.make_sampler(&state.words, true);
-        self.objs.state_mut(id)?.nearest = Some(sampler.clone());
         Some(sampler)
     }
 
@@ -922,6 +1032,18 @@ impl Gpu {
         if !self.ensure_pass() {
             return self.skip("no render target");
         }
+        self.observe_camera();
+        let distance = self.placed_distance();
+        if self.cull_distant_shadow(distance) {
+            return self.skip("distant shadow");
+        }
+        let ps_label = ps.as_ref().map(|p| p.label.as_str()).unwrap_or("");
+        if let Some(why) = self.cull_for_distance(distance, &vs.label, ps_label, kind, count, instances) {
+            return self.skip(why);
+        }
+        // Shadow maps sample alpha-tested cutouts. A coarser mip would change
+        // which pixels cast, so those draws are culled by distance instead.
+        self.mip_floor = if self.shadow_map_pass() { 0 } else { self.detail_lod(distance, &vs.label, ps_label) };
         let Some(cell) = self.pipeline(&vs, ps.as_ref(), [vs_float32, ps_float32]) else {
             return self.skip("no pipeline");
         };
@@ -940,7 +1062,6 @@ impl Gpu {
             p.rename(i, &ps.as_ref().unwrap_or(&vs).label);
         }
 
-        self.observe_camera();
         let g0 = match &vs.layout {
             Some(l) => match self.bind_group(&vs, Stage::Vertex, l) {
                 Some(g) => Some(g),
@@ -1073,7 +1194,11 @@ impl Gpu {
             Some(&[constant, clamp, slope]) => [constant, if self.caps.depth_bias_clamp { clamp } else { 0 }, slope],
             _ => [0; 3],
         };
-        let zero = if vbs.iter().any(|v| v.1.is_none()) { Some(self.dummies.vertices(&self.device)) } else { None };
+        let zero = if vbs.iter().any(|v| v.1.is_none()) {
+            Some(self.dummies.vertices(&self.device, &self.queue))
+        } else {
+            None
+        };
         let bound = &mut self.bound;
         let pass = self.pass.as_mut().unwrap();
 
@@ -1158,6 +1283,81 @@ impl Gpu {
         self.stats.draws += 1;
     }
 
+    /// World distance of this draw, when its constants place an object.
+    fn placed_distance(&self) -> Option<f32> {
+        if !crate::detail::policy().enabled || self.scene.hud {
+            return None;
+        }
+        let cam = self.scene.lod_camera?;
+        let cb = self.s.cb[0][1];
+        let shadow = self.objs.buf(cb.buf)?.shadow.as_deref()?;
+        let from = cb.first as usize * 16;
+        let bytes = shadow.get(from..from + 64)?;
+        let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        crate::detail::placed_distance([f(12), f(13), f(14)], cam)
+    }
+
+    fn detail_lod(&self, distance: Option<f32>, vs: &str, ps: &str) -> u32 {
+        let Some(distance) = distance else { return 0 };
+        let policy = crate::detail::policy();
+        if !policy.enabled {
+            return 0;
+        }
+        let thermal = self.presentation.as_ref().map(crate::present::Presentation::thermal).unwrap_or(0);
+        let bands = crate::detail::bands(policy.mobile, policy.aggressive, thermal);
+        crate::detail::lod_quanta(crate::detail::lod_add(vs, ps, distance, bands, thermal))
+    }
+
+    /// Drops distant grass, named clutter and LOD stand-ins. A road, wall or
+    /// ramp is not one of those: its origin is not the surface. Occlusion
+    /// queries and the HUD are left alone.
+    fn cull_for_distance(
+        &self,
+        distance: Option<f32>,
+        vs: &str,
+        ps: &str,
+        kind: u32,
+        count: u32,
+        instances: u32,
+    ) -> Option<&'static str> {
+        let policy = crate::detail::policy();
+        if !policy.enabled || self.scene.hud || self.occlusion.running() {
+            return None;
+        }
+        let distance = distance?;
+        let thermal = self.presentation.as_ref().map(crate::present::Presentation::thermal).unwrap_or(0);
+        let indirect = kind >= 4;
+        let triangles = if indirect { u32::MAX } else { count / 3 };
+        let instanced = instances > 1 || kind == 2 || kind == 3 || kind == 5;
+        crate::detail::skip_reason(
+            distance,
+            &crate::detail::DrawInfo { vs, ps, triangles, instanced },
+            crate::detail::distances(policy, thermal),
+        )
+    }
+
+    /// A depth-only square target smaller than the scene is a shadow map.
+    fn shadow_map_pass(&self) -> bool {
+        let Some(info) = self.pass_info.as_ref() else { return false };
+        let depth_only = info.depth.is_some() && info.targets.iter().all(|t| t.is_none());
+        let square = info.width > 0 && info.width == info.height && info.width <= 4096;
+        let smaller = self.scene.size.is_none_or(|(w, h)| info.width < w || info.height < h);
+        depth_only && square && smaller
+    }
+
+    /// Casters past the cutoff are not drawn into the shadow map. Occlusion
+    /// queries and the HUD are left alone, and the colour pass still draws
+    /// the object.
+    fn cull_distant_shadow(&self, distance: Option<f32>) -> bool {
+        let policy = crate::detail::policy();
+        if !policy.enabled || self.scene.hud || self.occlusion.running() || !self.shadow_map_pass() {
+            return false;
+        }
+        let thermal = self.presentation.as_ref().map(crate::present::Presentation::thermal).unwrap_or(0);
+        let cutoff = crate::detail::shadow_cutoff(policy.mobile, thermal, policy.shadow_override);
+        distance.is_some_and(|d| d > cutoff)
+    }
+
     /// A draw into the scene's targets may show this frame's camera (see
     /// scene.rs): the vertex program's `rage_matrices`.
     fn observe_camera(&mut self) {
@@ -1184,6 +1384,7 @@ impl Gpu {
     // ---- compute ---------------------------------------------------------------------------
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
+        self.mip_floor = 0;
         self.flush_clears();
         let Some(cs) = self.program(self.s.shader[2]) else {
             return self.skip("no compute shader");
@@ -1280,4 +1481,32 @@ fn pack_constants(
     }
     cache.entries.push((uniforms.frame, current, jitter_key, alloc));
     alloc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dummy_texels;
+    use crate::shader::Sample;
+
+    #[test]
+    fn a_missing_color_sample_is_opaque_black() {
+        let texels = dummy_texels(Sample::Float, 6);
+        assert_eq!(texels.len(), 256 * 6);
+        assert_eq!(&texels[..4], &[0, 0, 0, 255]);
+        assert_eq!(&texels[256..260], &[0, 0, 0, 255], "each cube face is cleared");
+        assert!(texels[4..256].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn a_missing_depth_sample_is_the_far_plane() {
+        let texels = dummy_texels(Sample::Depth, 1);
+        let depth = f32::from_le_bytes(texels[..4].try_into().unwrap());
+        assert_eq!(depth, 1.0);
+    }
+
+    #[test]
+    fn a_missing_integer_sample_is_zero() {
+        assert!(dummy_texels(Sample::Uint, 1).iter().all(|b| *b == 0));
+        assert!(dummy_texels(Sample::Sint, 1).iter().all(|b| *b == 0));
+    }
 }

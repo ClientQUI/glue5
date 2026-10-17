@@ -363,13 +363,17 @@ impl Compiler {
                 let alpha_test = alpha_to_coverage && r.samples <= 1 && p.outputs & 1 != 0;
                 let reads = |l: &u32| p.locations.contains(l) || (clip && *l == shader::CLIP_LOCATION);
                 let ps_remap = remap.as_ref().filter(|m| m.iter().any(|(from, _)| reads(from)));
-                if !alpha_test && !clip && ps_remap.is_none() {
+                let no_depth = p.frag_depth && r.depth_format.is_none();
+                if !alpha_test && !clip && ps_remap.is_none() && !no_depth {
                     Some(p.module(&self.device).ok_or_else(|| anyhow::anyhow!("pixel module failed"))?)
                 } else {
-                    let key = format!("{alpha_test}|{clip}|{ps_remap:?}");
+                    let key = format!("{alpha_test}|{clip}|{ps_remap:?}|{no_depth}");
                     let module = p.variant(&self.device, &key, |text| {
                         let mut text = text.to_owned();
                         if alpha_test && let Some(t) = shader::with_alpha_test(&text) {
+                            text = t;
+                        }
+                        if no_depth && let Some(t) = shader::without_frag_depth(&text) {
                             text = t;
                         }
                         if clip && let Some(t) = shader::with_clipping(Some(&text), shader::CLIP_LOCATION) {

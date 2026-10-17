@@ -5,7 +5,8 @@ use super::widgets::{
 use super::{Action, Page, SettingsTab, Status, WARN, theme};
 use crate::paths::MOBILE;
 use crate::settings::{
-    self, RENDER_SCALES, ResourceBudget, Settings, TextureDetail, TouchMode, Upscaling, WorldDetail, WorldPreset,
+    self, Corner, Efficiency, OverlayDetail, PerfOverlay, RENDER_SCALES, ResourceBudget, Settings, TextureDetail,
+    TouchAim, TouchMode, Upscaling, WorldDetail, WorldPreset,
 };
 use egui::{Align, Align2, Id, Layout, RichText, vec2};
 
@@ -267,15 +268,40 @@ fn settings_items(
                 setting(ui, "Adaptive quality", Control::Toggle, None, |ui| {
                     toggle(ui, &mut settings.adaptive_graphics)
                 });
-                let state = ["Nominal", "Fair", "Serious", "Critical"][status.thermal_state.min(3) as usize];
-                let subtitle = format!(
-                    "{state} · active limit {} FPS",
-                    if status.effective_fps > 0 { status.effective_fps } else { 60 }
-                );
-                setting(ui, "Thermal protection", Control::Toggle, Some(&subtitle), |ui| {
-                    toggle(ui, &mut settings.thermal_protection)
-                });
             }
+            let state = ["Nominal", "Fair", "Serious", "Critical"][status.thermal_state.min(3) as usize];
+            let subtitle = format!(
+                "{state} · active limit {} FPS",
+                if status.effective_fps > 0 { status.effective_fps } else { 60 }
+            );
+            setting(ui, "Thermal protection", Control::Toggle, Some(&subtitle), |ui| {
+                toggle(ui, &mut settings.thermal_protection)
+            });
+            let efficiency = settings.efficiency_now();
+            let efficiency_note = match crate::settings::efficiency_forced() {
+                Some(Efficiency::Off) => "Forced off",
+                Some(Efficiency::Hybrid) => "Forced to Hybrid",
+                Some(Efficiency::FullE) => "Forced to Full-E",
+                None => match efficiency {
+                    Efficiency::Off => "Performance cores",
+                    Efficiency::Hybrid => "Recommended. E-cores in play, P-cores while loading",
+                    Efficiency::FullE => "E-cores the whole time. About 20 FPS",
+                },
+            };
+            setting(ui, "Efficiency", Control::Choice, Some(efficiency_note), |ui| {
+                choice(
+                    ui,
+                    &mut settings.efficiency,
+                    &[(Efficiency::Off, "Off"), (Efficiency::Hybrid, "Hybrid"), (Efficiency::FullE, "Full-E")],
+                )
+            });
+            ui.label(
+                RichText::new(
+                    "Hybrid is recommended. Loading runs uncapped on performance cores, including streaming and shader compiles, then play prefers efficiency cores and paces at 24 FPS. A missed frame briefly raises the game and render threads. Audio stays immediate, with 250 ms buffered, on its own thread. Full-E stays on efficiency cores and paces at 20 FPS, including the load. Off keeps the frame, streaming and compile threads interactive; the frame-rate cap still waits until the load's reads go quiet.",
+                )
+                .small()
+                .color(theme::MUTED),
+            );
             let unlimited = if settings.vsync { "Display" } else { "Unlimited" };
             let mut rates = vec![(0, unlimited), (60, "60")];
             if status.refresh_rate >= 119.0 {
@@ -293,14 +319,44 @@ fn settings_items(
                 |ui| choice(ui, &mut settings.max_fps, &rates),
             );
             setting(ui, "VSync", Control::Toggle, None, |ui| toggle(ui, &mut settings.vsync));
-            #[cfg(target_vendor = "apple")]
+            distance_options(ui, settings, status);
+            let mut overlays = vec![(PerfOverlay::Off, "Off")];
+            if cfg!(target_vendor = "apple") {
+                overlays.push((PerfOverlay::MetalHud, "Metal HUD"));
+            }
+            overlays.push((PerfOverlay::Glue5, "Glue 5"));
             setting(
                 ui,
-                "Metal HUD",
-                Control::Toggle,
-                (settings.metal_hud && !status.metal_hud).then_some("Next launch"),
-                |ui| toggle(ui, &mut settings.metal_hud),
+                "Performance overlay",
+                Control::Choice,
+                (settings.overlay == PerfOverlay::MetalHud && !status.metal_hud).then_some("Next launch"),
+                |ui| choice(ui, &mut settings.overlay, &overlays),
             );
+            if settings.overlay == PerfOverlay::Glue5 {
+                setting(ui, "Overlay detail", Control::Choice, None, |ui| {
+                    choice(
+                        ui,
+                        &mut settings.overlay_detail,
+                        &[
+                            (OverlayDetail::Minimal, "Minimal"),
+                            (OverlayDetail::Standard, "Standard"),
+                            (OverlayDetail::Full, "Full"),
+                        ],
+                    )
+                });
+                setting(ui, "Overlay position", Control::Choice, None, |ui| {
+                    choice(
+                        ui,
+                        &mut settings.overlay_corner,
+                        &[
+                            (Corner::TopLeft, "Top left"),
+                            (Corner::TopRight, "Top right"),
+                            (Corner::BottomLeft, "Bottom left"),
+                            (Corner::BottomRight, "Bottom right"),
+                        ],
+                    )
+                });
+            }
         }
         SettingsTab::World => {
             setting(
@@ -381,11 +437,32 @@ fn settings_items(
             setting(ui, "Opacity", Control::Slider, None, |ui| {
                 slider(ui, &mut settings.touch_opacity, 0.2..=1.0, 0.01, "%", 0)
             });
+            setting(ui, "Camera speed", Control::Slider, None, |ui| {
+                slider(ui, &mut settings.touch_camera, 0.25..=3.0, 0.05, "×", 2)
+            });
+            setting(ui, "Aim assist", Control::Choice, None, |ui| {
+                choice(
+                    ui,
+                    &mut settings.touch_aim,
+                    &[
+                        (TouchAim::LockOn, "Lock-on"),
+                        (TouchAim::Snap, "Snap"),
+                        (TouchAim::SlowDown, "Slow-down"),
+                        (TouchAim::Off, "Off"),
+                    ],
+                )
+            })
+            .on_hover_text(
+                "Lock-on: aiming locks on to the nearest target and follows it. Snap: aiming snaps to the target, \
+                 then you aim. Slow-down: the camera slows down over targets. Off: free aim",
+            );
             if crate::haptics::SUPPORTED {
                 setting(ui, "Haptics", Control::Toggle, None, |ui| toggle(ui, &mut settings.haptics));
             }
         }
         SettingsTab::Game => {
+            #[cfg(target_vendor = "apple")]
+            drive_setting(ui, settings);
             setting(
                 ui,
                 "Streaming budget",
@@ -469,6 +546,94 @@ fn settings_items(
     }
 }
 
+#[cfg(target_vendor = "apple")]
+fn drive_setting(ui: &mut egui::Ui, settings: &mut Settings) {
+    let forced = settings::drive_forced();
+    let status = glue5_runtime::drive::status_note();
+    let note: &str = match forced {
+        Some(true) => "GLUE5_GOOGLE_DRIVE is on.",
+        Some(false) => "GLUE5_GOOGLE_DRIVE is off. Saves stay on this device.",
+        None if !settings.google_drive => "Off. Saves stay on this device.",
+        None => status.as_str(),
+    };
+    setting(ui, "Google Drive", Control::Toggle, Some(note), |ui| {
+        ui.add_enabled_ui(forced.is_none(), |ui| {
+            toggle(ui, &mut settings.google_drive);
+        });
+    });
+    if settings::google_client_id_from_env().is_some() {
+        ui.label(RichText::new("Client ID comes from GLUE5_GOOGLE_CLIENT_ID.").small().color(theme::MUTED));
+    } else {
+        let client = if cfg!(target_os = "ios") {
+            &mut settings.google_client_id_ios
+        } else {
+            &mut settings.google_client_id_desktop
+        };
+        text_field(ui, "ID", client, glue5_runtime::drive::default_client_id(), 200);
+    }
+    if !cfg!(target_os = "ios") {
+        if settings::google_client_secret_from_env().is_some() {
+            ui.label(RichText::new("Client secret comes from GLUE5_GOOGLE_CLIENT_SECRET.").small().color(theme::MUTED));
+        } else {
+            text_field(ui, "Secret", &mut settings.google_client_secret, "Desktop client secret", 80);
+        }
+    }
+    let signed = glue5_runtime::drive::signed_in();
+    setting(ui, "Account", Control::Action, Some(if signed { "Signed in" } else { "Not signed in" }), |ui| {
+        if action_button(ui, if signed { "Sign out" } else { "Sign in" }).clicked() {
+            if signed {
+                glue5_runtime::drive::sign_out();
+            } else {
+                settings.google_drive = true;
+                glue5_runtime::drive::sign_in(&settings.google_client_id(), &settings.google_client_secret());
+            }
+        }
+    });
+}
+
+fn distance_options(ui: &mut egui::Ui, settings: &mut Settings, status: &Status) {
+    ui.label(
+        RichText::new("Distance · applies immediately. Near the camera, surfaces stay fully textured.")
+            .small()
+            .color(theme::MUTED),
+    );
+    setting(ui, "Fog", Control::Toggle, Some("Never tints the road in front of you"), |ui| {
+        toggle(ui, &mut settings.fog)
+    });
+    let fog_note = if settings.fog_distance <= 0.0 {
+        "Same as view distance".to_string()
+    } else {
+        format!("{:.0} m", settings.fog_distance)
+    };
+    setting(ui, "Fog distance", Control::Slider, Some(&fog_note), |ui| {
+        slider(ui, &mut settings.fog_distance, 0.0..=1200.0, 10.0, "m", 0)
+    });
+    metres(ui, "View distance", &mut settings.view_distance, 0.0..=1200.0, "Off");
+    metres(ui, "Detail distance", &mut settings.detail_distance, 0.0..=400.0, "Off");
+    metres(ui, "Tree distance", &mut settings.tree_distance, 0.0..=800.0, "Off");
+    metres(ui, "Shadow distance", &mut settings.shadow_distance, 0.0..=600.0, "Off");
+    setting(ui, "Render boost", Control::Slider, Some("While cool. 1 keeps your resolution"), |ui| {
+        slider(ui, &mut settings.render_boost, 1.0..=1.5, 0.05, "×", 2)
+    });
+    ui.label(
+        RichText::new(
+            "0 turns a distance off. Detail is clutter, decals and bushes. Tree distance is cards, not the trees next to you. Boost above 1 uses more memory and can stop near textures loading.",
+        )
+        .small()
+        .color(theme::MUTED),
+    );
+    setting(ui, "Defaults", Control::Action, Some("Fog, distances, scale, boost, thermal, efficiency"), |ui| {
+        if action_button(ui, "Reset").clicked() {
+            settings.reset_distance_options(status.window.1);
+        }
+    });
+}
+
+fn metres(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, off: &str) {
+    let note = if *value <= 0.0 { off.to_string() } else { format!("{:.0} m", *value) };
+    setting(ui, label, Control::Slider, Some(&note), |ui| slider(ui, value, range, 10.0, "m", 0));
+}
+
 fn next_start(differs: bool) -> Option<&'static str> {
     differs.then_some("Next start")
 }
@@ -476,7 +641,7 @@ fn next_start(differs: bool) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{SettingsTab, Status, settings_page, theme};
-    use crate::settings::{Settings, Upscaling};
+    use crate::settings::{PerfOverlay, Settings, Upscaling};
     use crate::ui::{Mode, home::start_page};
     use egui::{Id, Pos2, Rect, SafeAreaInsets, vec2};
     use std::path::Path;
@@ -489,6 +654,7 @@ mod tests {
             last_failure: None,
             graphics_reset: false,
             window: (1440, 900),
+            back_buffer: None,
             upscalers: &[Upscaling::Bicubic, Upscaling::MetalFx, Upscaling::MetalFxTemporal, Upscaling::Fsr],
             frame_generation: true,
             metal_hud: false,
@@ -562,9 +728,17 @@ mod tests {
     }
     #[test]
     fn phone_settings_use_the_height_and_keep_video_options_reachable() {
+        for (overlay, last) in [(PerfOverlay::Off, "Performance overlay"), (PerfOverlay::Glue5, "Overlay position")] {
+            let mut settings = Settings::default();
+            settings.overlay = overlay;
+            phone_video_options(settings, last);
+        }
+    }
+
+    /// The Video tab on a phone, `last` its last option.
+    fn phone_video_options(mut settings: Settings, last: &str) {
         let ctx = egui::Context::default();
         theme::install(&ctx);
-        let mut settings = Settings::default();
         let mut tab = SettingsTab::Video;
         for pass in 0..8 {
             let mut output = ctx.run_ui(
@@ -615,12 +789,20 @@ mod tests {
                         _ => None,
                     })
                     .collect();
-                // The expanded settings scroll. Both the first row and last
-                // option must be reachable in a short landscape safe area.
+                // The video page is taller than the phone safe area. The first
+                // row shows before scrolling, and the last option after it.
                 assert!(!rows.is_empty());
                 let visible = if pass == 3 { &rows[..1] } else { &rows[rows.len() - 1..] };
                 for (rect, clip) in visible {
                     assert!(clip.contains_rect(*rect), "clipped option: {rect:?} in {clip:?}");
+                }
+                if pass == 7 {
+                    let label = |s: &egui::epaint::ClippedShape| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text() == last => Some(t.visual_bounding_rect()),
+                        _ => None,
+                    };
+                    let rect = output.shapes.iter().find_map(label).expect("the last option is drawn");
+                    assert!(visible[0].0.contains_rect(rect), "{last} is not the last row shown");
                 }
             }
         }

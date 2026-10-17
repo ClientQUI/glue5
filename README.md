@@ -28,7 +28,9 @@ Emscripten/WASI imports, threads, file access, input, audio and GPU support.
 
 **Status:** the story mode runs on macOS and iOS devices (wgpu on Metal,
 with sound); keyboard, mouse, gamepads and touch controls work. The
-Android app builds (wgpu on Vulkan); it has not run on a device yet.
+Android app builds (wgpu on Vulkan); it has not run on a device yet. The
+Linux build and AppImage (wgpu on Vulkan, X11 and Wayland) are set up but
+not yet built or run.
 
 See [design.md](docs/design.md) for architecture, tradeoffs and known limits.
 
@@ -51,7 +53,8 @@ See [design.md](docs/design.md) for architecture, tradeoffs and known limits.
 | `platform/ios` | What iOS needs around it: `main.c`, entitlements, the xcodegen spec. |
 | `platform/android` | The Gradle project around it: manifest, the activity (SDL's, subclassed), the adaptive icon. |
 | `platform/macos` | Extra bundle metadata; cargo-packager configuration lives in `crates/glue5/Cargo.toml`. |
-| `.mise` | [mise]: the toolchain (`config.toml`) and the developer tasks (`tasks/`): setup, desktop, iOS and Android. |
+| `platform/linux` | The container the AppImage is built in (`Dockerfile`). |
+| `.mise` | [mise]: the toolchain (`config.toml`) and the developer tasks (`tasks/`): setup, desktop, iOS, Android and Linux. |
 | `patches` | Our patches to wasm2c, wgpu, wgpu-core, wgpu-hal and sp-fidelity, applied by `mise run setup` ([README](patches/README.md)). |
 | `third_party/wabt` | wasm2c's sources, pinned (a submodule). `third_party/wgpu`, `third_party/wgpu-core`, `third_party/wgpu-hal` and `third_party/sp-fidelity`, the patched crates, are made by setup and not in git. |
 
@@ -62,8 +65,8 @@ build.
 
 ## Building
 
-Requirements: [mise] and a C/C++ compiler; for iOS, Xcode; for Windows,
-[see below](#windows). mise installs
+Requirements: [mise] and a C/C++ compiler; for iOS, Xcode; for Windows
+and Linux, [see below](#windows). mise installs
 Rust, CMake and [xcodegen] (`.mise/config.toml`) on first use, and for
 Android the JDK, Gradle, the SDK's command-line tools and cargo-ndk; the
 Android tasks install the SDK packages they need (platform, build tools,
@@ -101,6 +104,28 @@ sources. Link the game directory with a junction
 (`New-Item -ItemType Junction game -Target <dir>`) or set `GLUE5_GAME_DIR`.
 Rendering is wgpu on Vulkan: the GPU driver provides it.
 
+### Linux
+
+Clang compiles the game's generated C (`CC` overrides it), and SDL is built
+against the headers of the backends it supports: install them before the
+first build, or SDL leaves those out (no window without X11 or Wayland's).
+On Debian and Ubuntu, the list in `platform/linux/Dockerfile`; on other
+distributions, SDL's `docs/README-linux.md`. SDL loads X11 or Wayland
+(Wayland when the compositor has `fifo-v1`, X11 or XWayland otherwise;
+`SDL_VIDEO_DRIVER=x11` or `wayland` forces one), the sound server and udev
+at run time. Rendering is wgpu on Vulkan, from the GPU driver.
+
+`mise run linux:package` builds `target/package/glue5_<version>_<arch>.AppImage`
+with cargo-packager (it downloads linuxdeploy on first use). The AppImage
+holds the executable and the icon only: glibc, Vulkan and the libraries SDL
+loads are the system's, so it runs on systems with the glibc it was built
+against or later. `mise run linux:container [x86_64|aarch64]` builds it in
+`platform/linux/Dockerfile` (Ubuntu 22.04, glibc 2.35) with Docker, from any
+system, its build tree in `target/linux-<arch>`. Give Docker the memory for
+up to eight C compilations of ~15 MB files at once.
+
+The game is looked for in `game/` beside the AppImage, as beside the Mac app.
+
 ## Tasks
 
 | What | Command |
@@ -110,6 +135,8 @@ Rendering is wgpu on Vulkan: the GPU driver provides it.
 | macOS: build only the app bundle | `mise run macos:build` |
 | macOS: open the built app again | `mise run macos:run` |
 | macOS: build a distributable disk image | `mise run macos:package` |
+| Linux: build the AppImage (on Linux) | `mise run linux:package` |
+| Linux: build the AppImage in a container (Docker), on any system | `mise run linux:container [x86_64\|aarch64]` |
 | Run without a window: scripted input, PNG shots, statistics | `mise run headless --press 30 start --for 40 --shots 300 shots` (`mise run headless -- --help` lists the options) |
 | Tests | `mise run test`; every translated shader through the adapter and naga's validator: `mise run test:shaders` |
 | Merge recorded pipelines into the app's seed | `mise run shaders:seed <pipelines.jsonl>...` |
@@ -117,6 +144,7 @@ Rendering is wgpu on Vulkan: the GPU driver provides it.
 | iOS: build, sign, install, launch on the connected device | `mise run ios [device]` |
 | iOS: only check that the app builds | `mise run ios:build` |
 | iOS: build and export a signed IPA | `mise run ios:ipa` (`target/ios/export/Glue 5.ipa`) |
+| iOS: CI IPA (unsigned, then ldid) | GitHub Actions workflow `iOS IPA`, artifact `Glue5.ipa` |
 | iOS: launch the installed app again, with its console | `mise run ios:run [device]` |
 | iOS: copy the game into the app's Documents/game | `mise run ios:game [device]` |
 | Android: build, install, launch on the connected device with its log | `mise run android [device]` |
@@ -129,12 +157,36 @@ put it in `.mise/config.local.toml` (ignored by git) under `[env]`. With several
 phones connected, pass the device (name, identifier or UDID); for Android,
 its serial number (`adb devices`).
 
+### CI IPA
+
+The `iOS IPA` workflow (`.github/workflows/ios-ipa.yml`) runs on every push
+and from Actions → Run workflow. It builds the unsigned app on `macos-latest`
+(`CODE_SIGNING_ALLOWED=NO`, the same shape as `mise run ios:build`), fake-signs
+the bundle with `ldid` and `platform/ios/Glue5.entitlements`, and uploads the
+artifact `Glue5.ipa`. That archive is for sideloading. A Developer-signed IPA
+is still the local task `mise run ios:ipa`.
+
+This repository does not contain GTA V, so CI has no `game.wasm` unless you
+give it one:
+
+1. Pack the game directory (the folder that contains `b/<build>/game.wasm`,
+   `b/<build>/shaders` and `data/`). The archive root may be that folder, or
+   one directory above it. `.tar`, `.tar.gz` and `.zip` URLs are accepted.
+2. Set the repository secret `GLUE5_GAME_URL` to an https URL for that archive.
+   For a private URL, also set `GLUE5_GAME_TOKEN`. It is sent as a bearer token.
+3. Re-run `iOS IPA`.
+
+The supported `game.wasm` is build `8b0b5899ed`. A different build is refused.
+Until `GLUE5_GAME_URL` is set, the **Game files** step fails and explains this,
+before the toolchain or Xcode is installed.
+
 ### macOS packaging
 
 `mise run macos:build` creates `target/package/Glue 5.app` for the Mac's
 architecture; `mise run macos:package` also creates a DMG in `target/package`.
 These tasks require Xcode 26+ for the shared Icon Composer icon. mise manages
-cargo-packager alongside the other tools in `.mise/config.toml` on macOS.
+cargo-packager alongside the other tools in `.mise/config.toml` on macOS
+and Linux.
 Direct Cargo builds and the packaged app both target macOS 14+, configured in
 `.cargo/config.toml`. There is no bundle signing, Developer ID or notarization
 step; the executable retains the linker-generated ad-hoc signature on Apple
@@ -143,7 +195,13 @@ Silicon. Downloaded unsigned distributions may be blocked by Gatekeeper.
 Game data and shaders are **not bundled**. Choose the external game directory
 on the start page, or put a `game` directory beside `Glue 5.app`. The executable
 still contains the game code compiled from the build-time `game.wasm`.
-Saves and settings remain in the user's Application Support directory.
+Saves and settings stay in the user directory below, and can follow a Google
+account (Drive's hidden app data; see **Google Drive**). The Mac bundle id is
+`com.lennertwilhelm.gta5offline`, the same as iOS. There is no iCloud
+entitlement, so a free Apple developer account can sign the app.
+Closing or backgrounding the app (iOS: resigning active, entering the
+background, or terminating) queues a stats save and flushes it to disk, so
+the money stat is still there on the next launch.
 
 `mise run macos` builds and opens the bundle through Launch Services; an
 already running instance is brought forward. For a fresh launch, quit it
@@ -171,7 +229,18 @@ intent's extras).
 | `GLUE5_ENGINE_LOG=stdout` | The engine's log on the terminal too. On iOS it is also saved as `Glue5 Diagnostics/engine.log` in the app's Documents folder. |
 | `GLUE5_ENGINE_ARGS` | More engine switches, e.g. `-FrameQueueLimit=2`. |
 | `GLUE5_DISABLE_SCENARIO_WORKAROUND=1` | Diagnostic only: disables the workaround for the engine's full scenario-ped overlap list, to A/B-test a mission-specific crash. |
-| `GLUE5_GPU_PROFILE=1` | GPU time per pass in the statistics. |
+| `GLUE5_GPU_PROFILE=1` | GPU time per pass in the statistics, including the upscaler. The timing markers are extra command buffers, so they are not submitted unless this is set. |
+| `GLUE5_DISTANT_DETAIL` | `0` keeps every draw, at the engine's own detail, and turns distance fog off. `2` starts the built-in cuts closer. The in-game graphics menu (the gear button) overrides distances, fog and render boost and saves them in `glue5.json`. Roads, walls and ramps are never mip-biased or culled: a drawable's origin is not the surface in front of the camera. Named vegetation, clutter and LOD shaders still thin out with distance. Anything inside 48 m stays fully textured. |
+| `GLUE5_DETAIL_DISTANCE` | Metres past which small decals, debris and bushes are not drawn. Grass uses the same number when this is set. `0` disables that culling. Unset: 50 m / 40 m grass on phones, 80 m / 70 m on desktop, shorter while the device is hot. The graphics menu's detail distance replaces this while the app is running. |
+| `GLUE5_TREE_DISTANCE` | Metres past which a tree **card** (a shader whose name says it is a LOD) is not drawn. Full trees stay until the view distance, and blur only past 48 m. `0` keeps the cards. Unset: 130 m on phones, 200 m on desktop. |
+| `GLUE5_VIEW_DISTANCE` | Metres past which an LOD stand-in or a full tree is not drawn. High-detail materials are not dropped by this, because their origin can be a sector away from the camera. `0` disables the cutoff. Unset: 260 m on phones, 420 m on desktop, shorter while hot. Fog, when on, ends here unless the menu sets its own distance. |
+| `GLUE5_FOG` | `0` skips the fog pass. The menu's fog switch is the control while the app is running. Fog never tints a pixel inside 48 m, a pixel whose depth says it is close, or the ground when the depth buffer is the far clear. |
+| `GLUE5_RENDER_BOOST` | Multiplier on the chosen render scale while thermals are nominal, never past 100%. Unset is 1. The previous 1.25 phone default raised the back buffer enough that near textures stopped streaming in; raise it from the graphics menu if the device has the memory. Fair heat returns to the chosen scale; Serious and Critical go below it (×0.75, then ×0.6) when thermal protection is on. |
+| `GLUE5_GOOGLE_DRIVE` | `0` or `1`. Unset follows the Game-tab toggle, which defaults to off until you turn it on. Off, or any platform other than iPhone, iPad and Mac, keeps saves on the device. |
+| `GLUE5_GOOGLE_CLIENT_ID` | OAuth client id (`….apps.googleusercontent.com`). Wins over the Client ID field. Empty uses the built-in iOS client on iPhone and iPad, and the built-in desktop client on Mac. See **Google Drive**. |
+| `GLUE5_GOOGLE_CLIENT_SECRET` | Desktop OAuth client secret. Wins over the Secret field. Not used on iPhone or iPad. Not uploaded. See **Google Drive**. |
+| `GLUE5_EFFICIENCY` | `off`, `hybrid` (recommended), or `full` / `full-e`. Unset follows the Video choice, which defaults to Hybrid. Hybrid runs startup and loading uncapped, with streaming and shader compiles at user-interactive, then drops the game, render and GPU threads to utility and paces at 24 FPS. Streaming stays user-interactive after that: putting it below the frame stretched a load from 1-2 s to 6-10 s. A missed frame raises the game and render threads, then eases them back. Full-E keeps those threads at utility and paces at 20 FPS, including the load. Off keeps frame, streaming and compile threads user-interactive, and still lifts the frame cap until the load's reads go quiet. The mixer, the audio pump and the device callback stay user-interactive in every mode; hybrid and full-E buffer 250 ms, and on Apple the callback takes a time-constraint schedule and joins an audio workgroup. Shader compiles and texture decompression stay off the game thread. `GLUE5_EFFICIENCY_MODE=1` is full-E and `=0` is off. `GLUE5_EFFICIENCY_CORES=0` is off. Nothing here uses the Neural Engine. |
+| `GLUE5_SHADOW_DISTANCE` | Metres past which distant shadow casters are skipped. `0` disables that culling. Unset uses 120 m on phones and 250 m on desktop, shorter while the device is hot. |
 | `GLUE5_PLAY=1` | Start the game without the start page (as `--play`; on a phone too). |
 | `GLUE5_NO_BC=1`, `GLUE5_NO_FLOAT32_FILTER=1` | Mobile GPU fallbacks on a desktop GPU: BC textures decoded on the CPU (and re-encoded as ETC2 where the GPU has it), 32-bit float textures unfiltered. |
 | `GLUE5_NO_ETC2=1` | Decoded BC textures stay RGBA8 instead of ETC2. |
@@ -310,9 +379,110 @@ and a hook can call the original through `glue5_game::orig`.
   panics, engine fatal errors, resource-heap pressure, GPU statistics and
   missing game-file opens are recorded there.
 - The user directory (saves, `glue5.json` and the renderer's caches in
-  `cache/`) is SDL's per-user application directory:
-  `~/Library/Application Support/glue5` on macOS, `~/.local/share/glue5` on
-  Linux, `%APPDATA%\glue5` on Windows.
+  `cache/`) is SDL's per-user application directory
+  (`SDL_GetPrefPath("", "glue5")`):
+  `~/Library/Application Support/glue5` on macOS,
+  `<sandbox>/Library/Application Support/glue5` on iOS and iPadOS
+  (`/var/mobile/Containers/Data/Application/<UUID>/`),
+  `~/.local/share/glue5` on Linux, `%APPDATA%\glue5` on Windows.
+  The game install is not in there: on iOS and iPadOS it is
+  `<sandbox>/Documents/game`, visible in Finder and the Files app.
+  See **Where saves are**.
+
+## Where saves are
+
+iOS and iPadOS use the same paths (`target_os = "ios"`, device families iPhone
+and iPad). `<sandbox>` is
+`/var/mobile/Containers/Data/Application/<UUID>/`.
+
+| What | Path under the user directory | Who writes it |
+|---|---|---|
+| App settings (fog, distances, Efficiency, the Google Drive toggle, the chosen game folder) | `glue5.json` | `Settings::save` / `save_snapshot` in `crates/glue5/src/settings.rs`, including the background flush in `app.rs` |
+| Story and game saves, the engine's graphics settings | `Documents/Rockstar Games/GTA V/` (settings at `settings.xml`; a graphics reset also writes `settings.xml.bak`; profile slots such as `Profiles/<id>/SGTA5…` are whatever the engine creates through `/userdata`) | The engine, via the vfs (`/userdata` → this directory). The host also writes `settings.xml` from `crates/glue5-runtime/src/game_settings.rs` |
+| GTA Online characters | `cloud/<member file>` (`…_default0000.save`, `…_char0001.save`, and the same kind of name) | `post_member_file` in `crates/glue5-runtime/src/cloud.rs` |
+| Stats the game data does not define, including money when it lives in those stats | `cloud/extra-stats.txt` | `stats::save` in `crates/glue5-runtime/src/stats.rs` |
+| This install's online player id | `online-id` | `gamer_id` in `crates/glue5-runtime/src/online.rs` |
+| Benchmarks | `Documents/Rockstar Games/GTA V/Benchmarks/` | The engine. Not part of Google Drive sync |
+| Renderer cache | `cache/` | The GPU. Not synced |
+| Scratch files | `fsroot/` | The vfs. Not synced |
+| Last start failure | `last-failure.txt` | `app.rs`. Not synced |
+
+On iOS and iPadOS the user directory is
+`<sandbox>/Library/Application Support/glue5/`.
+Diagnostics that you can copy out of the Files app are not in that folder:
+`<sandbox>/Documents/Glue5 Diagnostics/` (`diagnostics.log`, `engine.log`).
+On macOS, while the app is not sandboxed, the user directory is
+`~/Library/Application Support/glue5/`, and diagnostics sit in
+`Glue5 Diagnostics` inside it.
+
+## Google Drive
+
+On iPhone, iPad and Mac the Game tab has **Google Drive** (off until you turn
+it on). It copies the save rows in the table above, plus `glue5.json`, into
+that Google account's hidden Drive app data (`drive.appdata`). The files do
+not appear in the Drive file list. Sync runs at launch, when a save or
+`glue5.json` is written, and when the app backgrounds. A newer file wins; the
+older one is kept next to it as `name.glue5-conflict-<seconds>-local.bak` or
+`-remote.bak`. Each device keeps its own game folder and its own OAuth client
+ids and the desktop client secret (those fields are cleared in the cloud copy). While a session is running,
+local saves upload and a newer cloud copy waits until the next launch, so an
+open file is not replaced under the engine.
+
+Sign-in is OAuth 2.0 for a native app, with PKCE. iPhone and iPad use
+`ASWebAuthenticationSession` and the built-in **iOS** client
+(`566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu.apps.googleusercontent.com`).
+The redirect is
+`com.googleusercontent.apps.566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu:/oauth2redirect`,
+which is the URL scheme in `platform/ios/project.yml`. Mac opens the browser
+and listens on `http://127.0.0.1` with the built-in **Desktop** client
+(`566965852987-md6g70j3j5qep867r642mg5u05furtfe.apps.googleusercontent.com`).
+Leave the ID field empty to keep that client. A value in the field, or
+`GLUE5_GOOGLE_CLIENT_ID`, replaces it. The refresh token is stored in the
+Keychain (`com.lennertwilhelm.gta5offline` / `google-drive`), not in
+`glue5.json`. **Sign out** deletes that Keychain item and leaves the Drive
+copies in place.
+
+A Desktop client has a client secret. Google's token endpoint does not use
+one for iOS, and the published exchange sample omits it, but a Desktop client
+is not in that exemption. The Mac **Secret** field (or
+`GLUE5_GOOGLE_CLIENT_SECRET`) is sent on the token and refresh requests when
+it is set. It is not built into the app, and it is not uploaded. iPhone and
+iPad never send it.
+
+If the toggle is off, you are signed out, or Drive cannot be reached, the
+files stay on the device and the toggle's note says so. `GLUE5_GOOGLE_DRIVE=0`
+forces that. Nothing here uses iCloud, CloudKit, or an iCloud entitlement, so
+a free Apple developer account can still sign the app.
+
+Create the OAuth clients once, in [Google Cloud Console](https://console.cloud.google.com/):
+
+1. Create or pick a project. **APIs & Services → Library**, enable **Google Drive API**.
+2. **APIs & Services → OAuth consent screen**. User type **External** (or
+   **Internal** if this is a Workspace org). App name `Glue 5`. Add the scope
+   `https://www.googleapis.com/auth/drive.appdata`. Add your Google account
+   as a **test user** while the app is in Testing. Testing-mode refresh
+   tokens expire after 7 days; **Publish app** on the consent screen (no
+   Google review is required for this non-sensitive scope) so a personal
+   token keeps working.
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID**.
+   The app already has one iOS client and one Desktop client. Replace them
+   only if you create new ones: put the iOS client id in the iPhone/iPad
+   **ID** field (or `GLUE5_GOOGLE_CLIENT_ID`) and change
+   `CFBundleURLSchemes` in `platform/ios/project.yml` to
+   `com.googleusercontent.apps.<prefix>`, then rebuild. Put a new Desktop
+   client id in the Mac **ID** field. Desktop clients accept
+   `http://127.0.0.1` on any port. Copy the Desktop client's secret into the
+   Mac **Secret** field or `GLUE5_GOOGLE_CLIENT_SECRET`. Do not put that
+   secret in the iOS app.
+4. On each device: Game tab → **Google Drive** on → **Sign in**, with the
+   same Google account. On Mac, fill **Secret** first if Google answers
+   `client_secret is missing`. The first launch after that copies the newer
+   save across. An ad-hoc build can sign in; the token still has to land in
+   the Keychain, which needs a real signature (a free team is enough).
+
+The iOS and desktop client ids are different. Each device reads its own field
+(`google_client_id_ios` or `google_client_id_desktop`). Syncing settings does
+not replace the other device's client id.
 
 [wasm2c]: https://github.com/WebAssembly/wabt/tree/main/wasm2c
 [xcodegen]: https://github.com/yonaskolb/XcodeGen

@@ -38,3 +38,7 @@ pub const HOOKS: &[&[(&str, &str)]] = &[
     include!("hooks/upscale.rs"),
     include!("hooks/boot_screen.rs"),
 ];
+
+/// Hooks whose symbol may be absent. See `resolve_optional_hooks`: a miss
+/// does not fail the build. Each one is `void(i64)`.
+pub const OPTIONAL_HOOKS: &[&[(&str, &str)]] = &[include!("hooks/movies.rs")];

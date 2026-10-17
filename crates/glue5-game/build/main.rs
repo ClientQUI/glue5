@@ -109,7 +109,8 @@ fn run() -> Result<()> {
 
     // 3. Hooks and glue.
     let module = module::parse(&wasm)?;
-    let hooks = codegen::resolve_hooks(&module, &HOOKS.concat())?;
+    let mut hooks = codegen::resolve_hooks(&module, &HOOKS.concat())?;
+    hooks.extend(codegen::resolve_optional_hooks(&module, &OPTIONAL_HOOKS.concat())?);
     let mut sources: Vec<PathBuf> = (0..OUTPUTS).map(|i| gen_dir.join(format!("game_{i}.c"))).collect();
     let mut texts: Vec<Option<String>> = vec![None; sources.len()];
     apply_hooks(&hooks, &sources, &mut texts)?;
@@ -243,7 +244,7 @@ fn find_wasm(game_dir: &Path) -> Result<(String, PathBuf)> {
 /// file's text (`texts`, written as `game_N.hooked.c`, which replaces the
 /// original in the build).
 fn apply_hooks(hooks: &[codegen::Hook], sources: &[PathBuf], texts: &mut [Option<String>]) -> Result<()> {
-    let mut pending: Vec<&codegen::Hook> = hooks.iter().collect();
+    let mut pending: Vec<&codegen::Hook> = hooks.iter().filter(|hook| hook.present).collect();
     for (source, patched) in sources.iter().zip(texts.iter_mut()) {
         if pending.is_empty() {
             break;

@@ -169,6 +169,10 @@ pub struct Stats {
 pub struct Gpu {
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
+    /// Same queue the submitter records on. Dummy textures and vertex streams
+    /// are cleared through it when they are created, on this thread, before
+    /// the draw that samples them is submitted.
+    pub queue: wgpu::Queue,
     pub caps: Caps,
     pub limits: wgpu::Limits,
     pub library: Arc<Library>,

@@ -79,6 +79,7 @@ impl Dummies {
     fn texture(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         dim: TextureViewDimension,
         sample: Sample,
         ms: bool,
@@ -99,6 +100,12 @@ impl Dummies {
                     TextureViewDimension::D3 => wgpu::TextureDimension::D3,
                     _ => wgpu::TextureDimension::D2,
                 };
+                // Unbound samples used to be uninitialized. On Apple that is
+                // garbage, often white, and a shader that divides by alpha
+                // turns alpha 0 into NaNs. Door geometry (the Liquor Ace meth
+                // kitchen's fragments) multiplies that by the hinge matrix, so
+                // the garbage sweeps the room as the door opens. Opaque black
+                // stays black. A depth stand-in is cleared to the far plane.
                 let tex = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("dummy"),
                     size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: layers },
@@ -107,10 +114,27 @@ impl Dummies {
                     dimension,
                     format,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | if ms { wgpu::TextureUsages::RENDER_ATTACHMENT } else { wgpu::TextureUsages::empty() },
+                        | if ms { wgpu::TextureUsages::RENDER_ATTACHMENT } else { wgpu::TextureUsages::COPY_DST },
                     view_formats: &[],
                 });
-                tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(dim), ..Default::default() })
+                let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(dim), ..Default::default() });
+                if ms {
+                    clear_dummy_target(device, queue, &view, sample);
+                } else {
+                    let texel = dummy_texels(sample, layers);
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &texel,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) },
+                        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: layers },
+                    );
+                }
+                view
             })
             .clone()
     }
@@ -127,32 +151,93 @@ impl Dummies {
     }
 
     /// One per binding: a writable storage buffer bound twice is an aliasing error.
-    fn buffer(&mut self, device: &wgpu::Device, binding: u32) -> wgpu::Buffer {
+    fn buffer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, binding: u32) -> wgpu::Buffer {
         self.buffers
             .entry(binding)
             .or_insert_with(|| {
-                device.create_buffer(&wgpu::BufferDescriptor {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("dummy"),
                     size: 65536,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
-                })
+                });
+                // Not on the stack: this runs on the command thread.
+                static ZEROS: [u8; 65536] = [0; 65536];
+                queue.write_buffer(&buffer, 0, &ZEROS);
+                buffer
             })
             .clone()
     }
 
-    fn vertices(&mut self, device: &wgpu::Device) -> wgpu::Buffer {
+    fn vertices(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Buffer {
         self.vertices
             .get_or_insert_with(|| {
-                device.create_buffer(&wgpu::BufferDescriptor {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("zero vertices"),
                     size: ZERO_VB,
-                    usage: wgpu::BufferUsages::VERTEX,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
-                })
+                });
+                // A missing vertex stream used to be uninitialized. Transformed
+                // by a door bone, those positions become streaks the length of
+                // the room. Zeros stay on the hinge.
+                queue.write_buffer(&buffer, 0, &[0; ZERO_VB as usize]);
+                buffer
             })
             .clone()
     }
+}
+
+/// One texel per layer, rows padded to the copy alignment. Float is opaque
+/// black. Depth is 1 (far). Integer formats are zero.
+fn dummy_texels(sample: Sample, layers: u32) -> Vec<u8> {
+    let row = 256usize;
+    let mut data = vec![0u8; row * layers.max(1) as usize];
+    match sample {
+        Sample::Float => {
+            for layer in 0..layers.max(1) as usize {
+                data[layer * row + 3] = 255;
+            }
+        }
+        Sample::Depth => {
+            let far = 1.0f32.to_le_bytes();
+            for layer in 0..layers.max(1) as usize {
+                data[layer * row..layer * row + 4].copy_from_slice(&far);
+            }
+        }
+        Sample::Uint | Sample::Sint => {}
+    }
+    data
+}
+
+fn clear_dummy_target(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView, sample: Sample) {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dummy clear") });
+    if sample == Sample::Depth {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+    } else {
+        let color = if sample == Sample::Float {
+            wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+        } else {
+            wgpu::Color::TRANSPARENT
+        };
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(color), store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+    }
+    queue.submit([encoder.finish()]);
 }
 
 /// What a bind group entry is built from.
@@ -560,7 +645,9 @@ impl Gpu {
                     let target = self.objs.srv(id).is_some_and(|v| self.is_target(v, *dim));
                     match if target { None } else { self.srv_view(id, *dim, *sample) } {
                         Some(v) => Res::View(v),
-                        None => Res::View(self.dummies.texture(&self.device, *dim, *sample, *multisampled)),
+                        None => {
+                            Res::View(self.dummies.texture(&self.device, &self.queue, *dim, *sample, *multisampled))
+                        }
                     }
                 }
                 Kind::Storage { .. } => {
@@ -597,7 +684,7 @@ impl Gpu {
                                 }
                             }
                         }
-                        _ => Res::Buffer(self.dummies.buffer(&self.device, b.binding), 0, None),
+                        _ => Res::Buffer(self.dummies.buffer(&self.device, &self.queue, b.binding), 0, None),
                     }
                 }
                 Kind::StorageTexture { dim, .. } => {
@@ -1107,7 +1194,11 @@ impl Gpu {
             Some(&[constant, clamp, slope]) => [constant, if self.caps.depth_bias_clamp { clamp } else { 0 }, slope],
             _ => [0; 3],
         };
-        let zero = if vbs.iter().any(|v| v.1.is_none()) { Some(self.dummies.vertices(&self.device)) } else { None };
+        let zero = if vbs.iter().any(|v| v.1.is_none()) {
+            Some(self.dummies.vertices(&self.device, &self.queue))
+        } else {
+            None
+        };
         let bound = &mut self.bound;
         let pass = self.pass.as_mut().unwrap();
 
@@ -1390,4 +1481,32 @@ fn pack_constants(
     }
     cache.entries.push((uniforms.frame, current, jitter_key, alloc));
     alloc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dummy_texels;
+    use crate::shader::Sample;
+
+    #[test]
+    fn a_missing_color_sample_is_opaque_black() {
+        let texels = dummy_texels(Sample::Float, 6);
+        assert_eq!(texels.len(), 256 * 6);
+        assert_eq!(&texels[..4], &[0, 0, 0, 255]);
+        assert_eq!(&texels[256..260], &[0, 0, 0, 255], "each cube face is cleared");
+        assert!(texels[4..256].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn a_missing_depth_sample_is_the_far_plane() {
+        let texels = dummy_texels(Sample::Depth, 1);
+        let depth = f32::from_le_bytes(texels[..4].try_into().unwrap());
+        assert_eq!(depth, 1.0);
+    }
+
+    #[test]
+    fn a_missing_integer_sample_is_zero() {
+        assert!(dummy_texels(Sample::Uint, 1).iter().all(|b| *b == 0));
+        assert!(dummy_texels(Sample::Sint, 1).iter().all(|b| *b == 0));
+    }
 }

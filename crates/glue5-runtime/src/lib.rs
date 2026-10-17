@@ -25,6 +25,8 @@ mod imports;
 mod jobs;
 pub mod input;
 pub mod memory;
+mod movies;
+pub use movies::caption as movie_caption;
 mod online;
 mod overlay;
 mod p2p;
@@ -381,6 +383,9 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
         hooks.stats_update = Some(cloud::stats_update);
         cloud::story_market_hooks(&mut hooks);
     }
+    // Story and online both play Bink clips. The picture stays unavailable;
+    // the script clock advances when those natives are in this game.wasm.
+    movies::hooks(&mut hooks);
     glue5_game::install(glue5_game::imports_from!(imports), hooks);
     let engine = threads::spawn_main()?;
     Ok(Game { engine })

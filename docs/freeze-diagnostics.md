@@ -81,9 +81,13 @@ The initial local fix rejected `CMovieMgr::PreloadMovie` before queueing a
 pending request; the user confirmed the stairs freeze was resolved. The
 ClientQUI/upstream sync supersedes this hook: `keepThreads` includes bit 4,
 so AsyncBink answers requests immediately with failure (there is no Bink or
-video data). Both approaches keep unsupported TV/video clips unavailable;
-ordinary real-time cutscenes and Scaleform UI are unaffected. The two fixes
-must not be installed together. Retest the mission with the merged build.
+video data). The picture stays the engine's "not found" frame. There is no
+Bink 2 decoder here, and the web mirror does not ship the `.bik` bytes.
+Script natives that read movie time are hosted when they are in game.wasm:
+`GET_BINK_MOVIE_TIME` advances as a percentage of the clip (the LifeInvader
+keynote, `lester1b_1`, is 178 seconds) and a caption shows that percentage.
+Ordinary real-time cutscenes and Scaleform UI are unaffected. The two movie
+fixes must not be installed together. Retest the mission with the merged build.
 The last run also reached roughly 5.4 GiB process
 footprint with 0.7 GiB available; that memory pressure has not been attributed
 to a termination or fixed by this movie guard.

@@ -474,6 +474,7 @@ fn init(ring: GpuRing, settings: Settings, screen: Option<Screen>) -> Result<exe
             output,
             recycler.finished.clone(),
         ),
+        queue,
         uniforms: uniforms::Uniforms::new(limits.min_uniform_buffer_offset_alignment),
         uploads,
         adapter,

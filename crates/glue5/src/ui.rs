@@ -421,7 +421,15 @@ impl Ui {
         if !hud {
             self.perf.hide();
         }
-        if self.page.is_none() && touch.is_none() && gear.is_none() && (!hud || !self.perf.due(settings.overlay_detail))
+        // A script movie with no picture still has to show its clock. The
+        // overlay is off for most of play, so the caption is its own reason
+        // to draw.
+        let movie = glue5_runtime::movie_caption();
+        if self.page.is_none()
+            && touch.is_none()
+            && gear.is_none()
+            && movie.is_none()
+            && (!hud || !self.perf.due(settings.overlay_detail))
         {
             if self.drawn && !hud {
                 self.overlay.submit(Vec::new(), Default::default(), 1.0);
@@ -463,6 +471,9 @@ impl Ui {
         self.gear = gear.map(|alpha| draw_gear(&ctx, safe, settings.touch_size, alpha));
         if hud {
             self.perf.draw(&ctx, safe, settings, status);
+        }
+        if let Some(text) = movie.as_deref() {
+            draw_movie_caption(&ctx, safe, text);
         }
         if self.page.is_some() && status.started.is_none() {
             theme::backdrop(&ctx, self.background.as_ref());
@@ -570,6 +581,20 @@ pub fn safe_rect(window: &Window) -> Rect {
         }
         _ => Rect::from_min_size(Pos2::ZERO, screen_size(window)),
     }
+}
+
+/// Bottom of the game: which Bink clip is playing, and how far the script
+/// clock has got. The picture itself stays the engine's "not found" frame.
+fn draw_movie_caption(ctx: &egui::Context, safe: Rect, text: &str) {
+    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("movie caption")));
+    let mut job = egui::text::LayoutJob::default();
+    job.append(text, 0.0, egui::TextFormat::simple(FontId::proportional(16.0), Color32::WHITE));
+    let galley = painter.layout_job(job);
+    let pad = vec2(14.0, 8.0);
+    let size = galley.size() + pad * 2.0;
+    let rect = Rect::from_center_size(pos2(safe.center().x, safe.max.y - 28.0 - size.y * 0.5), size);
+    painter.rect_filled(rect, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
+    painter.galley(rect.min + pad, galley, Color32::WHITE);
 }
 
 /// The settings button: the touch controls' look, at their size.

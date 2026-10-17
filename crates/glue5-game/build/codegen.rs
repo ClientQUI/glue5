@@ -13,6 +13,10 @@ pub struct Hook {
     pub field: String,
     pub symbol: String,
     pub sig: Sig,
+    /// False for an optional hook whose symbol is missing or has a different
+    /// signature. The Rust field still exists, so the host compiles either
+    /// way; the generated C never calls it.
+    pub present: bool,
 }
 
 pub fn resolve_hooks(module: &Module, list: &[(&str, &str)]) -> Result<Vec<Hook>> {
@@ -24,9 +28,46 @@ pub fn resolve_hooks(module: &Module, list: &[(&str, &str)]) -> Result<Vec<Hook>
                 .get(name)
                 .with_context(|| format!("hook `{field}`: no function named `{name}` in game.wasm"))?;
             ensure!(sig.crosses_boundary_ok(), "hook `{field}`: v128 parameters are not supported");
-            Ok(Hook { field: field.into(), symbol: game_symbol(name), sig: sig.clone() })
+            Ok(Hook { field: field.into(), symbol: game_symbol(name), sig: sig.clone(), present: true })
         })
         .collect()
+}
+
+/// Optional hooks are `void(i64)`, the script wrapper `Call(rage::scrThread::Info&)`.
+/// A missing name, or a different signature, becomes an inert field instead of
+/// failing the build: a guessed native must not stop a game.wasm we have not
+/// opened here.
+pub fn resolve_optional_hooks(module: &Module, list: &[(&str, &str)]) -> Result<Vec<Hook>> {
+    let script_call = Sig { params: vec![Ty::I64], result: None };
+    list.iter()
+        .map(|&(field, name)| {
+            ensure!(is_ident(field), "hook field `{field}` is not an identifier");
+            match module.functions.get(name) {
+                Some(sig) if sig == &script_call => {
+                    Ok(Hook { field: field.into(), symbol: game_symbol(name), sig: sig.clone(), present: true })
+                }
+                Some(sig) => {
+                    println!("cargo:warning=optional hook `{field}` has signature {sig:?}, not void(i64); left unused");
+                    Ok(absent(field))
+                }
+                None => {
+                    println!(
+                        "cargo:warning=optional hook `{field}`: no function named `{name}` in game.wasm; left unused"
+                    );
+                    Ok(absent(field))
+                }
+            }
+        })
+        .collect()
+}
+
+fn absent(field: &str) -> Hook {
+    Hook {
+        field: field.into(),
+        symbol: String::new(),
+        sig: Sig { params: vec![Ty::I64], result: None },
+        present: false,
+    }
 }
 
 /// Imports implemented in C here rather than by the host.
@@ -156,6 +197,20 @@ pub fn glue_c(module: &Module, hooks: &[Hook]) -> Result<String> {
     }
     c += "} glue5_hooks;\n\nglue5_hooks glue5_hooks_table;\n";
     for hook in hooks {
+        if !hook.present {
+            // The host still takes the field's address. The symbol is not in
+            // this module, so the original is a stub and nothing calls the hook.
+            let params = c_named_params(&hook.sig.params, 0);
+            let unused: String = (0..hook.sig.params.len()).map(|i| format!("\n  (void)p{i};")).collect();
+            let ret = if hook.sig.result.is_some() { "\n  return 0;" } else { "" };
+            let _ = writeln!(
+                c,
+                "\n{} glue5_orig_{}(struct w2c_env* env{params}) {{\n  (void)env;{unused}{ret}\n}}",
+                c_ret(&hook.sig),
+                hook.field
+            );
+            continue;
+        }
         let (sym, sig, field) = (&hook.symbol, &hook.sig, &hook.field);
         let params = c_named_params(&sig.params, 0);
         let a = args(sig.params.len(), 0);

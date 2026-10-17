@@ -15,6 +15,7 @@
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use glue5_game::{Env, orig};
 
@@ -78,8 +79,8 @@ pub(crate) fn start(online: &crate::Online, hooks: &mut glue5_game::Hooks) {
     crate::stats::hooks(hooks);
     // The stand-ins' methods, host functions the game calls through their
     // vtables (`glue5_game::host_function`): QueryInterface, a method doing
-    // nothing (0: S_OK, false, none), the profile manager's IsSignedIn and
-    // GetSignInInfo.
+    // nothing (0: S_OK, false, none), the profile manager's IsSignedIn,
+    // GetSignInInfo, and IsOnline (yes only while `story_market` is set).
     stand_in_functions();
     if let Err(e) = crate::p2p::start(&online.lobby, crate::vnet::deliver) {
         log::error!("p2p: {e}");
@@ -90,6 +91,17 @@ const QUERY_INTERFACE: u32 = 0;
 const NOTHING: u32 = 1;
 const SIGNED_IN: u32 = 2;
 const SIGN_IN_INFO: u32 = 3;
+const PROFILE_ONLINE: u32 = 4;
+
+/// Story mode asks the profile manager whether the player is online. That
+/// is `NETWORK_IS_SIGNED_ONLINE`, which BAWSAQ requires before it will show
+/// a price. Online mode leaves the answer no, so Social Club's own paths
+/// stay off there. `rlPc::IsInitialized` is still no in both.
+static STORY_MARKET: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn story_market() -> bool {
+    STORY_MARKET.load(Ordering::Relaxed)
+}
 
 // Host functions: called with the thread's instance first, not its `Env`
 // (see `glue5_game::set_host_functions`); the wasm memory is the runtime's.
@@ -108,6 +120,12 @@ unsafe extern "C" fn nothing(_: *mut c_void) -> u64 {
 
 unsafe extern "C" fn signed_in(_: *mut c_void) -> u64 {
     1
+}
+
+/// Profile-manager IsOnline. Story's BAWSAQ page treats "no" as the market
+/// being down and never reads a price. Online stays no (see `STORY_MARKET`).
+unsafe extern "C" fn profile_online(_: *mut c_void) -> u64 {
+    u64::from(story_market())
 }
 
 /// GetSignInInfo(IProfile*): { vtable*, s64 id, char nickname[17] }.
@@ -132,8 +150,11 @@ unsafe fn install(env: *mut Env) {
         m.set_u64(object, vtable);
         object
     };
-    // IsSignedIn: yes; IsOnline: no (Social Club's own online paths stay off).
-    let profile_manager = object(&[QUERY_INTERFACE, SIGNED_IN, NOTHING, SIGN_IN_INFO]);
+    // IsSignedIn: yes. IsOnline: yes in story, so BAWSAQ will price; no in
+    // online, so Social Club's own online paths stay off. The slot is the
+    // method the script's `NETWORK_IS_SIGNED_ONLINE` reads.
+    let is_online = if story_market() { PROFILE_ONLINE } else { NOTHING };
+    let profile_manager = object(&[QUERY_INTERFACE, SIGNED_IN, is_online, SIGN_IN_INFO]);
     let other = object(&[QUERY_INTERFACE]);
     for offset in INTERFACES.step_by(8) {
         m.set_u64(RL_PC + offset, if offset == PROFILE_MANAGER { profile_manager } else { other });
@@ -167,23 +188,26 @@ pub(crate) unsafe extern "C" fn story_live_manager_init(env: *mut Env, mode: u32
     unsafe { orig::live_manager_init(env, mode) };
 }
 
-/// The four stand-in methods. `host_function` addresses them from a base
+/// The stand-in methods. `host_function` addresses them from a base
 /// registered here. Without that call every vtable slot is 0, and
-/// `CLiveManager::Init` jumps to address 0.
+/// `CLiveManager::Init` jumps to address 0. The fifth is IsOnline, and
+/// only story's market answers yes.
 fn stand_in_functions() {
-    static FNS: OnceLock<[usize; 4]> = OnceLock::new();
+    static FNS: OnceLock<[usize; 5]> = OnceLock::new();
     glue5_game::set_host_functions(FNS.get_or_init(|| {
         [
             query_interface as *const () as usize,
             nothing as *const () as usize,
             signed_in as *const () as usize,
             sign_in_info as *const () as usize,
+            profile_online as *const () as usize,
         ]
     }));
 }
 
-/// Signs the story player in so stock trades see the cash stat. Online
-/// installs this itself, with the rest of its hooks.
+/// Signs the story player in so stock trades see the cash stat, and so
+/// BAWSAQ will ask for a price. Online installs this itself, with the rest
+/// of its hooks.
 ///
 /// `CLiveManager::Init` calls `rlPresence::RefreshSigninState`, which calls
 /// `rage::internal::GetGamerHandle`. That original function calls through
@@ -192,7 +216,16 @@ fn stand_in_functions() {
 /// too. `IsInitialized` stays no, so saves and the control settings keep
 /// the path that does not talk to Social Club. The cash HUD does not use
 /// this: it is `CStatsDataMgr::Update` writing the stored balance.
+///
+/// BAWSAQ is the other half. The phone shows an error, and the controller
+/// never copies a price, unless `NETWORK_IS_SIGNED_ONLINE` and
+/// `NETWORK_HAS_VALID_ROS_CREDENTIALS` are both true. Those read this
+/// profile manager's IsOnline and `rlRosCredentials::IsValid`. Story answers
+/// yes. It still does not start a session or mark Social Club initialized.
+/// The price itself is a local quote (`stats`), not Rockstar's service.
+/// LCN does not use either check: its prices are the script's own walk.
 pub(crate) fn story_sign_in(hooks: &mut glue5_game::Hooks) {
+    STORY_MARKET.store(true, Ordering::Relaxed);
     stand_in_functions();
     hooks.rl_gamer_handle = Some(gamer_handle);
     hooks.rl_offline_name = Some(offline_name);

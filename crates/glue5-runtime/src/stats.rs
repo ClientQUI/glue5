@@ -10,7 +10,8 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use glue5_game::{Env, orig};
 
@@ -293,9 +294,27 @@ unsafe fn cash_get(env: *mut Env, hash: u32, out: u64, player: u32) -> u32 {
 }
 
 pub(crate) unsafe extern "C" fn get_float(env: *mut Env, hash: u32, out: u64, player: u32) -> u32 {
+    if crate::online::story_market() && is_bawsaq_price(hash) {
+        return unsafe { bawsaq_get_float(env, hash, out, player) };
+    }
     with_stat(hash, || {
         engine_or(|| unsafe { orig::stat_get_float(env, hash, out, player) }, || write(env, out, get(&hash_key(hash))))
     })
+}
+
+/// `STAT_GET_FLOAT` of a BAWSAQ price. The script copies this into the
+/// stock's price only while it believes Rockstar's service answered. A 0
+/// from the engine is that service missing, not a real quote: the local
+/// price stands. A positive value (a stat the game did set) is kept.
+unsafe fn bawsaq_get_float(env: *mut Env, hash: u32, out: u64, player: u32) -> u32 {
+    let local = hosted_price(hash);
+    let result = with_stat(hash, || engine_or(|| unsafe { orig::stat_get_float(env, hash, out, player) }, || 0));
+    let engine = if result != 0 { f32::from_bits(unsafe { Mem::of(env) }.u32(out)) } else { 0.0 };
+    let value = bawsaq_choose(engine, local);
+    if engine > 0.0 {
+        set(hash_key(hash), i64::from(engine.to_bits()));
+    }
+    write(env, out, i64::from(value.to_bits()))
 }
 
 pub(crate) unsafe extern "C" fn get_bool(env: *mut Env, hash: u32, out: u64, player: u32) -> u32 {
@@ -627,6 +646,277 @@ pub(crate) unsafe extern "C" fn delete_slot(env: *mut Env, slot: u32) {
     });
 }
 
+/// BAWSAQ price stats, in the order `stock_controller` writes into
+/// `Global_59488`. Slot 32 is `SM_PRICE_MOL`, which is Betta Pharmaceuticals
+/// (BET, stock 43): Lester's missions multiply that price in the script.
+/// LCN does not read these. Share counts (`MOL_OW0` and the rest) are not
+/// in this list and are not cash.
+const BAWSAQ_PRICES: &[u32] = &[
+    joaat(b"SM_PRICE_AMU"),
+    joaat(b"SM_PRICE_BDG"),
+    joaat(b"SM_PRICE_BFA"),
+    joaat(b"SM_PRICE_BIN"),
+    joaat(b"SM_PRICE_BTR"),
+    joaat(b"SM_PRICE_BLE"),
+    joaat(b"SM_PRICE_BRU"),
+    joaat(b"SM_PRICE_CNT"),
+    joaat(b"SM_PRICE_CRE"),
+    joaat(b"SM_PRICE_DGP"),
+    joaat(b"SM_PRICE_WAP"),
+    joaat(b"SM_PRICE_FAC"),
+    joaat(b"SM_PRICE_FRT"),
+    joaat(b"SM_PRICE_LSC"),
+    joaat(b"SM_PRICE_LST"),
+    joaat(b"SM_PRICE_LTD"),
+    joaat(b"SM_PRICE_MAI"),
+    joaat(b"SM_PRICE_PKW"),
+    joaat(b"SM_PRICE_PIS"),
+    joaat(b"SM_PRICE_PON"),
+    joaat(b"SM_PRICE_RON"),
+    joaat(b"SM_PRICE_SHT"),
+    joaat(b"SM_PRICE_SPU"),
+    joaat(b"SM_PRICE_TNK"),
+    joaat(b"SM_PRICE_WIW"),
+    joaat(b"SM_PRICE_UMA"),
+    joaat(b"SM_PRICE_VAP"),
+    joaat(b"SM_PRICE_VOM"),
+    joaat(b"SM_PRICE_WZL"),
+    joaat(b"SM_PRICE_WIZ"),
+    joaat(b"SM_PRICE_ZIT"),
+    joaat(b"SM_PRICE_SHK"),
+    joaat(b"SM_PRICE_MOL"),
+    joaat(b"SM_PRICE_PMP"),
+    joaat(b"SM_PRICE_GOT"),
+    joaat(b"SM_PRICE_EYE"),
+    joaat(b"SM_PRICE_HVY"),
+    joaat(b"SM_PRICE_SHR"),
+    joaat(b"SM_PRICE_HAL"),
+];
+
+fn is_bawsaq_price(hash: u32) -> bool {
+    BAWSAQ_PRICES.contains(&hash)
+}
+
+/// A positive engine quote wins. Zero is the offline service, so the local
+/// price is what the phone trades at. The script multiplies that price by
+/// the mission factor itself (BET after Lester); this does not.
+fn bawsaq_choose(engine: f32, local: f32) -> f32 {
+    if engine > 0.0 { engine } else { local }
+}
+
+/// Deterministic opening price, 15.00 to 289.99, the band LCN starts in.
+fn bawsaq_seed(hash: u32) -> f32 {
+    let n = hash.wrapping_mul(0x9E37_79B1);
+    let cents = (n % 27_500) + 1_500;
+    (cents as f32) / 100.0
+}
+
+/// One step of the local walk, kept inside the band the script clamps to.
+fn bawsaq_step_price(hash: u32, price: f32, step: u32) -> f32 {
+    let n = hash.wrapping_mul(0x85EB_CA6B).wrapping_add(step.wrapping_mul(0xC2B2_AE35));
+    let factor = 0.97 + ((n % 601) as f32) / 10_000.0;
+    let next = (price * factor).clamp(3.5, 290.0);
+    (next * 100.0).floor() / 100.0
+}
+
+fn hosted_price(hash: u32) -> f32 {
+    tick_bawsaq();
+    with_store(|s| {
+        let key = hash_key(hash);
+        if let Some(&bits) = s.values.get(&key) {
+            let price = f32::from_bits(bits as u32);
+            if price > 0.0 && price.is_finite() {
+                return price;
+            }
+        }
+        let price = bawsaq_seed(hash);
+        s.values.insert(key, i64::from(price.to_bits()));
+        s.dirty = true;
+        price
+    })
+}
+
+/// Moves every saved BAWSAQ price at most once per two minutes, which is
+/// how often the phone asks the service. The first call only starts the
+/// clock, so a launch does not jump the quote before it has been shown.
+fn tick_bawsaq() {
+    static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut next = NEXT.lock().unwrap_or_else(|err| err.into_inner());
+    let now = Instant::now();
+    if next.is_none() {
+        *next = Some(now + Duration::from_secs(120));
+        return;
+    }
+    if now < next.unwrap() {
+        return;
+    }
+    *next = Some(now + Duration::from_secs(120));
+    drop(next);
+    with_store(|s| {
+        let step = s.values.get("bawsaq_step").copied().unwrap_or(0).wrapping_add(1);
+        let mut any = false;
+        for &hash in BAWSAQ_PRICES {
+            let key = hash_key(hash);
+            let Some(&bits) = s.values.get(&key) else { continue };
+            let price = f32::from_bits(bits as u32);
+            if !(price > 0.0 && price.is_finite()) {
+                continue;
+            }
+            let stepped = bawsaq_step_price(hash, price, step as u32);
+            s.values.insert(key, i64::from(stepped.to_bits()));
+            any = true;
+        }
+        if any {
+            s.values.insert("bawsaq_step".into(), step);
+            s.dirty = true;
+        }
+    });
+}
+
+/// `Global_56607`, 80 stocks, 36 ints each. `f_8` is the BAWSAQ flag.
+const STOCK_GLOBAL: u64 = 56_607;
+const STOCK_COUNT: u64 = 80;
+const STOCK_STRIDE: u64 = 36 * 4;
+const FIELD_EXCHANGE: u64 = 8 * 4;
+const FIELD_PRICE: u64 = 9 * 4;
+const FIELD_CHART: u64 = 14 * 4;
+const FIELD_HIGH: u64 = 31 * 4;
+const FIELD_LOW: u64 = 32 * 4;
+const FIELD_SLOT: u64 = 35 * 4;
+/// Set while the phone thinks BAWSAQ failed to download.
+const BAWSAQ_DOWN: u64 = 64_293;
+
+static STOCK_BASE: AtomicU64 = AtomicU64::new(0);
+static STOCK_FRAME: AtomicU32 = AtomicU32::new(0);
+static STOCK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn read_u32_at(mem: &[u8], at: usize) -> Option<u32> {
+    let bytes = mem.get(at..at + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// The live stock table: the names are 144 bytes apart, BET is index 43,
+/// and the exchange flag matches the script (LCN is 0, BAWSAQ is 1).
+fn find_stock_table(mem: &[u8]) -> Option<u64> {
+    let bet = b"BSS_BSTR_85\0";
+    let next = b"BSS_BSTR_87\0";
+    let first = b"BSS_BSTR_0\0";
+    let ticker = b"BSS_BSTR_86\0";
+    let bet_at = 43 * STOCK_STRIDE as usize;
+    let mut i = 0;
+    while i + bet.len() <= mem.len() {
+        if mem[i..].starts_with(bet) {
+            let Some(base) = i.checked_sub(bet_at) else {
+                i += 4;
+                continue;
+            };
+            let next_at = base + 44 * STOCK_STRIDE as usize;
+            let tick_at = base + bet_at + 16;
+            let names_ok = mem.get(base..base + first.len()) == Some(first.as_slice())
+                && mem.get(next_at..next_at + next.len()) == Some(next.as_slice())
+                && mem.get(tick_at..tick_at + ticker.len()) == Some(ticker.as_slice());
+            let bawsaq = read_u32_at(mem, base + bet_at + FIELD_EXCHANGE as usize) == Some(1);
+            let lcn = read_u32_at(mem, base + 2 * STOCK_STRIDE as usize + FIELD_EXCHANGE as usize) == Some(0);
+            if names_ok && bawsaq && lcn {
+                return Some(base as u64);
+            }
+        }
+        i += 4;
+    }
+    None
+}
+
+fn stock_table() -> Option<u64> {
+    let known = STOCK_BASE.load(Ordering::Relaxed);
+    if known != 0 {
+        return Some(known);
+    }
+    let frame = STOCK_FRAME.fetch_add(1, Ordering::Relaxed);
+    // A full heap walk is not a per-frame cost. These updates cover the
+    // stock script starting after the first frames.
+    const AT: [u32; 7] = [0, 120, 300, 600, 1_200, 2_400, 4_800];
+    if !AT.contains(&frame) {
+        return None;
+    }
+    let mem = crate::rt().memory.mem();
+    let size = crate::rt().memory.size();
+    let found = find_stock_table(mem.bytes(0, size as usize));
+    if let Some(base) = found {
+        STOCK_BASE.store(base, Ordering::Relaxed);
+        if !STOCK_LOGGED.swap(true, Ordering::Relaxed) {
+            log::info!("bawsaq: story stock table at {base:#x}; prices are local");
+        }
+    } else if frame == 4_800 {
+        log::warn!("bawsaq: the story stock table was not found; prices stay with the script");
+    }
+    found
+}
+
+fn put_f32(mem: Mem, addr: u64, value: f32) {
+    let bits = value.to_bits();
+    if mem.u32(addr) != bits {
+        mem.set_u32(addr, bits);
+    }
+}
+
+/// Writes the local BAWSAQ quote into the script stock the phone reads.
+/// LCN (`f_8 == 0`) is left alone: its price is the script's own walk and
+/// is already stored in the story save. Holdings (which stock, shares,
+/// dollars paid) are that same save, on iOS and macOS, and Drive syncs it.
+///
+/// The phone shows and trades `price * mission multiplier`. The multiplier
+/// (BET after an assassination) lives in the script, so this only has to
+/// keep a positive base price. The "BAWSAQ is down" flag is cleared with
+/// it: a failed download sets the flag and nothing in the script clears it
+/// again when the download never happened.
+pub(crate) unsafe fn publish_bawsaq(env: *mut Env) {
+    if !crate::online::story_market() {
+        return;
+    }
+    let Some(base) = stock_table() else {
+        return;
+    };
+    let mem = unsafe { Mem::of(env) };
+    let size = crate::rt().memory.size();
+    let table_end = base + STOCK_COUNT * STOCK_STRIDE;
+    if table_end > size {
+        return;
+    }
+    for i in 0..STOCK_COUNT {
+        let stock = base + i * STOCK_STRIDE;
+        if mem.u32(stock + FIELD_EXCHANGE) == 0 {
+            continue;
+        }
+        let slot = mem.u32(stock + FIELD_SLOT) as usize;
+        let Some(&hash) = BAWSAQ_PRICES.get(slot) else { continue };
+        let price = hosted_price(hash);
+        put_f32(mem, stock + FIELD_PRICE, price);
+        for n in 0..16u64 {
+            let at = stock + FIELD_CHART + n * 4;
+            if mem.u32(at) == 0 {
+                put_f32(mem, at, price);
+            }
+        }
+        let high = f32::from_bits(mem.u32(stock + FIELD_HIGH));
+        if !(high > 0.0) || high < price {
+            put_f32(mem, stock + FIELD_HIGH, price);
+        }
+        let low = f32::from_bits(mem.u32(stock + FIELD_LOW));
+        if !(low > 0.0) || low > price {
+            put_f32(mem, stock + FIELD_LOW, price);
+        }
+    }
+    if let Some(globals) = base.checked_sub(STOCK_GLOBAL * 4) {
+        let flag = globals + BAWSAQ_DOWN * 4;
+        // Only a 0/1 flag. A different script layout must not have some
+        // other global cleared just because this index moved.
+        if flag + 4 <= size && mem.u32(flag) == 1 {
+            mem.set_u32(flag, 0);
+        }
+    }
+    save();
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -747,6 +1037,65 @@ mod tests {
         // Franklin, the character that run loaded.
         assert_eq!(super::joaat(b"SP1_TOTAL_CASH"), 0x44bd_6982);
         assert!(!super::is_cash_hash(super::joaat(b"AMU_OW1")));
+    }
+
+    #[test]
+    fn bawsaq_bet_has_a_local_price_and_shares_stay_shares() {
+        // BET's community price is SM_PRICE_MOL (slot 32), not a cash stat
+        // and not the share mirror. LCN never reads this list.
+        let bet = super::joaat(b"SM_PRICE_MOL");
+        assert_eq!(super::BAWSAQ_PRICES.len(), 39);
+        assert_eq!(super::BAWSAQ_PRICES[32], bet);
+        assert!(super::is_bawsaq_price(bet));
+        assert!(super::is_bawsaq_price(super::joaat(b"SM_PRICE_AMU")));
+        assert!(!super::is_bawsaq_price(super::joaat(b"MOL_OW0")));
+        assert!(!super::is_bawsaq_price(super::joaat(b"MOL_OW2")));
+        assert!(!super::is_cash_hash(bet));
+        assert!(!super::is_bawsaq_price(super::joaat(b"SP1_TOTAL_CASH")));
+        let seed = super::bawsaq_seed(bet);
+        assert!((15.0..=290.0).contains(&seed));
+        assert_eq!(super::bawsaq_seed(bet), seed);
+        let mut price = seed;
+        for step in 1..8 {
+            price = super::bawsaq_step_price(bet, price, step);
+            assert!((3.5..=290.0).contains(&price), "{price}");
+        }
+        // A quote the engine already stored wins. Zero is the missing service.
+        assert_eq!(super::bawsaq_choose(80.0, seed), 80.0);
+        assert_eq!(super::bawsaq_choose(0.0, seed), seed);
+        assert_eq!(super::bawsaq_choose(-1.0, seed), seed);
+        // extra-stats.txt keeps the float bits. Drive syncs that file.
+        let key = super::hash_key(bet);
+        let text = format!("{key} {}\nbawsaq_step 3\n", i64::from(seed.to_bits()));
+        let (values, pins) = super::parse_store(&text);
+        assert!(pins.is_empty());
+        assert_eq!(f32::from_bits(values[&key] as u32), seed);
+        assert_eq!(values["bawsaq_step"], 3);
+    }
+
+    #[test]
+    fn the_stock_table_scanner_finds_bet_and_ignores_a_string_table() {
+        let stride = super::STOCK_STRIDE as usize;
+        let mut table = vec![0u8; stride * super::STOCK_COUNT as usize];
+        let put = |table: &mut [u8], at: usize, text: &[u8]| {
+            table[at..at + text.len()].copy_from_slice(text);
+        };
+        put(&mut table, 0, b"BSS_BSTR_0\0");
+        put(&mut table, 43 * stride, b"BSS_BSTR_85\0");
+        put(&mut table, 43 * stride + 16, b"BSS_BSTR_86\0");
+        put(&mut table, 44 * stride, b"BSS_BSTR_87\0");
+        // Stock 2 is LCN. Stock 43 (BET) is BAWSAQ.
+        table[2 * stride + 32..2 * stride + 36].copy_from_slice(&0u32.to_le_bytes());
+        table[43 * stride + 32..43 * stride + 36].copy_from_slice(&1u32.to_le_bytes());
+        let mut hay = vec![0u8; 64];
+        hay.extend_from_slice(&table);
+        assert_eq!(super::find_stock_table(&hay), Some(64));
+        // The script's own string literals sit next to each other, not one
+        // stock apart, and they have no exchange flag.
+        let packed = b"BSS_BSTR_0\0BSS_BSTR_85\0BSS_BSTR_86\0BSS_BSTR_87\0";
+        assert_eq!(super::find_stock_table(packed), None);
+        table[43 * stride + 32..43 * stride + 36].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(super::find_stock_table(&table), None);
     }
 }
 

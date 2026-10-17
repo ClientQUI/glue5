@@ -376,8 +376,10 @@ pub fn start(config: Config, gpu: gpu::GpuBackend) -> Result<Game> {
         online::story_sign_in(&mut hooks);
         // The cash HUD reads the stat in `CStatsDataMgr`, not `StatGetInt`.
         // This update writes the stored balance into that stat, and it is
-        // what finishes a suspend's stats save.
+        // what finishes a suspend's stats save. The same update publishes
+        // the local BAWSAQ prices.
         hooks.stats_update = Some(cloud::stats_update);
+        cloud::story_market_hooks(&mut hooks);
     }
     glue5_game::install(glue5_game::imports_from!(imports), hooks);
     let engine = threads::spawn_main()?;

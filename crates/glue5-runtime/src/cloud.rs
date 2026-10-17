@@ -109,6 +109,9 @@ pub(crate) unsafe extern "C" fn stats_update(env: *mut Env) {
     // The corner HUD reads these ints. A script `StatGetInt` is a different
     // call, and editing extra-stats.txt does not change the ints.
     unsafe { crate::stats::apply_stored_cash(env) };
+    // Local BAWSAQ quotes, into the script table the phone trades from.
+    // LCN is not touched. A changed quote is written to extra-stats.txt.
+    unsafe { crate::stats::publish_bawsaq(env) };
     if pending > done {
         // Cash lives in extra-stats.txt as well as the engine's member file.
         // The member file can load back as 0; this file is what Drive syncs.
@@ -160,10 +163,12 @@ pub(crate) unsafe extern "C" fn mpstats_save_update(env: *mut Env, op: u64) -> u
 }
 
 /// Hook for `rage::rlRosCredentials::IsValid() const`: valid in the stats'
-/// saves and loads, which go to the disk; elsewhere the engine would talk
-/// to Rockstar's services with them.
+/// saves and loads, which go to the disk. Story mode also answers yes.
+/// BAWSAQ will not price or trade unless it does. Social Club stays
+/// uninitialized, and a member-file read or write is the disk copy, so this
+/// does not open a session or talk to Rockstar.
 pub(crate) unsafe extern "C" fn ros_credentials_valid(env: *mut Env, credentials: u64) -> u32 {
-    if IN_STATS_OPERATION.get() {
+    if IN_STATS_OPERATION.get() || crate::online::story_market() {
         return 1;
     }
     unsafe { orig::ros_credentials_valid(env, credentials) }
@@ -341,6 +346,17 @@ pub(crate) fn hooks(hooks: &mut glue5_game::Hooks) {
     hooks.profile_stats_synced = Some(profile_stats_synced);
     hooks.mpstats_load_update = Some(mpstats_load_update);
     hooks.mpstats_save_update = Some(mpstats_save_update);
+    hooks.ros_credentials_valid = Some(ros_credentials_valid);
+    hooks.post_member_file = Some(post_member_file);
+    hooks.get_member_file = Some(get_member_file);
+}
+
+/// Story BAWSAQ. The phone and the stock script both refuse the market
+/// unless Rockstar's credentials check passes, then they download the
+/// price file. The check passes, and the download is the disk copy (missing
+/// until the local quote fills the stat). The online character pipeline
+/// (stats init, queue, save, load) stays out of story.
+pub(crate) fn story_market_hooks(hooks: &mut glue5_game::Hooks) {
     hooks.ros_credentials_valid = Some(ros_credentials_valid);
     hooks.post_member_file = Some(post_member_file);
     hooks.get_member_file = Some(get_member_file);

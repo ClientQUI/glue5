@@ -80,15 +80,7 @@ pub(crate) fn start(online: &crate::Online, hooks: &mut glue5_game::Hooks) {
     // vtables (`glue5_game::host_function`): QueryInterface, a method doing
     // nothing (0: S_OK, false, none), the profile manager's IsSignedIn and
     // GetSignInInfo.
-    static FNS: OnceLock<[usize; 4]> = OnceLock::new();
-    glue5_game::set_host_functions(FNS.get_or_init(|| {
-        [
-            query_interface as *const () as usize,
-            nothing as *const () as usize,
-            signed_in as *const () as usize,
-            sign_in_info as *const () as usize,
-        ]
-    }));
+    stand_in_functions();
     if let Err(e) = crate::p2p::start(&online.lobby, crate::vnet::deliver) {
         log::error!("p2p: {e}");
     }
@@ -175,9 +167,36 @@ pub(crate) unsafe extern "C" fn story_live_manager_init(env: *mut Env, mode: u32
     unsafe { orig::live_manager_init(env, mode) };
 }
 
+/// The four stand-in methods. `host_function` addresses them from a base
+/// registered here. Without that call every vtable slot is 0, and
+/// `CLiveManager::Init` jumps to address 0.
+fn stand_in_functions() {
+    static FNS: OnceLock<[usize; 4]> = OnceLock::new();
+    glue5_game::set_host_functions(FNS.get_or_init(|| {
+        [
+            query_interface as *const () as usize,
+            nothing as *const () as usize,
+            signed_in as *const () as usize,
+            sign_in_info as *const () as usize,
+        ]
+    }));
+}
+
 /// Signs the story player in so stock trades see the cash stat. Online
 /// installs this itself, with the rest of its hooks.
+///
+/// `CLiveManager::Init` calls `rlPresence::RefreshSigninState`, which calls
+/// `rage::internal::GetGamerHandle`. That original function calls through
+/// Social Club. Story has none, so the call lands at address 0 (`6e5fce8`,
+/// about 38 s in, engine main). Online replaces the function; story does
+/// too. `IsInitialized` stays no, so saves and the control settings keep
+/// the path that does not talk to Social Club. The cash HUD does not use
+/// this: it is `CStatsDataMgr::Update` writing the stored balance.
 pub(crate) fn story_sign_in(hooks: &mut glue5_game::Hooks) {
+    stand_in_functions();
+    hooks.rl_gamer_handle = Some(gamer_handle);
+    hooks.rl_offline_name = Some(offline_name);
+    hooks.rl_pc_initialized = Some(rl_pc_initialized);
     hooks.live_manager_init = Some(story_live_manager_init);
 }
 

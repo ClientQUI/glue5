@@ -15,6 +15,8 @@ settings:
     TARGETED_DEVICE_FAMILY: "1,2"
     ARCHS: arm64
     DEAD_CODE_STRIPPING: YES
+    # Set GLUE5_TEAM when signing. A free Apple developer account is enough:
+    # saves sync through Google Drive, not an iCloud entitlement.
     DEVELOPMENT_TEAM: ${GLUE5_TEAM}
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_ENTITLEMENTS: Glue5.entitlements
@@ -49,6 +51,8 @@ targets:
       - sdk: MetalFX.framework
       - sdk: OpenGLES.framework
       - sdk: QuartzCore.framework
+      - sdk: AuthenticationServices.framework
+      - sdk: Security.framework
       - sdk: UIKit.framework
     info:
       path: Info.plist
@@ -74,5 +78,12 @@ targets:
         GCSupportsControllerUserInteraction: true
         # GTA Online: players on the same network find each other there.
         NSLocalNetworkUsageDescription: Glue 5 finds GTA Online players on your network.
+        # Google sign-in on iPhone and iPad. The scheme is the reversed iOS
+        # client id. The redirect is that scheme plus :/oauth2redirect.
+        # A custom URL scheme does not need a paid Apple developer account.
+        CFBundleURLTypes:
+          - CFBundleURLName: glue5.google
+            CFBundleURLSchemes:
+              - com.googleusercontent.apps.566965852987-ep0g7185pbbhn83idg5mk5ikjij8q3fu
         GCSupportedGameControllers:
           - ProfileName: ExtendedGamepad

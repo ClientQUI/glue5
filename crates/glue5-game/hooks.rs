@@ -17,12 +17,14 @@ pub const HOOKS: &[&[(&str, &str)]] = &[
     include!("hooks/exit.rs"),
     include!("hooks/gamelog.rs"),
     include!("hooks/memory.rs"),
+    include!("hooks/files.rs"),
     include!("hooks/skin.rs"),
     include!("hooks/shader_settings.rs"),
     include!("hooks/shadow_reveal.rs"),
     include!("hooks/device_reset.rs"),
     include!("hooks/readback.rs"),
     include!("hooks/audio_update.rs"),
+    include!("hooks/granular.rs"),
     include!("hooks/script_assets.rs"),
     include!("hooks/gamer_tags.rs"),
     include!("hooks/scenario.rs"),
@@ -30,6 +32,13 @@ pub const HOOKS: &[&[(&str, &str)]] = &[
     include!("hooks/online.rs"),
     include!("hooks/vnet.rs"),
     include!("hooks/cloud.rs"),
+    include!("hooks/jobs.rs"),
+    include!("hooks/texts.rs"),
     include!("hooks/stats.rs"),
     include!("hooks/upscale.rs"),
+    include!("hooks/boot_screen.rs"),
 ];
+
+/// Hooks whose symbol may be absent. See `resolve_optional_hooks`: a miss
+/// does not fail the build. Each one is `void(i64)`.
+pub const OPTIONAL_HOOKS: &[&[(&str, &str)]] = &[include!("hooks/movies.rs")];

@@ -51,13 +51,57 @@ pub struct Settings {
     /// macOS and iOS 26): twice the frames shown, half a frame more of
     /// latency.
     pub frame_generation: bool,
-    /// Apple's driver-level performance overlay.
-    pub metal_hud: bool,
+    /// The performance overlay over the game, and how the application's
+    /// own shows.
+    pub overlay: PerfOverlay,
+    pub overlay_detail: OverlayDetail,
+    pub overlay_corner: Corner,
+    /// Distance fog over the world. Near surfaces are never tinted.
+    pub fog: bool,
+    /// Where fog is fully mixed, in metres. 0 uses the view distance.
+    pub fog_distance: f32,
+    /// Placed LOD stand-ins and trees stop at this distance. 0 disables the cutoff.
+    pub view_distance: f32,
+    /// Decals, debris and bushes stop at this distance. 0 disables that culling.
+    pub detail_distance: f32,
+    /// Tree and bush cards stop at this distance. 0 keeps the cards.
+    pub tree_distance: f32,
+    /// Shadow casters stop at this distance. 0 disables that culling.
+    pub shadow_distance: f32,
+    /// Extra render scale while the device is cool. 1 keeps the chosen scale.
+    pub render_boost: f32,
+    /// Where threads sit. Hybrid is the recommended one: performance cores
+    /// while loading or hitching, efficiency cores once play is steady.
+    /// Audio stays immediate in every choice. `GLUE5_EFFICIENCY` forces one.
+    pub efficiency: Efficiency,
     pub touch: TouchMode,
     pub touch_opacity: f32,
     pub touch_size: f32,
+    /// How fast a finger's drag turns the camera.
+    pub touch_camera: f32,
+    /// The aim assist while playing by touch (the game's Targeting Mode,
+    /// in place of its menu's).
+    pub touch_aim: TouchAim,
     /// The Taptic Engine taps under pressed touch controls and plays the game's rumble (iPhone).
     pub haptics: bool,
+    /// Copy saves and these settings through Google Drive on iPhone, iPad and
+    /// Mac. The game folder stays on this device. Off, signed out, or offline
+    /// leaves the files local.
+    #[serde(default)]
+    pub google_drive: bool,
+    /// iOS OAuth client id (`….apps.googleusercontent.com`). Not a secret.
+    /// Empty uses the built-in iOS client, unless `GLUE5_GOOGLE_CLIENT_ID` is set.
+    #[serde(default)]
+    pub google_client_id_ios: String,
+    /// Desktop OAuth client id, for the Mac. Not a secret. Empty uses the
+    /// built-in desktop client, unless `GLUE5_GOOGLE_CLIENT_ID` is set.
+    #[serde(default)]
+    pub google_client_id_desktop: String,
+    /// Desktop OAuth client secret. Google issues one for a Desktop client.
+    /// Empty omits it. Not uploaded with the other settings. iOS does not use it.
+    /// `GLUE5_GOOGLE_CLIENT_SECRET` wins.
+    #[serde(default)]
+    pub google_client_secret: String,
     /// The game starts in the sandbox (the map, no story) rather than the
     /// story: the start page's last choice.
     pub sandbox: bool,
@@ -76,6 +120,59 @@ pub struct Settings {
     /// on or off.
     #[serde(skip_serializing)]
     metalfx: Option<bool>,
+    /// Settings saved before the choice of overlays: Apple's HUD on or off.
+    #[serde(skip_serializing)]
+    metal_hud: Option<bool>,
+    /// Settings saved before the single Efficiency choice.
+    #[serde(skip_serializing)]
+    efficiency_cores: Option<bool>,
+    #[serde(skip_serializing)]
+    efficiency_mode: Option<bool>,
+}
+
+/// Where the engine's threads sit. Hybrid is the one to leave on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Efficiency {
+    Off,
+    /// Performance cores for loads and hitches, efficiency cores in steady play.
+    Hybrid,
+    /// Frame threads stay at utility. About 20 frames per second.
+    #[serde(rename = "full-e", alias = "full")]
+    FullE,
+}
+
+/// The performance overlay over the game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PerfOverlay {
+    Off,
+    /// Apple's, drawn by Metal (shown from the launch it is on at).
+    MetalHud,
+    /// The application's (ui/perf.rs), on every platform.
+    Glue5,
+}
+
+/// How much the application's overlay shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OverlayDetail {
+    /// One line: frame rate, frame time, GPU time.
+    Minimal,
+    /// The frame times as a graph, and where they go.
+    Standard,
+    /// The busiest threads, the renderer's counts, resolution and memory too.
+    Full,
+}
+
+/// A corner of the safe area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 /// How the game's frames are scaled up to the window.
@@ -112,6 +209,34 @@ pub enum TouchMode {
     Auto,
     Always,
     Off,
+}
+
+/// The aim assist while playing by touch: one of the game's targeting modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TouchAim {
+    /// Aiming locks on to the nearest target and follows it (Assisted Aim -
+    /// Full).
+    LockOn,
+    /// Aiming snaps to the target, then the finger aims (Assisted Aim -
+    /// Partial).
+    Snap,
+    /// The camera slows down over targets (Free Aim - Assisted).
+    SlowDown,
+    /// Free Aim.
+    Off,
+}
+
+impl TouchAim {
+    pub fn targeting(self) -> glue5_runtime::input::Targeting {
+        use glue5_runtime::input::Targeting;
+        match self {
+            TouchAim::LockOn => Targeting::Full,
+            TouchAim::Snap => Targeting::Partial,
+            TouchAim::SlowDown => Targeting::FreeAssisted,
+            TouchAim::Off => Targeting::Free,
+        }
+    }
 }
 
 /// Phones and tablets with less RAM start with the low-memory profile (the
@@ -219,6 +344,61 @@ fn finite_unit(value: f32) -> f32 {
     if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 }
 }
 
+/// Built-in distances, in metres. The same numbers as the renderer's defaults.
+pub fn default_view_distance() -> f32 {
+    if MOBILE { 260.0 } else { 420.0 }
+}
+pub fn default_detail_distance() -> f32 {
+    if MOBILE { 50.0 } else { 80.0 }
+}
+pub fn default_tree_distance() -> f32 {
+    if MOBILE { 130.0 } else { 200.0 }
+}
+pub fn default_shadow_distance() -> f32 {
+    if MOBILE { 120.0 } else { 250.0 }
+}
+
+/// `0` disables the cutoff. A value on the built-in default stays `None`,
+/// so heat can still shorten it. Anything else is used as written.
+fn distance_override(value: f32, builtin: f32) -> Option<f32> {
+    if !value.is_finite() || value <= 0.0 {
+        Some(0.0)
+    } else if (value - builtin).abs() < 0.5 {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// The environment's efficiency choice, when one of the variables sets it.
+pub fn efficiency_forced() -> Option<Efficiency> {
+    glue5_runtime::qos::forced_mode().map(|mode| match mode {
+        glue5_runtime::sched::Mode::Off => Efficiency::Off,
+        glue5_runtime::sched::Mode::Hybrid => Efficiency::Hybrid,
+        glue5_runtime::sched::Mode::FullE => Efficiency::FullE,
+    })
+}
+
+fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    glue5_runtime::qos::lower(glue5_runtime::qos::Qos::Utility, || durable_write_at(path, bytes))
+}
+
+fn durable_write_at(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 /// Heights, not fixed 16:9 widths: phone aspect ratios are preserved.
 pub const SCALE_PAIRS: &[(u32, Option<u32>, &str)] = &[
     (360, Some(720), "360p → 720p"),
@@ -254,11 +434,27 @@ impl Default for Settings {
             upscaler: Upscaling::MetalFx,
             sharpness: 0.5,
             frame_generation: false,
-            metal_hud: false,
+            overlay: PerfOverlay::Off,
+            overlay_detail: OverlayDetail::Standard,
+            overlay_corner: Corner::TopLeft,
+            fog: true,
+            fog_distance: 0.0,
+            view_distance: default_view_distance(),
+            detail_distance: default_detail_distance(),
+            tree_distance: default_tree_distance(),
+            shadow_distance: default_shadow_distance(),
+            render_boost: 1.0,
+            efficiency: Efficiency::Hybrid,
             touch: TouchMode::Auto,
             touch_opacity: 0.6,
             touch_size: 1.0,
+            touch_camera: 1.0,
+            touch_aim: TouchAim::LockOn,
             haptics: true,
+            google_drive: false,
+            google_client_id_ios: String::new(),
+            google_client_id_desktop: String::new(),
+            google_client_secret: String::new(),
             sandbox: false,
             online: false,
             online_name: String::new(),
@@ -266,6 +462,9 @@ impl Default for Settings {
             online_lobby: String::new(),
             render_height: None,
             metalfx: None,
+            metal_hud: None,
+            efficiency_cores: None,
+            efficiency_mode: None,
         }
     }
 }
@@ -297,6 +496,25 @@ pub fn lobby_key(code: &str) -> String {
     code.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()).collect()
 }
 
+/// `GLUE5_GOOGLE_DRIVE=0` or `1` overrides the toggle. `None` means the toggle wins.
+pub fn drive_forced() -> Option<bool> {
+    match std::env::var("GLUE5_GOOGLE_DRIVE").ok().as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("0" | "off" | "false") => Some(false),
+        Some("1" | "on" | "true") => Some(true),
+        _ => None,
+    }
+}
+
+/// `GLUE5_GOOGLE_CLIENT_ID`, when it is set and not blank.
+pub fn google_client_id_from_env() -> Option<String> {
+    std::env::var("GLUE5_GOOGLE_CLIENT_ID").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
+/// `GLUE5_GOOGLE_CLIENT_SECRET`, when it is set and not blank.
+pub fn google_client_secret_from_env() -> Option<String> {
+    std::env::var("GLUE5_GOOGLE_CLIENT_SECRET").ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
 fn random() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     std::collections::hash_map::RandomState::new().build_hasher().finish()
@@ -324,13 +542,125 @@ impl Settings {
         if settings.metalfx.take() == Some(false) {
             settings.upscaler = Upscaling::Bicubic;
         }
+        if settings.metal_hud.take() == Some(true) {
+            settings.overlay = PerfOverlay::MetalHud;
+        }
+        let full = settings.efficiency_mode.take();
+        let cores = settings.efficiency_cores.take();
+        if full == Some(true) {
+            settings.efficiency = Efficiency::FullE;
+        } else if cores == Some(false) {
+            settings.efficiency = Efficiency::Off;
+        }
         settings
     }
 
     pub fn save(&self, user_dir: &Path) {
-        let json = serde_json::to_vec_pretty(self).expect("settings serialise");
-        if let Err(e) = std::fs::write(Self::file(user_dir), json) {
+        Self::save_snapshot(user_dir, &self.snapshot());
+    }
+
+    /// Whether saves should be copied through Google Drive. Never off Apple:
+    /// the sign-in window is the Mac browser or the iOS authentication session.
+    pub fn drive_enabled(&self) -> bool {
+        if !cfg!(target_vendor = "apple") {
+            return false;
+        }
+        drive_forced().unwrap_or(self.google_drive)
+    }
+
+    /// The OAuth client id for this device. The environment variable wins,
+    /// then a non-empty saved field, then the built-in client for this platform.
+    pub fn google_client_id(&self) -> String {
+        if let Some(id) = google_client_id_from_env() {
+            return id;
+        }
+        let saved = if cfg!(target_os = "ios") {
+            self.google_client_id_ios.trim()
+        } else {
+            self.google_client_id_desktop.trim()
+        };
+        if saved.is_empty() { glue5_runtime::drive::default_client_id().to_owned() } else { saved.to_owned() }
+    }
+
+    /// The desktop client secret, if one was set. iOS always returns empty.
+    /// The environment variable wins. This is not copied to another device.
+    pub fn google_client_secret(&self) -> String {
+        if cfg!(target_os = "ios") {
+            return String::new();
+        }
+        if let Some(secret) = google_client_secret_from_env() {
+            return secret;
+        }
+        self.google_client_secret.trim().to_owned()
+    }
+
+    /// JSON for the lifecycle watch, which cannot borrow `Settings`.
+    pub fn snapshot(&self) -> Vec<u8> {
+        serde_json::to_vec_pretty(self).unwrap_or_default()
+    }
+
+    /// Writes and flushes settings. Used when the app backgrounds, where a
+    /// later `save` would not run.
+    pub fn save_snapshot(user_dir: &Path, json: &[u8]) {
+        if json.is_empty() {
+            return;
+        }
+        if let Err(e) = durable_write(&Self::file(user_dir), json) {
             log::warn!("cannot save settings: {e}");
+        }
+        glue5_runtime::drive::on_settings_saved(user_dir, json);
+    }
+
+    /// The distance, fog, resolution and thermal options the graphics menu owns.
+    pub fn reset_distance_options(&mut self, window_height: u32) {
+        let fresh = Settings::default();
+        self.fog = fresh.fog;
+        self.fog_distance = fresh.fog_distance;
+        self.view_distance = fresh.view_distance;
+        self.detail_distance = fresh.detail_distance;
+        self.tree_distance = fresh.tree_distance;
+        self.shadow_distance = fresh.shadow_distance;
+        self.render_boost = fresh.render_boost;
+        self.thermal_protection = fresh.thermal_protection;
+        self.efficiency = fresh.efficiency;
+        self.adaptive_graphics = fresh.adaptive_graphics;
+        let lines = if MOBILE { 720.0 } else { 1080.0 };
+        self.render_scale = Some(round_scale(lines / window_height.max(1) as f32));
+        self.render_lines = None;
+        self.scaling_custom = false;
+    }
+
+    /// The efficiency choice the process should use, after the environment.
+    pub fn efficiency_now(&self) -> Efficiency {
+        efficiency_forced().unwrap_or(self.efficiency)
+    }
+
+    pub fn runtime_mode(&self) -> glue5_runtime::sched::Mode {
+        match self.efficiency_now() {
+            Efficiency::Off => glue5_runtime::sched::Mode::Off,
+            Efficiency::Hybrid => glue5_runtime::sched::Mode::Hybrid,
+            Efficiency::FullE => glue5_runtime::sched::Mode::FullE,
+        }
+    }
+
+    /// Policy for the renderer. Built-in distances still shorten while the
+    /// device is hot; a number chosen in the menu is used as written. 0
+    /// turns that cutoff off.
+    pub fn distance_policy(&self) -> glue5_gpu::Policy {
+        let mode = std::env::var("GLUE5_DISTANT_DETAIL").ok();
+        let kill = mode.as_deref() == Some("0");
+        let boost = if self.render_boost.is_finite() && self.render_boost >= 1.0 { self.render_boost } else { 1.0 };
+        glue5_gpu::Policy {
+            enabled: !kill,
+            mobile: MOBILE,
+            aggressive: mode.as_deref() == Some("2"),
+            shadow_override: distance_override(self.shadow_distance, default_shadow_distance()),
+            detail_override: distance_override(self.detail_distance, default_detail_distance()),
+            tree_override: distance_override(self.tree_distance, default_tree_distance()),
+            view_override: distance_override(self.view_distance, default_view_distance()),
+            fog: self.fog && !kill,
+            fog_override: (self.fog_distance.is_finite() && self.fog_distance > 0.0).then_some(self.fog_distance),
+            render_boost: boost,
         }
     }
 
@@ -393,7 +723,7 @@ impl Settings {
         self.max_fps = if profile == 2 { 60 } else { 30 };
         self.thermal_protection = true;
         self.verbose_logs = false;
-        self.metal_hud = false;
+        self.overlay = PerfOverlay::Off;
         self.set_scaling_preset(match profile {
             0 => 1,
             2 => 4,
@@ -452,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn upscaler_from_older_settings() {
+    fn upscaler_and_overlay_from_older_settings() {
         let dir = std::env::temp_dir().join(format!("glue5-settings-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("glue5.json"), r#"{"metalfx": false}"#).unwrap();
@@ -461,12 +791,27 @@ mod tests {
         assert_eq!(Settings::load(&dir).upscaler, Upscaling::MetalFx);
         std::fs::write(dir.join("glue5.json"), r#"{"upscaler": "metalfx-temporal"}"#).unwrap();
         assert_eq!(Settings::load(&dir).upscaler, Upscaling::MetalFxTemporal);
+        std::fs::write(dir.join("glue5.json"), r#"{"metal_hud": true}"#).unwrap();
+        assert_eq!(Settings::load(&dir).overlay, PerfOverlay::MetalHud);
+        std::fs::write(dir.join("glue5.json"), r#"{"metal_hud": false}"#).unwrap();
+        assert_eq!(Settings::load(&dir).overlay, PerfOverlay::Off);
+        std::fs::write(dir.join("glue5.json"), r#"{"efficiency_mode": true}"#).unwrap();
+        assert_eq!(Settings::load(&dir).efficiency, Efficiency::FullE);
+        std::fs::write(dir.join("glue5.json"), r#"{"efficiency_cores": false}"#).unwrap();
+        assert_eq!(Settings::load(&dir).efficiency, Efficiency::Off);
+        std::fs::write(dir.join("glue5.json"), r#"{"efficiency_cores": true, "efficiency_mode": false}"#).unwrap();
+        assert_eq!(Settings::load(&dir).efficiency, Efficiency::Hybrid);
         std::fs::write(dir.join("glue5.json"), r#"{"metalfx":true,"resource_budget":"Compact","texture_detail":"Minimal","render_lines":480,"upscale_lines":720,"world_preset":"Eco","max_fps":30}"#).unwrap();
         let migrated = Settings::load(&dir);
         assert_eq!(migrated.upscaler, Upscaling::MetalFx);
         assert_eq!(migrated.resource_budget.mb(), 1280);
         assert_eq!(migrated.texture_detail.max_dimension(), 256);
         assert_eq!(migrated.world_preset, WorldPreset::Eco);
+        assert!(migrated.fog);
+        assert_eq!(migrated.efficiency, Efficiency::Hybrid);
+        assert_eq!(migrated.overlay, PerfOverlay::Off);
+        assert_eq!(migrated.render_boost, 1.0);
+        assert_eq!(migrated.distance_policy().render_boost, 1.0);
         assert_eq!(migrated.input_size((2868, 1320)), (1042, 480));
         assert_eq!(migrated.output_size((2868, 1320)), (1564, 720));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -528,6 +873,7 @@ mod tests {
         assert_eq!(s.texture_detail, TextureDetail::Original);
         assert_eq!(s.resource_budget, ResourceBudget::Auto);
         assert!(s.render_lines.is_none());
+        assert_eq!(s.efficiency, Efficiency::Hybrid);
         s.performance_profile(0);
         let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
         assert_eq!(restored.render_lines, Some(480));
@@ -556,5 +902,35 @@ mod tests {
         assert_eq!(values[0], ("LodScale", "1.000000".into()));
         assert_eq!(values[3], ("CityDensity", "0.000000".into()));
         assert!(values.iter().all(|(name, _)| !name.contains("Texture") && !name.contains("MSAA")));
+    }
+
+    #[test]
+    fn google_drive_follows_the_file_and_stays_off_without_apple() {
+        let dir = std::env::temp_dir().join(format!("glue5-drive-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("glue5.json"), r#"{"google_drive": false}"#).unwrap();
+        assert!(!Settings::load(&dir).google_drive);
+        std::fs::write(
+            dir.join("glue5.json"),
+            r#"{"google_drive": true, "google_client_id_desktop": "desktop.apps.googleusercontent.com"}"#,
+        )
+        .unwrap();
+        let on = Settings::load(&dir);
+        assert!(on.google_drive);
+        assert!(!Settings::default().google_drive);
+        if !cfg!(target_vendor = "apple") {
+            assert!(!on.drive_enabled());
+        }
+        if !cfg!(target_os = "ios") {
+            assert_eq!(on.google_client_id(), "desktop.apps.googleusercontent.com");
+        }
+        std::fs::write(dir.join("glue5.json"), r#"{"google_drive": true}"#).unwrap();
+        let builtin = Settings::load(&dir);
+        if google_client_id_from_env().is_none() {
+            assert_eq!(builtin.google_client_id(), glue5_runtime::drive::default_client_id());
+        }
+        assert!(builtin.google_client_secret().is_empty() || google_client_secret_from_env().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

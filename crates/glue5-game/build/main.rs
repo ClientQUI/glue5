@@ -109,7 +109,8 @@ fn run() -> Result<()> {
 
     // 3. Hooks and glue.
     let module = module::parse(&wasm)?;
-    let hooks = codegen::resolve_hooks(&module, &HOOKS.concat())?;
+    let mut hooks = codegen::resolve_hooks(&module, &HOOKS.concat())?;
+    hooks.extend(codegen::resolve_optional_hooks(&module, &OPTIONAL_HOOKS.concat())?);
     let mut sources: Vec<PathBuf> = (0..OUTPUTS).map(|i| gen_dir.join(format!("game_{i}.c"))).collect();
     let mut texts: Vec<Option<String>> = vec![None; sources.len()];
     apply_hooks(&hooks, &sources, &mut texts)?;
@@ -156,6 +157,12 @@ fn run() -> Result<()> {
         let cpu = env::var("GLUE5_IOS_CPU").unwrap_or_else(|_| "apple-a11".into());
         build.flag(format!("-mcpu={cpu}"));
     }
+    // Android likewise defaults to ARMv8.0, with atomics as calls that pick
+    // LSE at run time. Phones that can run the game have ARMv8.2 cores
+    // (Cortex-A55/A75 and later), none of them a Cortex-A53.
+    if env::var("TARGET")? == "aarch64-linux-android" {
+        build.flag("-march=armv8.2-a").flag("-mno-fix-cortex-a53-835769");
+    }
     if env::var("CARGO_CFG_TARGET_ARCH")? == "x86_64" {
         build.flag_if_supported("-msse4.1"); // SIMDe maps wasm SIMD much better with SSE4.1
     }
@@ -172,6 +179,14 @@ fn run() -> Result<()> {
             build.compiler("clang-cl");
         }
         build.flag("/std:c17").define("WIN32_LEAN_AND_MEAN", None).define("NOMINMAX", None);
+    }
+    // Linux: Clang too, as everywhere else (Apple's, the NDK's, clang-cl),
+    // rather than the system's cc, usually GCC. `CC` overrides it.
+    if env::var("CARGO_CFG_TARGET_OS")? == "linux" {
+        let target = env::var("TARGET")?;
+        if env::var_os("CC").is_none() && env::var_os(format!("CC_{}", target.replace('-', "_"))).is_none() {
+            build.compiler("clang");
+        }
     }
     // Three groups, each keyed by the headers it includes (sources are not
     // scanned for includes): the game, the glue, the wasm2c runtime.
@@ -229,7 +244,7 @@ fn find_wasm(game_dir: &Path) -> Result<(String, PathBuf)> {
 /// file's text (`texts`, written as `game_N.hooked.c`, which replaces the
 /// original in the build).
 fn apply_hooks(hooks: &[codegen::Hook], sources: &[PathBuf], texts: &mut [Option<String>]) -> Result<()> {
-    let mut pending: Vec<&codegen::Hook> = hooks.iter().collect();
+    let mut pending: Vec<&codegen::Hook> = hooks.iter().filter(|hook| hook.present).collect();
     for (source, patched) in sources.iter().zip(texts.iter_mut()) {
         if pending.is_empty() {
             break;

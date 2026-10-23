@@ -150,6 +150,11 @@ struct Shared {
     has_frame_generation: AtomicBool,
     /// Frames per second at most, shown evenly (0: as they come).
     frame_rate: AtomicU32,
+    /// The app is not visible. Presentation drops to [`BACKGROUND_FPS`] so
+    /// the engine, which waits on this queue, stops producing full frames.
+    background: AtomicBool,
+    /// Apple's thermal state, 0 when the platform has none.
+    thermal: AtomicU8,
     /// FSR's sharpening, 0 to 1 (f32 bits).
     sharpness: AtomicU32,
     /// A new surface for the window, to present into from the next frame.
@@ -169,6 +174,8 @@ impl Presentation {
             frame_generation: AtomicBool::new(false),
             has_frame_generation: AtomicBool::new(false),
             frame_rate: AtomicU32::new(0),
+            background: AtomicBool::new(false),
+            thermal: AtomicU8::new(0),
             sharpness: AtomicU32::new(0.5f32.to_bits()),
             surface: Mutex::new(None),
         }));
@@ -269,6 +276,25 @@ impl Presentation {
         self.0.frame_rate.store(fps, Ordering::Relaxed);
     }
 
+    /// The process is in the background (a phone locked or the app switched
+    /// away). Frames drop to a few a second until this is cleared.
+    pub fn set_background(&self, on: bool) {
+        self.0.background.store(on, Ordering::Relaxed);
+    }
+
+    /// Apple's thermal state, sampled by the app about once a second.
+    pub fn set_thermal(&self, state: u8) {
+        self.0.thermal.store(state.min(3), Ordering::Relaxed);
+    }
+
+    pub(crate) fn thermal(&self) -> u8 {
+        self.0.thermal.load(Ordering::Relaxed)
+    }
+
+    fn background(&self) -> bool {
+        self.0.background.load(Ordering::Relaxed)
+    }
+
     /// Records a smoothed frame interval for the application. A short
     /// moving average prevents one shader compile or drawable hiccup from
     /// immediately changing the resolution.
@@ -308,41 +334,43 @@ pub(crate) fn take_upscaling() -> Option<f64> {
     (frames > 0 && seconds > 0.0).then(|| seconds * 1000.0 / frames as f64)
 }
 
+/// Extra Metal command buffers around the upscaler, only while GPU profiling
+/// is on. They exist to time the pass; Metal charges for each one, so normal
+/// play does not submit them.
+fn profile_gpu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GLUE5_GPU_PROFILE").is_some())
+}
+
+/// While the app is in the background the engine is held to a few frames a
+/// second. `0` with the app visible still means "as fast as the present".
+pub(crate) const BACKGROUND_FPS: u32 = 4;
+
+pub(crate) fn paced_fps(requested: u32, background: bool) -> u32 {
+    if !background {
+        return requested;
+    }
+    if requested == 0 { BACKGROUND_FPS } else { requested.min(BACKGROUND_FPS) }
+}
+
 /// One frame's upscaling `commands` between two empty command buffers whose
 /// times measure them, added to the upscalers' (on Apple GPUs; elsewhere
 /// as they are).
 pub(crate) fn timed(device: &wgpu::Device, commands: Vec<wgpu::CommandBuffer>) -> Vec<wgpu::CommandBuffer> {
     #[cfg(target_vendor = "apple")]
     {
-        use block2::RcBlock;
-        use objc2_metal::MTLCommandBuffer;
         let ended = Arc::new(Mutex::new(None::<f64>));
-        // An empty command buffer calling `done` with itself once the GPU is past it.
-        let marker = |done: RcBlock<dyn Fn(std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>)>| {
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("timing") });
-            unsafe {
-                encoder.as_hal_mut::<Metal, _, _>(|e| {
-                    if let Some(commands) = e.and_then(|e| e.raw_command_buffer()) {
-                        commands.addCompletedHandler(RcBlock::as_ptr(&done));
-                    }
-                })
-            };
-            encoder.finish()
-        };
         let before = {
             let ended = ended.clone();
-            marker(RcBlock::new(move |c: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                *ended.lock().unwrap() = Some(unsafe { c.as_ref() }.GPUEndTime());
-            }))
+            crate::perf::marker(device, move |_, end| *ended.lock().unwrap() = Some(end))
         };
-        let after = marker(RcBlock::new(move |c: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-            let start = unsafe { c.as_ref() }.GPUStartTime();
+        let after = crate::perf::marker(device, move |start, _| {
             if let Some(end) = ended.lock().unwrap().take()
                 && start > end
             {
                 UPSCALING.lock().unwrap().0 += start - end;
             }
-        }));
+        });
         UPSCALING.lock().unwrap().1 += 1;
         let mut all = Vec::with_capacity(commands.len() + 2);
         all.push(before);
@@ -799,19 +827,26 @@ struct Offscreen {
 impl Output {
     /// Limit real engine submissions, not the generated intermediate images.
     /// Waiting before queue submission also keeps engine fences paced on iOS.
-    pub(crate) fn pace(&mut self) {
-        let fps = self.presentation.0.frame_rate.load(Ordering::Relaxed);
+    pub(crate) fn pace(&mut self) -> Duration {
+        let fps = paced_fps(self.presentation.0.frame_rate.load(Ordering::Relaxed), self.presentation.background());
         if fps == 0 {
             self.last_frame_start = None;
-            return;
+            return Duration::ZERO;
         }
         let budget = Duration::from_secs_f64(1.0 / fps as f64);
-        if let Some(last) = self.last_frame_start {
+        let slept = if let Some(last) = self.last_frame_start {
             if let Some(left) = budget.checked_sub(last.elapsed()) {
+                let started = Instant::now();
                 std::thread::sleep(left);
+                started.elapsed()
+            } else {
+                Duration::ZERO
             }
-        }
+        } else {
+            Duration::ZERO
+        };
         self.last_frame_start = Some(Instant::now());
+        slept
     }
 
     pub(crate) fn note_frame_interval(&self, interval: Duration) {
@@ -884,8 +919,9 @@ impl Output {
     }
 
     /// How long a frame may take: at the frame rate set, or 60 a second.
+    /// Background playback uses the same cap as [`Output::pace`].
     pub fn frame_budget(&self) -> Duration {
-        let fps = self.presentation.0.frame_rate.load(Ordering::Relaxed);
+        let fps = paced_fps(self.presentation.0.frame_rate.load(Ordering::Relaxed), self.presentation.background());
         Duration::from_secs_f64(1.0 / if fps > 0 { fps } else { 60 } as f64)
     }
 
@@ -1045,7 +1081,9 @@ impl Output {
             size = temporal_size((src.width, src.height), size);
         }
         let mut up = self.upscale_into(device, src, size)?;
-        up.commands = timed(device, std::mem::take(&mut up.commands));
+        if profile_gpu() {
+            up.commands = timed(device, std::mem::take(&mut up.commands));
+        }
         Some(up)
     }
 
@@ -1165,9 +1203,19 @@ impl Gpu {
             self.screenshot(id, &name);
         }
         self.flush_with("present", present, true);
+        let jobs = self.decodes.len() as u32;
+        let bytes = self.decodes.iter().map(|d| d.bytes).sum::<u64>();
+        glue5_runtime::qos::note_stream(bytes, jobs);
         let now = Instant::now();
         if let Some(last) = self.last_present.replace(now) {
-            self.stats.frame_ms.push((now - last).as_secs_f32() * 1000.0);
+            let ms = (now - last).as_secs_f32() * 1000.0;
+            self.stats.frame_ms.push(ms);
+            if crate::perf::on() {
+                let st = &self.stats;
+                if self.perf.frame(ms, st.draws, st.passes, st.busy, self.epoch) {
+                    crate::perf::gpu_bytes(self.gpu_bytes().into_iter().sum());
+                }
+            }
         }
         self.uniforms.next_frame();
         // The next frame: drawn jittered, its scene kept, while a temporal
@@ -1313,6 +1361,15 @@ mod tests {
         assert_eq!(super::temporal_size((1280, 720), (2560, 1440)), (2560, 1440));
         assert_eq!(super::temporal_size((640, 360), (2560, 1440)), (1920, 1080));
         assert_eq!(super::temporal_size((1280, 720), (1280, 720)), (1280, 720));
+    }
+
+    #[test]
+    fn background_holds_the_engine_to_a_few_frames() {
+        assert_eq!(super::paced_fps(0, false), 0);
+        assert_eq!(super::paced_fps(60, false), 60);
+        assert_eq!(super::paced_fps(0, true), super::BACKGROUND_FPS);
+        assert_eq!(super::paced_fps(30, true), super::BACKGROUND_FPS);
+        assert_eq!(super::paced_fps(2, true), 2);
     }
 
     #[test]

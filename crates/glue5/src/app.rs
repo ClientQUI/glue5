@@ -24,8 +24,8 @@ use sdl3::mouse::MouseButton;
 
 use crate::haptics;
 use crate::paths::{self, MOBILE};
-use crate::settings::{self, Settings, TouchMode, Upscaling};
-use crate::touch::Touch;
+use crate::settings::{self, PerfOverlay, Settings, TouchMode, Upscaling};
+use crate::touch::{self, Touch};
 use crate::ui::{self, Action, Mode, Page, Started, Status, Ui};
 use crate::{audio, benchmark, keymap, pads};
 
@@ -36,6 +36,11 @@ const GEAR_ALONE: f32 = 0.35;
 /// In the user directory: why the last game stopped, for the start page
 /// (gone once the game is started again).
 const FAILURE_FILE: &str = "last-failure.txt";
+/// How long the pointer waits to be captured once it should be (`App::pointer`).
+const CAPTURE_DELAY: Duration = Duration::from_millis(150);
+
+/// Esc's Windows virtual-key code: back, in the game's menus.
+const VK_ESCAPE: u8 = 0x1B;
 
 #[cfg(test)]
 mod performance_tests {
@@ -106,8 +111,27 @@ pub fn run() -> Result<()> {
         Err(e) => log::warn!("diagnostics: cannot start in {}: {e}", diagnostics_dir.display()),
     }
     let mut settings = Settings::load(&user_dir);
+    glue5_runtime::qos::set_mode(settings.runtime_mode());
+    // Before the window, so a save from another device is the one the start
+    // page and the engine see. Bounded: a missing container gives up.
+    glue5_runtime::drive::configure(
+        &user_dir,
+        settings.drive_enabled(),
+        &settings.google_client_id(),
+        &settings.google_client_secret(),
+    );
+    if settings.drive_enabled() {
+        glue5_runtime::drive::sync_now(&user_dir);
+        settings = Settings::load(&user_dir);
+        glue5_runtime::drive::configure(
+            &user_dir,
+            settings.drive_enabled(),
+            &settings.google_client_id(),
+            &settings.google_client_secret(),
+        );
+    }
     // Before the GPU opens; turned on later, it shows from the next launch.
-    let metal_hud = settings.metal_hud;
+    let metal_hud = cfg!(target_vendor = "apple") && settings.overlay == PerfOverlay::MetalHud;
     if metal_hud {
         // SAFETY: Apple's libc locks the environment for getenv and setenv
         // (elsewhere this does nothing).
@@ -128,7 +152,7 @@ pub fn run() -> Result<()> {
     settings.for_screen(pixels.1);
 
     let presentation = Presentation::new(pixels, settings.vsync, upscaler(&settings));
-    presentation.set_metal_hud(settings.metal_hud);
+    presentation.set_metal_hud(settings.overlay == PerfOverlay::MetalHud);
     let overlay = glue5_gpu::Overlay::default();
     let instance = glue5_gpu::instance();
     #[cfg(target_os = "android")]
@@ -150,14 +174,23 @@ pub fn run() -> Result<()> {
     // the application's lifecycle only to watches too, from the call that
     // learns of it (not through the queue): the loop follows it from there.
     let watched = presentation.clone();
-    let lifecycle = Arc::new(Lifecycle::default());
+    let lifecycle = Arc::new(Lifecycle::new(user_dir.clone(), &settings));
     let life = lifecycle.clone();
     let _watch =
         sdl.event().map_err(|e| anyhow!("SDL events: {e}"))?.add_event_watch(move |event: Event| match event {
             Event::Window { win_event: WindowEvent::PixelSizeChanged(w, h), .. } => {
                 watched.set_size(w.max(0) as u32, h.max(0) as u32)
             }
-            Event::AppWillEnterBackground { .. } => life.background.store(true, Ordering::Relaxed),
+            // iOS: applicationWillResignActive, applicationDidEnterBackground,
+            // applicationWillTerminate. SDL delivers the first as will-enter-background.
+            // The process can be killed as soon as this returns, so the save is
+            // flushed here rather than on the next turn of the loop.
+            Event::AppWillEnterBackground { .. }
+            | Event::AppDidEnterBackground { .. }
+            | Event::AppTerminating { .. } => {
+                life.background.store(true, Ordering::Relaxed);
+                life.flush();
+            }
             Event::AppDidEnterForeground { .. } => {
                 life.background.store(false, Ordering::Relaxed);
                 life.came_back.store(true, Ordering::Relaxed);
@@ -192,6 +225,7 @@ pub fn run() -> Result<()> {
         touch: Touch::new(),
         touch_input: MOBILE,
         touch_shown: false,
+        touch_mouse: Default::default(),
         lifecycle,
         folder: None,
         game_dir: None,
@@ -206,6 +240,8 @@ pub fn run() -> Result<()> {
         play_requested: false,
         mode,
         benchmark: last_benchmark,
+        capture_since: None,
+        mouse_used: !MOBILE,
         game: None,
         adaptive_slow_since: None,
         adaptive_fast_since: None,
@@ -253,12 +289,41 @@ impl Args {
 }
 
 /// The application's lifecycle, as SDL tells the event watch.
-#[derive(Default)]
 struct Lifecycle {
     /// In the background (phones: no GPU work there).
     background: AtomicBool,
     /// Back in the foreground since the loop last looked.
     came_back: AtomicBool,
+    user_dir: PathBuf,
+    /// Latest settings, so the watch can flush them without borrowing `App`.
+    settings_json: Mutex<Vec<u8>>,
+}
+
+impl Lifecycle {
+    fn new(user_dir: PathBuf, settings: &Settings) -> Self {
+        Self {
+            background: AtomicBool::new(false),
+            came_back: AtomicBool::new(false),
+            user_dir,
+            settings_json: Mutex::new(settings.snapshot()),
+        }
+    }
+
+    fn remember(&self, settings: &Settings) {
+        if let Ok(mut json) = self.settings_json.lock() {
+            *json = settings.snapshot();
+        }
+    }
+
+    /// Settings, then the engine's stats and save files. Bounded, so a stuck
+    /// engine cannot hold the process past the point iOS suspends it.
+    fn flush(&self) {
+        let json = self.settings_json.lock().map(|json| json.clone()).unwrap_or_default();
+        Settings::save_snapshot(&self.user_dir, &json);
+        glue5_runtime::flush_on_suspend();
+        // The debounced upload would not finish before iOS suspends the process.
+        glue5_runtime::drive::push_now(&self.user_dir);
+    }
 }
 
 struct App {
@@ -286,6 +351,9 @@ struct App {
     /// not enough, phones often have a paired controller lying around).
     touch_input: bool,
     touch_shown: bool,
+    /// What the touch controls last did with the mouse and Esc (the pause
+    /// menu's).
+    touch_mouse: touch::Mouse,
     lifecycle: Arc<Lifecycle>,
     folder: Option<FolderPick>,
     /// The game's folder, once found.
@@ -312,6 +380,10 @@ struct App {
     mode: Mode,
     /// The last benchmark's results.
     benchmark: Option<benchmark::Results>,
+    /// Since when the pointer should be captured (see `pointer`).
+    capture_since: Option<Instant>,
+    /// A mouse has been used in the game: phones capture it only then.
+    mouse_used: bool,
     game: Option<Running>,
     /// Hysteresis timers for adaptive mobile rendering. The timers make the
     /// quality react to sustained pressure, not one transient frame.
@@ -340,8 +412,9 @@ struct Running {
 impl App {
     fn run(mut self) -> Result<()> {
         loop {
+            self.lifecycle.remember(&self.settings);
             if let Some(exit) = glue5_runtime::exit::requested() {
-                self.settings.save(&self.user_dir);
+                self.lifecycle.flush();
                 if exit == Exit::Restart {
                     if MOBILE {
                         // A phone app cannot start itself again: says so before it ends.
@@ -356,6 +429,7 @@ impl App {
                 return Ok(());
             }
             if let Some(why) = glue5_runtime::exit::failed() {
+                self.lifecycle.flush();
                 self.stopped(why);
                 return Ok(());
             }
@@ -375,13 +449,25 @@ impl App {
             }
             let page = self.ui.page();
             // Before the game the loop sleeps until there is input or the UI
-            // animates; with it, it keeps the touch controls and pads current.
-            let wait = if self.game.is_some() { Duration::from_millis(16) } else { self.ui.idle_for() };
+            // animates; with it, it wakes on the frame cap (events still
+            // return early). In the background it wakes rarely: the renderer
+            // is held to a few frames a second for the same reason.
+            let background = self.lifecycle.background.load(Ordering::Relaxed);
+            self.presentation.set_background(background);
+            let wait = if background {
+                Duration::from_millis(250)
+            } else if self.game.is_some() {
+                let fps = self.effective_fps();
+                Duration::from_millis(if fps == 0 { 16 } else { (1000 / fps.clamp(20, 60)) as u64 })
+            } else {
+                self.ui.idle_for()
+            };
             let first = wait_event(&mut self.events, wait);
             let events: Vec<Event> = first.into_iter().chain(self.events.poll_iter()).collect();
             for event in events {
                 if self.event(event) {
-                    self.settings.save(&self.user_dir);
+                    self.lifecycle.remember(&self.settings);
+                    self.lifecycle.flush();
                     return Ok(());
                 }
             }
@@ -389,7 +475,8 @@ impl App {
                 self.came_back();
             }
             if self.update(page)? {
-                self.settings.save(&self.user_dir);
+                self.lifecycle.remember(&self.settings);
+                self.lifecycle.flush();
                 return Ok(());
             }
         }
@@ -441,6 +528,7 @@ impl App {
             return false;
         }
         match event {
+            Event::MouseButtonDown { .. } => self.mouse_used = true,
             Event::FingerDown { finger_id, x, y, .. } => self.touch.finger_down(finger_id, x, y),
             Event::FingerMotion { finger_id, x, y, .. } => self.touch.finger_motion(finger_id, x, y),
             Event::FingerUp { finger_id, .. } => self.touch.finger_up(finger_id),
@@ -449,7 +537,7 @@ impl App {
         if let Some(game) = &self.game
             && let Some(input) = &game.input
         {
-            game_input(input, &event, &self.window, &self.mouse, game.back_buffer);
+            game_input(input, &event, &self.window, game.back_buffer);
         }
         false
     }
@@ -470,11 +558,52 @@ impl App {
             self.touch_shown = show;
             self.touch.clear();
             glue5_runtime::input::set_gamepad(0, Gamepad::default());
+            if let Some(input) = self.game.as_ref().and_then(|g| g.input.as_ref()) {
+                if self.touch_mouse.down {
+                    input.mouse_button(mouse::LEFT, false);
+                }
+                if self.touch_mouse.back {
+                    input.key(VK_ESCAPE, false);
+                }
+            }
+            self.touch_mouse = Default::default();
         }
+        glue5_runtime::input::set_touch_play(show);
+        glue5_runtime::input::set_touch_targeting(self.settings.touch_aim.targeting());
         if show {
             self.touch.haptics = self.settings.haptics;
+            self.touch.camera_speed = self.settings.touch_camera;
+            self.touch.aim_locked = glue5_runtime::input::aim_locked();
             self.touch.layout(ui::screen_size(&self.window), ui::safe_rect(&self.window), self.settings.touch_size);
+            self.touch.set_context(glue5_runtime::input::player_context());
             glue5_runtime::input::set_gamepad(0, self.touch.gamepad());
+            let look = self.touch.take_look();
+            let mouse = self.touch.take_mouse();
+            if let Some(game) = &self.game
+                && let Some(input) = &game.input
+            {
+                // The camera, dragged: as a mouse turns it.
+                if look != (0, 0) {
+                    input.mouse_motion(look.0, look.1);
+                }
+                // The pause menu: a finger is the mouse.
+                if mouse.at != self.touch_mouse.at
+                    && let Some(at) = mouse.at
+                {
+                    let (w, h) = game.back_buffer;
+                    input.mouse_position((at.x * w as f32) as i32, (at.y * h as f32) as i32);
+                }
+                if mouse.down != self.touch_mouse.down {
+                    input.mouse_button(mouse::LEFT, mouse.down);
+                }
+                if mouse.wheel != 0 {
+                    input.mouse_wheel(mouse.wheel);
+                }
+                if mouse.back != self.touch_mouse.back {
+                    input.key(VK_ESCAPE, mouse.back);
+                }
+                self.touch_mouse = mouse;
+            }
             if self.settings.haptics {
                 haptics::rumble(glue5_runtime::input::rumble(0));
             }
@@ -491,7 +620,8 @@ impl App {
 
         // What applies at once (the engine's own frame limiter at its next start).
         self.presentation.set_vsync(self.settings.vsync);
-        self.presentation.set_metal_hud(self.settings.metal_hud);
+        self.presentation.set_metal_hud(self.settings.overlay == PerfOverlay::MetalHud);
+        glue5_gpu::perf::set_on(in_game && self.settings.overlay == PerfOverlay::Glue5);
         self.update_thermal();
         self.presentation.set_frame_rate(self.effective_fps());
         self.presentation.set_upscaler(upscaler(&self.settings));
@@ -503,6 +633,14 @@ impl App {
             0
         });
         glue5_runtime::diagnostics::set_verbose_logs(self.settings.verbose_logs);
+        glue5_runtime::qos::set_mode(self.settings.runtime_mode());
+        if self.game.is_some()
+            && let Some(ms) = self.presentation.frame_interval_ms()
+        {
+            let budget = 1000.0 / self.effective_fps().max(1) as f32;
+            glue5_runtime::qos::note_frame(ms, budget);
+        }
+        glue5_gpu::set_distance_policy(self.settings.distance_policy());
         self.adapt_graphics();
         self.resize_game();
 
@@ -519,6 +657,7 @@ impl App {
                 last_failure: self.last_failure.as_deref(),
                 graphics_reset: self.graphics_reset,
                 window: self.window.size_in_pixels(),
+                back_buffer: self.game.as_ref().map(|g| g.back_buffer),
                 upscalers: &self.upscalers,
                 frame_generation: self.frame_generation,
                 metal_hud: self.metal_hud,
@@ -571,10 +710,6 @@ impl App {
             if let Some(input) = self.game.as_ref().and_then(|g| g.input.as_ref()) {
                 // Nothing stays pressed in the game behind a page.
                 input.release_all();
-                if page.is_some() {
-                    self.mouse.set_relative_mouse_mode(&self.window, false);
-                    input.pointer_locked(false);
-                }
             }
             if page_before == Some(Page::Settings) {
                 self.settings.save(&self.user_dir);
@@ -597,7 +732,40 @@ impl App {
                 self.text_input.stop(&self.window);
             }
         }
+        self.pointer();
         Ok(false)
+    }
+
+    /// The mouse pointer, as the game has it on PC: captured in play (hidden,
+    /// every motion reaching the game); free while the game shows its own
+    /// cursor (the pause menu and its map, the phone's browser, ...), the
+    /// system's hidden over the window then, as the game draws its own; free
+    /// and shown while the window is not in front or a page of ours is
+    /// open. It follows these as they change: Esc frees it with the pause
+    /// menu and captures it again on leaving it, as does switching to
+    /// another window and back; no click is needed.
+    fn pointer(&mut self) {
+        // Touch alone (phones without a mouse): nothing to do.
+        if !self.mouse_used {
+            return;
+        }
+        let Some(input) = self.game.as_ref().and_then(|g| g.input) else { return };
+        let ours = self.ui.is_open() || !self.window.has_input_focus();
+        let game_cursor = input.cursor_shown();
+        let want = !ours && !game_cursor && self.mode != Mode::Benchmark;
+        // Capturing waits a moment: back in front over a menu, the game
+        // shows its cursor only a frame or two later.
+        self.capture_since = want.then(|| self.capture_since.unwrap_or_else(Instant::now));
+        let capture = self.capture_since.is_some_and(|t| t.elapsed() >= CAPTURE_DELAY);
+        let captured = self.mouse.relative_mouse_mode(&self.window);
+        if captured != capture && (capture || !want) {
+            self.mouse.set_relative_mouse_mode(&self.window, capture);
+            input.pointer_locked(capture);
+        }
+        let shown = ours || !game_cursor;
+        if self.mouse.is_cursor_showing() != shown {
+            self.mouse.show_cursor(shown);
+        }
     }
 
     /// The game's back buffer follows the window (desktop), and on phones it
@@ -605,6 +773,7 @@ impl App {
     /// for 20 of its frames before rebuilding its render targets, and a
     /// window being resized by the system does not reach this loop until the
     /// end: one rebuild per resize.
+
     fn resize_game(&mut self) {
         let Some(game) = &mut self.game else { return };
         let Some(input) = &game.input else { return };
@@ -631,19 +800,10 @@ impl App {
     fn adapt_graphics(&mut self) {
         let pixels = self.window.size_in_pixels();
         let wanted = self.settings.input_size(pixels).1 as f32 / pixels.1.max(1) as f32;
-        let hot = MOBILE && self.settings.thermal_protection && self.thermal_cap.is_some();
-        let ceiling = wanted
-            * if hot {
-                if self.thermal_state >= 3 {
-                    0.6
-                } else if self.thermal_state == 1 {
-                    0.9
-                } else {
-                    0.75
-                }
-            } else {
-                1.0
-            };
+        // Nominal spends the distant-draw savings on pixels. Heat gives them back.
+        let thermal = if self.settings.thermal_protection { self.thermal_state } else { 0 };
+        let factor = glue5_gpu::resolution_factor(thermal, glue5_gpu::render_boost());
+        let ceiling = settings::round_scale((wanted * factor).min(1.0));
         if !MOBILE || !self.settings.adaptive_graphics || self.game.is_none() {
             self.adaptive_slow_since = None;
             self.adaptive_fast_since = None;
@@ -656,7 +816,7 @@ impl App {
         let target_ms = 1000.0 / if fps > 0 { fps } else { 60 } as f32;
         let now = Instant::now();
         let overloaded = interval_ms > target_ms * 1.18;
-        let headroom = !hot && self.thermal_state < 2 && interval_ms <= target_ms * 1.04;
+        let headroom = thermal < 2 && self.thermal_state < 2 && interval_ms <= target_ms * 1.04;
         if overloaded {
             self.adaptive_slow_since.get_or_insert(now);
             self.adaptive_fast_since = None;
@@ -701,32 +861,46 @@ impl App {
     fn effective_fps(&self) -> u32 {
         let engine_cap = self.game.as_ref().and_then(|g| (g.started.max_fps > 0).then_some(g.started.max_fps));
         let requested = limited_fps(self.settings.max_fps, engine_cap);
-        limited_fps(requested, self.thermal_cap.filter(|_| self.settings.thermal_protection))
+        let thermal = limited_fps(requested, self.thermal_cap.filter(|_| self.settings.thermal_protection));
+        // The engine advances a streaming budget per frame. Sleeping to the
+        // menu cap (30 on a phone, 24 in Hybrid) multiplies the load. The
+        // cap returns once archive and shader reads have gone quiet. A
+        // serious or critical thermal state still applies.
+        if glue5_runtime::qos::load_uncapped() {
+            if self.settings.thermal_protection && self.thermal_state >= 2 {
+                return thermal;
+            }
+            return 0;
+        }
+        limited_fps(thermal, glue5_runtime::qos::pace_fps())
     }
 
     fn update_thermal(&mut self) {
-        if !MOBILE || self.thermal_last_poll.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        self.thermal_last_poll = Instant::now();
-        let state = glue5_gpu::thermal_state();
-        if state != self.thermal_state {
-            glue5_runtime::diagnostics::note(format_args!("thermal state: {} -> {state}", self.thermal_state));
-            self.thermal_state = state;
-        }
-        if !self.settings.thermal_protection {
-            self.thermal_cap = None;
-            self.thermal_cool_since = None;
-        } else if let Some(cap) = hot_fps_cap(state) {
-            self.thermal_cap = Some(self.thermal_cap.map_or(cap, |old| old.min(cap)));
-            self.thermal_cool_since = None;
-        } else if self.thermal_cap.is_some() {
-            let since = self.thermal_cool_since.get_or_insert(Instant::now());
-            if since.elapsed() >= Duration::from_secs(30) {
+        // Polled on every platform. Off Apple the state stays nominal, so a
+        // desktop build that leaves thermal protection off is unchanged.
+        if self.thermal_last_poll.elapsed() >= Duration::from_secs(1) {
+            self.thermal_last_poll = Instant::now();
+            let state = glue5_gpu::thermal_state();
+            if state != self.thermal_state {
+                glue5_runtime::diagnostics::note(format_args!("thermal state: {} -> {state}", self.thermal_state));
+                self.thermal_state = state;
+            }
+            if !self.settings.thermal_protection {
                 self.thermal_cap = None;
                 self.thermal_cool_since = None;
+            } else if let Some(cap) = hot_fps_cap(state).filter(|_| MOBILE) {
+                self.thermal_cap = Some(self.thermal_cap.map_or(cap, |old| old.min(cap)));
+                self.thermal_cool_since = None;
+            } else if self.thermal_cap.is_some() {
+                let since = self.thermal_cool_since.get_or_insert(Instant::now());
+                if since.elapsed() >= Duration::from_secs(30) {
+                    self.thermal_cap = None;
+                    self.thermal_cool_since = None;
+                }
             }
         }
+        let state = if self.settings.thermal_protection { self.thermal_state } else { 0 };
+        self.presentation.set_thermal(state);
     }
 
     /// Starts the game once the pipelines known for it are prepared (the
@@ -770,6 +944,11 @@ impl App {
         }
         glue5_runtime::diagnostics::set_verbose_logs(self.settings.verbose_logs);
         self.settings.save(&self.user_dir);
+        // Newest save wins before the engine opens the files. A session that
+        // is already running uploads only (see background and note_write).
+        if self.settings.drive_enabled() {
+            glue5_runtime::drive::sync_now(&self.user_dir);
+        }
         // A new attempt: the last one's failure is history.
         let _ = std::fs::remove_file(self.user_dir.join(FAILURE_FILE));
         log::info!("game: {}, user data: {}", game_dir.display(), self.user_dir.display());
@@ -785,6 +964,10 @@ impl App {
             s.max_fps,
             self.mode,
         ));
+        // Before the engine's first frame. The load reads archives and
+        // shaders for a long time after this returns; the frame cap stays
+        // off until those reads go quiet.
+        glue5_runtime::qos::note_load();
         let game = glue5_runtime::start(
             glue5_runtime::Config {
                 game_dir: game_dir.clone(),
@@ -857,6 +1040,7 @@ impl App {
         }
         self.settings.save(&self.user_dir);
         self.mouse.set_relative_mouse_mode(&self.window, false);
+        self.mouse.show_cursor(true);
         let page = if MOBILE { "when the app is opened again, its start page" } else { "the start page" };
         let text = format!(
             "The game has stopped: {why}.\n\nIf it stops again at the same point, one of its graphics settings \
@@ -901,6 +1085,23 @@ impl App {
         #[cfg(target_os = "android")]
         self.replace_surface();
         self.ui.repaint();
+        if self.settings.drive_enabled() {
+            if self.game.is_none() {
+                glue5_runtime::drive::sync_now(&self.user_dir);
+                if self.ui.page() != Some(Page::Settings) {
+                    self.settings = Settings::load(&self.user_dir);
+                    glue5_runtime::drive::configure(
+                        &self.user_dir,
+                        self.settings.drive_enabled(),
+                        &self.settings.google_client_id(),
+                        &self.settings.google_client_secret(),
+                    );
+                    self.lifecycle.remember(&self.settings);
+                }
+            } else {
+                glue5_runtime::drive::push_now(&self.user_dir);
+            }
+        }
         // The game's files may have been copied in meanwhile (Finder, the
         // Files app, adb).
         if self.game.is_none() && self.game_dir.is_none() {
@@ -1026,20 +1227,10 @@ fn upscaler(settings: &Settings) -> Upscaler {
 const UPSCALERS: &[Upscaling] = &[Upscaling::Bicubic, Upscaling::MetalFx, Upscaling::MetalFxTemporal, Upscaling::Fsr];
 
 /// Keyboard and mouse into the game's input block.
-fn game_input(
-    input: &InputBlock,
-    event: &Event,
-    window: &sdl3::video::Window,
-    mouse_util: &sdl3::mouse::MouseUtil,
-    back_buffer: (u32, u32),
-) {
+fn game_input(input: &InputBlock, event: &Event, window: &sdl3::video::Window, back_buffer: (u32, u32)) {
     let (bw, bh) = (back_buffer.0 as f32, back_buffer.1 as f32);
     match *event {
         Event::KeyDown { scancode: Some(sc), repeat, .. } => {
-            if sc == Scancode::Escape && mouse_util.relative_mouse_mode(window) {
-                mouse_util.set_relative_mouse_mode(window, false);
-                input.pointer_locked(false);
-            }
             if !repeat {
                 key(input, sc, true);
             }
@@ -1056,22 +1247,11 @@ fn game_input(
             input.mouse_position((x * bw / ww as f32) as i32, (y * bh / wh as f32) as i32);
             input.mouse_motion(xrel.round() as i32, yrel.round() as i32);
         }
-        Event::MouseButtonDown { mouse_btn, .. } => {
-            // Like the page: a click captures the pointer.
-            if !mouse_util.relative_mouse_mode(window) {
-                mouse_util.set_relative_mouse_mode(window, true);
-                input.pointer_locked(true);
-            }
-            input.mouse_button(mouse_bit(mouse_btn), true);
-        }
+        Event::MouseButtonDown { mouse_btn, .. } => input.mouse_button(mouse_bit(mouse_btn), true),
         Event::MouseButtonUp { mouse_btn, .. } => input.mouse_button(mouse_bit(mouse_btn), false),
         Event::MouseWheel { y, .. } => input.mouse_wheel(y.round() as i32),
         Event::Window { win_event: WindowEvent::FocusGained, .. } => input.focus(true),
-        Event::Window { win_event: WindowEvent::FocusLost, .. } => {
-            mouse_util.set_relative_mouse_mode(window, false);
-            input.pointer_locked(false);
-            input.focus(false);
-        }
+        Event::Window { win_event: WindowEvent::FocusLost, .. } => input.focus(false),
         _ => {}
     }
 }

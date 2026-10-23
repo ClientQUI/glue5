@@ -11,13 +11,36 @@ glue5-game.workspace = true
 anyhow.workspace = true
 log.workspace = true
 sha2.workspace = true
+serde_json.workspace = true
 # /dev/urandom for the engine, which Windows does not have.
 getrandom = "0.4"
 # The system's time zone, the same way on every platform.
 jiff = "0.2"
+# Google Drive's hidden app data (OAuth and the files REST API).
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+md-5 = "0.10"
+# Xcode writes Info.plist as a binary plist. Used when NSBundle cannot be queried.
+plist = "1.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The refresh token lives in the Keychain.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+security-framework = "2.11"
+
+# Sign-in on iPhone and iPad (ASWebAuthenticationSession).
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSBundle",
+    "NSDictionary",
+    "NSString",
+    "NSURL",
+] }
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Media", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Media", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading"] }

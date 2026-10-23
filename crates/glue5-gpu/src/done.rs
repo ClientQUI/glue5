@@ -40,6 +40,13 @@ pub enum Work {
         staging: Staging,
         resolved: crate::profile::Resolved,
     },
+    /// A frame's batch timestamps, for the performance overlay.
+    #[cfg(not(target_vendor = "apple"))]
+    GpuTime {
+        staging: Staging,
+        pairs: u32,
+        period: f32,
+    },
     Screenshot {
         staging: Staging,
         width: u32,
@@ -170,8 +177,9 @@ impl Done {
 
 fn run(device: wgpu::Device, mem: Mem, pool: Arc<StagingPool>, rx: Receiver<(wgpu::SubmissionIndex, Vec<Work>)>) {
     // The engine paces its frames on what this thread completes.
-    glue5_runtime::qos::set(glue5_runtime::qos::Qos::Interactive);
+    glue5_runtime::qos::bind_host(glue5_runtime::qos::Qos::Interactive);
     while let Ok((submission, works)) = rx.recv() {
+        glue5_runtime::qos::refresh();
         glue5_runtime::diagnostics::gpu_completion_stage(1);
         let result = wait_for_submission(
             || {
@@ -353,6 +361,13 @@ fn finish(device: &wgpu::Device, mem: Mem, pool: &StagingPool, work: Work) {
         Work::Profile { staging, resolved } => {
             if let Some(data) = mapped(device, &staging) {
                 resolved.add(&data);
+            }
+            release(pool, staging);
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        Work::GpuTime { staging, pairs, period } => {
+            if let Some(data) = mapped(device, &staging) {
+                crate::perf::timestamps_done(&data, pairs, period);
             }
             release(pool, staging);
         }
